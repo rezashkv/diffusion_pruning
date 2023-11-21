@@ -1,1 +1,0 @@
-from diffusers.models import UNet2DConditionModel
