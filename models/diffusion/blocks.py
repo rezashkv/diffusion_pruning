@@ -7,10 +7,10 @@ from diffusers.models.resnet import ResnetBlock2D, Upsample2D, Downsample2D
 from torch import nn
 from diffusers.configuration_utils import register_to_config
 
-from ..utils.gates import BlockVirtualGate
+from diffusion_pruning.models.hypernet.gates import BlockVirtualGate
 from diffusers.models.attention import BasicTransformerBlock
 from diffusers.models.unet_2d_blocks import CrossAttnDownBlock2D, CrossAttnUpBlock2D, DownBlock2D, UpBlock2D
-from diffusers.utils import logging
+from diffusers.utils import logging, USE_PEFT_BACKEND
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -61,15 +61,16 @@ class ResnetBlock2DGated(ResnetBlock2D):
                 else self.downsample(hidden_states)
             )
 
-        hidden_states = self.conv1(hidden_states, scale)
-
-        # DO it here or after norm2?
-        # hidden_states = self.gate(hidden_states)
+        hidden_states = self.conv1(hidden_states, scale) if not USE_PEFT_BACKEND else self.conv1(hidden_states)
 
         if self.time_emb_proj is not None:
             if not self.skip_time_act:
                 temb = self.nonlinearity(temb)
-            temb = self.time_emb_proj(temb, scale)[:, :, None, None]
+            temb = (
+                self.time_emb_proj(temb, scale)[:, :, None, None]
+                if not USE_PEFT_BACKEND
+                else self.time_emb_proj(temb)[:, :, None, None]
+            )
 
         if temb is not None and self.time_embedding_norm == "default":
             hidden_states = hidden_states + temb
@@ -87,11 +88,14 @@ class ResnetBlock2DGated(ResnetBlock2D):
             hidden_states = hidden_states * (1 + scale) + shift
 
         hidden_states = self.nonlinearity(hidden_states)
+
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.conv2(hidden_states, scale)
+        hidden_states = self.conv2(hidden_states, scale) if not USE_PEFT_BACKEND else self.conv2(hidden_states)
 
         if self.conv_shortcut is not None:
-            input_tensor = self.conv_shortcut(input_tensor, scale)
+            input_tensor = (
+                self.conv_shortcut(input_tensor, scale) if not USE_PEFT_BACKEND else self.conv_shortcut(input_tensor)
+            )
 
         output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
 
@@ -148,15 +152,16 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
                 else self.downsample(hidden_states)
             )
 
-        hidden_states = self.conv1(hidden_states, scale)
-
-        # DO it here or after norm2?
-        # hidden_states = self.gate(hidden_states)
+        hidden_states = self.conv1(hidden_states, scale) if not USE_PEFT_BACKEND else self.conv1(hidden_states)
 
         if self.time_emb_proj is not None:
             if not self.skip_time_act:
                 temb = self.nonlinearity(temb)
-            temb = self.time_emb_proj(temb, scale)[:, :, None, None]
+            temb = (
+                self.time_emb_proj(temb, scale)[:, :, None, None]
+                if not USE_PEFT_BACKEND
+                else self.time_emb_proj(temb)[:, :, None, None]
+            )
 
         if temb is not None and self.time_embedding_norm == "default":
             hidden_states = hidden_states + temb
@@ -174,12 +179,14 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
             hidden_states = hidden_states * (1 + scale) + shift
 
         hidden_states = self.nonlinearity(hidden_states)
-        hidden_states = self.dropout(hidden_states)
 
-        hidden_states = self.conv2(hidden_states, scale)
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.conv2(hidden_states, scale) if not USE_PEFT_BACKEND else self.conv2(hidden_states)
 
         if self.conv_shortcut is not None:
-            input_tensor = self.conv_shortcut(input_tensor, scale)
+            input_tensor = (
+                self.conv_shortcut(input_tensor, scale) if not USE_PEFT_BACKEND else self.conv_shortcut(input_tensor)
+            )
 
         hidden_states = self.depth_gate(hidden_states)
 

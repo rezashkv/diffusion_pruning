@@ -11,9 +11,7 @@ from diffusers.utils import replace_example_docstring
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPImageProcessor
 import diffusers
 
-from ..models.unet_2d_conditional import UNet2DConditionModelGated
-from ..models.hypernet import HyperStructure
-
+from diffusion_pruning.models.diffusion.unet_2d_conditional import UNet2DConditionModelGated
 
 from diffusers import StableDiffusionPipeline, DiffusionPipeline
 from diffusers.models.modeling_utils import _LOW_CPU_MEM_USAGE_DEFAULT
@@ -172,10 +170,12 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
             feature_extractor: CLIPImageProcessor,
             requires_safety_checker: bool = True,
             hyper_net: Optional[torch.nn.Module] = None,
+            quantizer: Optional[torch.nn.Module] = None,
     ):
         super().__init__(vae, text_encoder, tokenizer, unet, scheduler, safety_checker, feature_extractor,
                          requires_safety_checker)
         self.hyper_net = hyper_net
+        self.quantizer = quantizer
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], **kwargs):
@@ -743,7 +743,8 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
         )
 
         structure_vector = self.hyper_net(prompt_embeds)
-        self.unet.set_structure(structure_vector)
+        structure_vector_quantized, _, _ = self.quantizer(structure_vector)
+        self.unet.set_structure(structure_vector_quantized)
 
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch
@@ -957,7 +958,8 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
         )
 
         structure_vector = self.hyper_net(prompt_embeds)
-        self.unet.set_structure(structure_vector)
+        structure_vector_quantized, _, _ = self.quantizer(structure_vector)
+        self.unet.set_structure(structure_vector_quantized)
 
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch

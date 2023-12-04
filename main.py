@@ -45,14 +45,16 @@ from transformers.utils import ContextManagers
 from utils.op_counter import (add_flops_counting_methods)
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, DDIMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from pipelines.pruning_pipelines import StableDiffusionPruningPipeline
-from models.unet_2d_conditional import UNet2DConditionModelGated
+from models.diffusion.unet_2d_conditional import UNet2DConditionModelGated
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate, is_wandb_available, make_image_grid
 from diffusers.utils.import_utils import is_xformers_available
 from models.hypernet import HyperStructure
+from models.vq.quantizer import StructureVectorQuantizer
+from losses.clip_loss import ClipLoss
 
 if is_wandb_available():
     import wandb
@@ -168,10 +170,11 @@ More information on all the CLI arguments and the environment are available on y
         f.write(yaml + model_card)
 
 
-def log_validation(hyper_net, vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, epoch):
+def log_validation(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, epoch):
     logger.info("Running validation... ")
 
     hyper_net.eval()
+    quantizer.eval()
     pipeline = StableDiffusionPruningPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=accelerator.unwrap_model(vae),
@@ -182,6 +185,7 @@ def log_validation(hyper_net, vae, text_encoder, tokenizer, unet, args, accelera
         revision=args.revision,
         torch_dtype=weight_dtype,
         hyper_net=hyper_net,
+        quantizer=quantizer
     )
 
     pipeline = pipeline.to(accelerator.device)
@@ -224,10 +228,11 @@ def log_validation(hyper_net, vae, text_encoder, tokenizer, unet, args, accelera
     return images
 
 
-def log_validation_latents(hyper_net, vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, epoch):
+def log_validation_latents(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, epoch):
     logger.info("Running validation... ")
 
     hyper_net.eval()
+    quantizer.eval()
     pipeline = StableDiffusionPruningPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=accelerator.unwrap_model(vae),
@@ -238,6 +243,7 @@ def log_validation_latents(hyper_net, vae, text_encoder, tokenizer, unet, args, 
         revision=args.revision,
         torch_dtype=weight_dtype,
         hyper_net=hyper_net,
+        quantizer=quantizer,
     )
 
     pipeline = pipeline.to(accelerator.device)
@@ -286,7 +292,7 @@ def log_validation_latents(hyper_net, vae, text_encoder, tokenizer, unet, args, 
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Dynamic Pruning of StableDiffusion-2.0")
+    parser = argparse.ArgumentParser(description="Dynamic Pruning of StableDiffusion-2.1")
     parser.add_argument(
         "--input_perturbation", type=float, default=0, help="The scale of input perturbation. Recommended 0.1."
     )
@@ -586,6 +592,8 @@ def parse_args():
     )
 
     parser.add_argument("--pruning", action="store_true", help="Whether to prune the model.")
+    parser.add_argument("--clip_loss_temperature", type=float, default=0.07,
+                        help="The temperature for the clip loss.")
     parser.add_argument(
         "--hypernet_T",
         type=float,
@@ -606,6 +614,21 @@ def parse_args():
         default=0,
         required=False,
         help="The sparsity for the hypernet.",
+    )
+
+    parser.add_argument(
+        "--num_arch_vq_codebook_embeddings",
+        type=int,
+        default=256,
+        required=False,
+        help="The number of codebook embeddings for the quantizer.",
+    )
+    parser.add_argument(
+        "--arch_vq_beta",
+        type=float,
+        default=0.25,
+        required=False,
+
     )
     parser.add_argument(
         "--unet_down_blocks",
@@ -744,6 +767,12 @@ def main():
                                    structure=unet.get_structure(),
                                    T=args.hypernet_T, base=args.hypernet_base)
 
+        quantizer = StructureVectorQuantizer(n_e=args.num_arch_vq_codebook_embeddings,
+                                             vq_embed_dim=sum(unet.get_structure()), beta=args.arch_vq_beta,
+                                             temperature=args.hypernet_T, base=args.hypernet_base)
+
+        clip_loss = ClipLoss(temperature=args.clip_loss_temperature)
+
     else:
         unet = UNet2DConditionModel.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
@@ -772,6 +801,7 @@ def main():
         unet.eval()
         unet.freeze()
         hyper_net.train()
+        quantizer.train()
     else:
         unet.train()
 
@@ -855,16 +885,19 @@ def main():
         unet = add_flops_counting_methods(unet)
         unet.start_flops_count(ost=sys.stdout, verbose=False, ignore_list=[])
 
+        # TODO possibly two learning rates for hypernet and quantizer
         optimizer = optimizer_cls(
-            hyper_net.parameters(),
+            list(hyper_net.parameters()) + list(quantizer.parameters()),
             lr=args.learning_rate,
             betas=(args.adam_beta1, args.adam_beta2),
             weight_decay=args.adam_weight_decay,
             eps=args.adam_epsilon,
         )
+
     else:
+        # TODO possibly two learning rates for hypernet and quantizer
         optimizer = optimizer_cls(
-            unet.parameters(),
+            list(hyper_net.parameters()) + list(quantizer.parameters()),
             lr=args.learning_rate,
             betas=(args.adam_beta1, args.adam_beta2),
             weight_decay=args.adam_weight_decay,
@@ -1037,8 +1070,8 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    unet, optimizer, train_dataloader, lr_scheduler, hyper_net = accelerator.prepare(
-        unet, optimizer, train_dataloader, lr_scheduler, hyper_net
+    unet, optimizer, train_dataloader, lr_scheduler, hyper_net, quantizer = accelerator.prepare(
+        unet, optimizer, train_dataloader, lr_scheduler, hyper_net, quantizer
     )
 
     if args.use_ema:
@@ -1126,6 +1159,7 @@ def main():
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             hyper_net.train()
+            quantizer.train()
             unet.reset_flops_count()
             with accelerator.accumulate(unet):
                 # Convert images to latent space
@@ -1157,8 +1191,11 @@ def main():
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
                 arch_vector = hyper_net(encoder_hidden_states)
+                arch_vector_quantized, q_loss, _ = quantizer(arch_vector)
 
-                unet.set_structure(arch_vector)
+                contrastive_loss = clip_loss(torch.sum(encoder_hidden_states, dim=1).squeeze(1), arch_vector_quantized)
+
+                unet.set_structure(arch_vector_quantized)
 
                 # Get the target for loss depending on the prediction type
                 if args.prediction_type is not None:
@@ -1192,22 +1229,24 @@ def main():
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                     loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                     loss = loss.mean()
-                curr_flops = unet.compute_average_flops_cost()[0]
+                curr_flops, _ = unet.compute_average_flops_cost()
 
                 if global_step == 0:
-                    unet.__total_flops__ = curr_flops.detach().clone()
+                    unet.__total_flops__ = curr_flops
 
                 resource_ratio = (curr_flops / unet.__total_flops__)
                 if args.resource_loss_type == "log":
-                    abs_rv = torch.clamp(resource_ratio, min=args.pruning_p)
+                    abs_rv = torch.clamp(torch.tensor(resource_ratio), min=args.pruning_p)
                     resource_loss = torch.log(abs_rv / args.pruning_p)
                 elif args.resource_loss_type == "mae":
-                    resource_loss = torch.abs(resource_ratio - args.pruning_p)
+                    resource_loss = torch.abs(torch.tensor(resource_ratio - args.pruning_p))
                 elif args.resource_loss_type == "mse":
                     resource_loss = (resource_ratio - args.pruning_p) ** 2
                 else:
                     raise ValueError(f"Unknown resource loss type {args.resource_loss_type}")
                 loss += resource_loss
+                loss += q_loss
+                loss += contrastive_loss
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
@@ -1272,6 +1311,7 @@ def main():
                     ema_unet.copy_to(unet.parameters())
                 log_validation(
                     hyper_net,
+                    quantizer,
                     vae,
                     text_encoder,
                     tokenizer,
@@ -1300,9 +1340,11 @@ def main():
             revision=args.revision,
             tokenizer=tokenizer,
             hyper_net=hyper_net,
+            quantizer=quantizer,
         )
         # pipeline.save_pretrained(args.output_dir)
         hyper_net.save_pretrained(args.output_dir)
+        quantizer.save_pretrained(args.output_dir)
 
         # Run a final round of inference.
         images = []

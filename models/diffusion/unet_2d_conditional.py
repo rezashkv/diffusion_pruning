@@ -11,10 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict
 
-import torch
-import torch.nn as nn
 import torch.utils.checkpoint
 from diffusers.models.modeling_utils import *
 from diffusers import __version__
@@ -52,7 +50,7 @@ from diffusers.models.unet_2d_blocks import (
     KCrossAttnUpBlock2D
 )
 
-from blocks import (CrossAttnDownBlock2DGated, CrossAttnUpBlock2DGated, CrossAttnUpBlock2DHalfGated,
+from .blocks import (CrossAttnDownBlock2DGated, CrossAttnUpBlock2DGated, CrossAttnUpBlock2DHalfGated,
                     CrossAttnDownBlock2DHalfGated, DownBlock2DGated, UpBlock2DGated,
                     DownBlock2DHalfGated, UpBlock2DHalfGated)
 
