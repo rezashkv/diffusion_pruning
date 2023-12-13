@@ -11,7 +11,7 @@ from diffusers.utils import replace_example_docstring
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPImageProcessor
 import diffusers
 
-from diffusion_pruning.models.diffusion.unet_2d_conditional import UNet2DConditionModelGated
+from pdm.models.diffusion.unet_2d_conditional import UNet2DConditionModelGated
 
 from diffusers import StableDiffusionPipeline, DiffusionPipeline
 from diffusers.models.modeling_utils import _LOW_CPU_MEM_USAGE_DEFAULT

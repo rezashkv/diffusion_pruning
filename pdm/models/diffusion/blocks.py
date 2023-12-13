@@ -7,7 +7,7 @@ from diffusers.models.resnet import ResnetBlock2D, Upsample2D, Downsample2D
 from torch import nn
 from diffusers.configuration_utils import register_to_config
 
-from diffusion_pruning.models.hypernet.gates import BlockVirtualGate
+from pdm.models.hypernet.gates import BlockVirtualGate
 from diffusers.models.attention import BasicTransformerBlock
 from diffusers.models.unet_2d_blocks import CrossAttnDownBlock2D, CrossAttnUpBlock2D, DownBlock2D, UpBlock2D
 from diffusers.utils import logging, USE_PEFT_BACKEND

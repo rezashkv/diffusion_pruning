@@ -80,6 +80,7 @@ class HyperStructure(ModelMixin):
     #     return out.squeeze()
 
     def _forward(self, x):
+        # x: B * L * D
         if self.bn1.weight.is_cuda:
             x = x.cuda()
             self.h0 = self.h0.cuda()

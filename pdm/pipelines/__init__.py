@@ -1,0 +1,1 @@
+from .pruning_pipelines import StableDiffusionPruningPipeline

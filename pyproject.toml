@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pdm"
+dynamic = ["version"]
+description = "Pruning Diffusion Models"
+readme = "README.md"
+license-files = { paths = ["LICENSE-CODE"] }
+requires-python = ">=3.8"
+
+[project.urls]
+Homepage = "https://github.com/rezashkv/diffusion_pruning"
+
+[tool.hatch.version]
+path = "pdm/__init__.py"
+
+[tool.hatch.build]
+# This needs to be explicitly set so the configuration files
+# grafted into the `sgm` directory get included in the wheel's
+# RECORD file.
+include = [
+    "pdm",
+]
+
+
+[tool.hatch.envs.ci]
+skip-install = false
+
+dependencies = [
+    "pytest"
+]
+
+[tool.hatch.envs.ci.scripts]
+

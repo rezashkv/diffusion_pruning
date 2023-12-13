@@ -4,7 +4,7 @@ from typing import Tuple, Union, Callable, Optional
 import numpy as np
 import torch
 from torch import nn
-from diffusion_pruning.models.utils import gumbel_softmax_sample, hard_concrete
+from pdm.utils.estimation_utils import gumbel_softmax_sample, hard_concrete
 from diffusers import ModelMixin
 
 

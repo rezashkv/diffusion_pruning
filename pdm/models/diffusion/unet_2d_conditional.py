@@ -2023,7 +2023,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         return model
 
     def freeze(self):
-        # set all parameters to not require gradients except for the virtual gates
+        # set all parameters to not require gradients except for the virtual hypernets
         for name, param in self.named_parameters():
             if "gate_f" not in name:
                 param.requires_grad = False

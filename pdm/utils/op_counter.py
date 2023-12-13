@@ -15,9 +15,9 @@ from diffusers.models.normalization import AdaGroupNorm
 from diffusers.models.activations import GEGLU
 from diffusers.models.resnet import Upsample2D
 from diffusers.models.lora import (LoRACompatibleConv, LoRACompatibleLinear)
-from diffusion_pruning.models.diffusion.blocks import (ResnetBlock2DGated, BasicTransformerBlockGated,
+from pdm.models.diffusion.blocks import (ResnetBlock2DGated, BasicTransformerBlockGated,
                                        ResnetBlock2DWidthDepthGated, BasicTransformerBlockWidthDepthGated)
-from diffusion_pruning.models.utils import hard_concrete
+from pdm.utils.estimation_utils import hard_concrete
 
 import sys
 import os

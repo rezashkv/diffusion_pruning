@@ -42,19 +42,19 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.utils import ContextManagers
-from utils.op_counter import (add_flops_counting_methods)
+from pdm.utils.op_counter import (add_flops_counting_methods)
 
 import diffusers
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
-from pipelines.pruning_pipelines import StableDiffusionPruningPipeline
-from models.diffusion.unet_2d_conditional import UNet2DConditionModelGated
+from pdm.pipelines import StableDiffusionPruningPipeline
+from pdm.models.diffusion import UNet2DConditionModelGated
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate, is_wandb_available, make_image_grid
 from diffusers.utils.import_utils import is_xformers_available
-from models.hypernet import HyperStructure
-from models.vq.quantizer import StructureVectorQuantizer
-from losses.clip_loss import ClipLoss
+from pdm.models import HyperStructure
+from pdm.models import StructureVectorQuantizer
+from pdm.losses import ClipLoss
 
 if is_wandb_available():
     import wandb
@@ -166,7 +166,7 @@ More information on all the CLI arguments and the environment are available on y
 
     model_card += wandb_info
 
-    with open(os.path.join(repo_folder, "README.md"), "w") as f:
+    with open(os.path.join(repo_folder, "../README.md"), "w") as f:
         f.write(yaml + model_card)
 
 
@@ -1193,7 +1193,7 @@ def main():
                 arch_vector = hyper_net(encoder_hidden_states)
                 arch_vector_quantized, q_loss, _ = quantizer(arch_vector)
 
-                contrastive_loss = clip_loss(torch.sum(encoder_hidden_states, dim=1).squeeze(1), arch_vector_quantized)
+                contrastive_loss = clip_loss(torch.sum(encoder_hidden_states, dim=1).squeeze(1), arch_vector)
 
                 unet.set_structure(arch_vector_quantized)
 
@@ -1246,7 +1246,7 @@ def main():
                     raise ValueError(f"Unknown resource loss type {args.resource_loss_type}")
                 loss += resource_loss
                 loss += q_loss
-                loss += contrastive_loss
+                loss += 0.1 * contrastive_loss
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
