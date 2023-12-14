@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers import ModelMixin
 
-from torch.nn.utils import weight_norm
+from torch.nn.utils.parametrizations import weight_norm
 
 
 class SimpleGate(nn.Module):

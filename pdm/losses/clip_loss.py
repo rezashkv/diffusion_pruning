@@ -7,7 +7,6 @@ class ClipLoss(nn.Module):
         super().__init__()
         self.temperature = temperature
 
-    @staticmethod
     def forward(self, prompt_embeddings, arch_vectors):
         arch_vectors_similarity = F.softmax(arch_vectors @ arch_vectors.T, dim=-1)
         texts_similarity = F.softmax(prompt_embeddings @ prompt_embeddings.T, dim=-1)

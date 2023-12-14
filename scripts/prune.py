@@ -228,69 +228,6 @@ def log_validation(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, arg
     return images
 
 
-def log_validation_latents(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, epoch):
-    logger.info("Running validation... ")
-
-    hyper_net.eval()
-    quantizer.eval()
-    pipeline = StableDiffusionPruningPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        vae=accelerator.unwrap_model(vae),
-        text_encoder=accelerator.unwrap_model(text_encoder),
-        tokenizer=tokenizer,
-        unet=accelerator.unwrap_model(unet),
-        safety_checker=None,
-        revision=args.revision,
-        torch_dtype=weight_dtype,
-        hyper_net=hyper_net,
-        quantizer=quantizer,
-    )
-
-    pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
-
-    if args.enable_xformers_memory_efficient_attention:
-        pipeline.enable_xformers_memory_efficient_attention()
-
-    if args.seed is None:
-        generator = None
-    else:
-        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-
-    images = []
-    for i in range(len(args.validation_prompts)):
-        with torch.autocast("cuda"):
-            images_l = pipeline.sample_progressive(args.validation_prompts[i],
-                                                 num_inference_steps=100, generator=generator).images
-
-        images.append(images_l)
-
-    # images = [item for sublist in images for item in sublist]
-
-
-    for tracker in accelerator.trackers:
-        if tracker.name == "tensorboard":
-            np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
-        elif tracker.name == "wandb":
-            tracker.log(
-                {
-                    "validation": [
-                        # log the grid of images
-                        wandb.Image(image, caption=f"{i}, {j}: {args.validation_prompts[i]}")
-                        for i, image_l in enumerate(images) for j, image in enumerate(image_l)
-                    ]
-                }
-            )
-        else:
-            logger.warn(f"image logging not implemented for {tracker.name}")
-
-    del pipeline
-    torch.cuda.empty_cache()
-
-    return images
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Dynamic Pruning of StableDiffusion-2.1")
     parser.add_argument(
@@ -887,7 +824,10 @@ def main():
 
         # TODO possibly two learning rates for hypernet and quantizer
         optimizer = optimizer_cls(
-            list(hyper_net.parameters()) + list(quantizer.parameters()),
+            [
+                {"params": hyper_net.parameters(), "lr": args.learning_rate},
+                {"params": quantizer.parameters(), "lr": args.learning_rate},
+            ],
             lr=args.learning_rate,
             betas=(args.adam_beta1, args.adam_beta2),
             weight_decay=args.adam_weight_decay,
@@ -897,7 +837,11 @@ def main():
     else:
         # TODO possibly two learning rates for hypernet and quantizer
         optimizer = optimizer_cls(
-            list(hyper_net.parameters()) + list(quantizer.parameters()),
+            [
+                {"params": hyper_net.parameters(), "lr": args.learning_rate},
+                {"params": quantizer.parameters(), "lr": args.learning_rate},
+                {"params": unet.parameters(), "lr": args.learning_rate},
+            ],
             lr=args.learning_rate,
             betas=(args.adam_beta1, args.adam_beta2),
             weight_decay=args.adam_weight_decay,
@@ -921,6 +865,10 @@ def main():
         )
     else:
         if "aesthetics" in args.train_data_dir:
+            if args.data_files is None:
+
+                # datafiles a list of 5-char strs from 00000 to 00200
+                args.data_files = [f"{i:05d}" for i in range(250)]
             def load_dataset_dir(dataset_dir):
                 dataset = []
                 image_files = [f for f in os.listdir(dataset_dir) if f.endswith('.jpg')]
@@ -954,7 +902,6 @@ def main():
             for dataset_name, dataset in train_data.items():
                 tr_datasets.append(Dataset.from_list(dataset))
 
-            # Now, you have a dictionary of Hugging Face datasets where each key is the dataset name and the value is the dataset.
             dataset = {'train': concatenate_datasets(tr_datasets)}
 
         else:
@@ -1023,7 +970,7 @@ def main():
 
     def preprocess_train(examples):
         # if image_column contains urls or paths to files, convert to bytes
-        #check if image_column path exists:
+        # check if image_column path exists:
         if isinstance(examples[image_column][0], str):
             if not os.path.exists(examples[image_column][0]):
                 examples[image_column] = [requests.get(image).content for image in examples[image_column]]
@@ -1245,7 +1192,7 @@ def main():
                 else:
                     raise ValueError(f"Unknown resource loss type {args.resource_loss_type}")
                 loss += resource_loss
-                loss += q_loss
+                loss += 0.5 * q_loss
                 loss += 0.1 * contrastive_loss
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()

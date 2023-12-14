@@ -22,6 +22,6 @@ def hard_concrete(out):
     out_hard[out < 0.5] = 0
     if out.is_cuda:
         out_hard = out_hard.cuda()
-    # Set gradients w.r.t. y_hard gradients w.r.t. y
+    # Straight through estimation
     out_hard = (out_hard - out).detach() + out
     return out_hard
