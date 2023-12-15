@@ -1,0 +1,15 @@
+accelerate==0.24.1
+bitsandbytes==0.41.3.post2
+datasets==2.14.5
+diffusers==0.22.0.dev0
+huggingface_hub==0.17.3
+numpy==1.26.2
+packaging==23.2
+Pillow==10.1.0
+Requests==2.31.0
+torch==2.0.1+cu118
+torchvision==0.15.2+cu118
+torchaudio==2.0.2+cu118
+tqdm==4.66.1
+transformers==4.34.1
+xformers==0.0.22.post7
