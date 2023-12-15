@@ -7,7 +7,7 @@ name = "pdm"
 dynamic = ["version"]
 description = "Pruning Diffusion Models"
 readme = "README.md"
-license-files = { paths = ["LICENSE-CODE"] }
+license-files = { paths = ["LICENSE"] }
 requires-python = ">=3.8"
 
 [project.urls]

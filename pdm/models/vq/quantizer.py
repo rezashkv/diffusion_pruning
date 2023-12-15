@@ -3,12 +3,13 @@ from typing import Tuple, Union, Callable, Optional
 
 import numpy as np
 import torch
+from diffusers.configuration_utils import register_to_config, ConfigMixin
 from torch import nn
 from pdm.utils.estimation_utils import gumbel_softmax_sample, hard_concrete
 from diffusers import ModelMixin
 
 
-class StructureVectorQuantizer(ModelMixin):
+class StructureVectorQuantizer(ModelMixin, ConfigMixin):
     """
     Improved version over VectorQuantizer, can be used as a drop-in replacement. Mostly avoids costly matrix
     multiplications and allows for post-hoc remapping of indices.
@@ -17,6 +18,7 @@ class StructureVectorQuantizer(ModelMixin):
     # NOTE: due to a bug the beta term was applied to the wrong term. for
     # backwards compatibility we use the buggy version by default, but you can
     # specify legacy=False to fix it.
+    @register_to_config
     def __init__(
             self,
             n_e: int,
@@ -133,28 +135,10 @@ class StructureVectorQuantizer(ModelMixin):
 
         return z_q
 
-    def save_pretrained(
-            self,
-            save_directory: Union[str, os.PathLike],
-            is_main_process: bool = True,
-            save_function: Callable = None,
-            safe_serialization: bool = True,
-            variant: Optional[str] = None,
-            push_to_hub: bool = False,
-            **kwargs,
-    ):
-        # save the hyper_net state
-        torch.save(self.state_dict(), os.path.join(save_directory, "quantizer.pt"))
-
-    def from_pretrained(cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], **kwargs):
-        # load the hyper_net state
-        model = cls(**kwargs)
-        model.load_state_dict(torch.load(os.path.join(pretrained_model_name_or_path, "quantizer.pt")))
-        return model
-
     def print_param_stats(self):
-        print("Quantizer")
         for name, param in self.named_parameters():
             if "weight" in name:
                 print(f"{name}: {param.mean()}, {param.std()}")
-        print("")
+
+
+

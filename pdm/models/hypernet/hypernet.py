@@ -11,7 +11,8 @@ from typing import Union, Callable, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers import ModelMixin
+from diffusers import ModelMixin, ConfigMixin
+from diffusers.configuration_utils import register_to_config
 
 from torch.nn.utils.parametrizations import weight_norm
 
@@ -25,7 +26,8 @@ class SimpleGate(nn.Module):
         return self.weight
 
 
-class HyperStructure(ModelMixin):
+class HyperStructure(ModelMixin, ConfigMixin):
+    @register_to_config
     def __init__(self, input_dim=1024, seq_len=77, structure=None, T=0.4, sparsity=0, base=2, wn_flag=True):
         super(HyperStructure, self).__init__()
 
@@ -53,31 +55,10 @@ class HyperStructure(ModelMixin):
 
         self.iteration = 0
 
-        # print the mean and std of the weights of the gru
-
     def forward(self, x):
-        # expand x so the first dim has len(structure) copies
-        # x = x.expand(len(self.structure), x.size(1), x.size(2))
         self.iteration += 1
         out = self._forward(x)
-        # if not self.training:
-        #     out = hard_concrete(out)
         return out
-
-    # def transform_output(self, x):
-    #     arch_vector = []
-    #     start = 0
-    #     for i in range(len(self.structure)):
-    #         end = start + self.structure[i]
-    #         arch_vector.append(x[start:end])
-    #         start = end
-    #
-    #     return arch_vector
-
-    # def resource_output(self, x):
-    #     out = self._forward(x)
-    #     out = hard_concrete(out)
-    #     return out.squeeze()
 
     def _forward(self, x):
         # x: B * L * D
@@ -90,32 +71,10 @@ class HyperStructure(ModelMixin):
         outputs = [self.mh_fc[i](outputs[i]) for i in range(len(self.mh_fc))]
 
         out = torch.cat(outputs, dim=1)
-        # out = gumbel_softmax_sample(out, temperature=self.T, offset=self.base)
 
         return out
 
-    def save_pretrained(
-        self,
-        save_directory: Union[str, os.PathLike],
-        is_main_process: bool = True,
-        save_function: Callable = None,
-        safe_serialization: bool = True,
-        variant: Optional[str] = None,
-        push_to_hub: bool = False,
-        **kwargs,
-    ):
-        # save the hyper_net state
-        torch.save(self.state_dict(), os.path.join(save_directory, "hyper_net.pt"))
-
-    def from_pretrained(cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], **kwargs):
-        # load the hyper_net state
-        model = cls(**kwargs)
-        model.load_state_dict(torch.load(os.path.join(pretrained_model_name_or_path, "hyper_net.pt")))
-        return model
-
     def print_param_stats(self):
-        print("HyperNet")
         for name, param in self.named_parameters():
             if "weight" in name:
                 print(f"{name}: {param.mean()}, {param.std()}")
-        print("")

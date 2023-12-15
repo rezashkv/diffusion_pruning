@@ -527,8 +527,6 @@ def parse_args():
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
-
-    parser.add_argument("--pruning", action="store_true", help="Whether to prune the model.")
     parser.add_argument("--clip_loss_temperature", type=float, default=0.07,
                         help="The temperature for the clip loss.")
     parser.add_argument(
@@ -623,7 +621,8 @@ def main():
         )
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
-    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
+    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir,
+                                                      total_limit=args.checkpoints_total_limit)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -694,26 +693,20 @@ def main():
         vae = AutoencoderKL.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision
         )
-    if args.pruning:
-        unet = UNet2DConditionModelGated.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision,
-            down_block_types=args.unet_down_blocks, up_block_types=args.unet_up_blocks
-        )
-        hyper_net = HyperStructure(input_dim=text_encoder.config.hidden_size,
-                                   seq_len=text_encoder.config.max_position_embeddings,
-                                   structure=unet.get_structure(),
-                                   T=args.hypernet_T, base=args.hypernet_base)
+    unet = UNet2DConditionModelGated.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision,
+        down_block_types=args.unet_down_blocks, up_block_types=args.unet_up_blocks
+    )
+    hyper_net = HyperStructure(input_dim=text_encoder.config.hidden_size,
+                               seq_len=text_encoder.config.max_position_embeddings,
+                               structure=unet.get_structure(),
+                               T=args.hypernet_T, base=args.hypernet_base)
 
-        quantizer = StructureVectorQuantizer(n_e=args.num_arch_vq_codebook_embeddings,
-                                             vq_embed_dim=sum(unet.get_structure()), beta=args.arch_vq_beta,
-                                             temperature=args.hypernet_T, base=args.hypernet_base)
+    quantizer = StructureVectorQuantizer(n_e=args.num_arch_vq_codebook_embeddings,
+                                         vq_embed_dim=sum(unet.get_structure()), beta=args.arch_vq_beta,
+                                         temperature=args.hypernet_T, base=args.hypernet_base)
 
-        clip_loss = ClipLoss(temperature=args.clip_loss_temperature)
-
-    else:
-        unet = UNet2DConditionModel.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
-        )
+    clip_loss = ClipLoss(temperature=args.clip_loss_temperature)
 
     # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
@@ -721,26 +714,17 @@ def main():
 
     # Create EMA for the unet.
     if args.use_ema:
-        if args.pruning:
-            ema_unet = UNet2DConditionModelGated.from_pretrained(
-                args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision,
-                down_block_types=args.unet_down_blocks, up_block_types=args.unet_up_blocks
-            )
-            ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModelGated,
-                                model_config=ema_unet.config)
-        else:
-            ema_unet = UNet2DConditionModel.from_pretrained(
-                args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
-            )
-            ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel, model_config=ema_unet.config)
+        ema_unet = UNet2DConditionModelGated.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision,
+            down_block_types=args.unet_down_blocks, up_block_types=args.unet_up_blocks
+        )
+        ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModelGated,
+                            model_config=ema_unet.config)
 
-    if args.pruning:
-        unet.eval()
-        unet.freeze()
-        hyper_net.train()
-        quantizer.train()
-    else:
-        unet.train()
+    unet.eval()
+    unet.freeze()
+    hyper_net.train()
+    quantizer.train()
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -764,7 +748,15 @@ def main():
                     ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
 
                 for i, model in enumerate(models):
-                    model.save_pretrained(os.path.join(output_dir, "unet"))
+                    if isinstance(model, (UNet2DConditionModel, UNet2DConditionModelGated)):
+                        logger.info("Save UNet")
+                        model.save_pretrained(os.path.join(output_dir, "unet"))
+                    elif isinstance(model, HyperStructure):
+                        logger.info(f"Saving HyperStructure")
+                        model.save_pretrained(os.path.join(output_dir, "hypernet"))
+                    elif isinstance(model, StructureVectorQuantizer):
+                        logger.info(f"Saving Quantizer")
+                        model.save_pretrained(os.path.join(output_dir, "quantizer"))
 
                     # make sure to pop weight so that corresponding model is not saved again
                     weights.pop()
@@ -781,14 +773,20 @@ def main():
                 model = models.pop()
 
                 # load diffusers style into model
-                if args.pruning:
-                    load_model = UNet2DConditionModelGated.from_pretrained(input_dir, subfolder="unet")
-                else:
-                    load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
-                model.register_to_config(**load_model.config)
+                if isinstance(model, (UNet2DConditionModel, UNet2DConditionModelGated)):
 
-                model.load_state_dict(load_model.state_dict())
-                del load_model
+                    load_model = UNet2DConditionModelGated.from_pretrained(input_dir, subfolder="unet")
+
+                    model.register_to_config(**load_model.config)
+
+                    model.load_state_dict(load_model.state_dict())
+                    del load_model
+                elif isinstance(model, HyperStructure):
+                    model.from_pretrained(input_dir, subfolder="hypernet")
+                elif isinstance(model, StructureVectorQuantizer):
+                    model.from_pretrained(input_dir, subfolder="quantizer")
+                else:
+                    models.append(model)
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -818,35 +816,22 @@ def main():
         optimizer_cls = bnb.optim.AdamW8bit
     else:
         optimizer_cls = torch.optim.AdamW
-    if args.pruning:
-        unet = add_flops_counting_methods(unet)
-        unet.start_flops_count(ost=sys.stdout, verbose=False, ignore_list=[])
 
-        # TODO possibly two learning rates for hypernet and quantizer
-        optimizer = optimizer_cls(
-            [
-                {"params": hyper_net.parameters(), "lr": args.learning_rate},
-                {"params": quantizer.parameters(), "lr": args.learning_rate},
-            ],
-            lr=args.learning_rate,
-            betas=(args.adam_beta1, args.adam_beta2),
-            weight_decay=args.adam_weight_decay,
-            eps=args.adam_epsilon,
-        )
+    unet = add_flops_counting_methods(unet)
+    unet.start_flops_count(ost=sys.stdout, verbose=False, ignore_list=[])
 
-    else:
-        # TODO possibly two learning rates for hypernet and quantizer
-        optimizer = optimizer_cls(
-            [
-                {"params": hyper_net.parameters(), "lr": args.learning_rate},
-                {"params": quantizer.parameters(), "lr": args.learning_rate},
-                {"params": unet.parameters(), "lr": args.learning_rate},
-            ],
-            lr=args.learning_rate,
-            betas=(args.adam_beta1, args.adam_beta2),
-            weight_decay=args.adam_weight_decay,
-            eps=args.adam_epsilon,
-        )
+    # TODO possibly two learning rates for hypernet and quantizer
+    optimizer = optimizer_cls(
+        [
+            {"params": hyper_net.parameters(), "lr": args.learning_rate},
+            {"params": quantizer.parameters(), "lr": args.learning_rate},
+        ],
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+
 
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
@@ -1139,8 +1124,13 @@ def main():
 
                 arch_vector = hyper_net(encoder_hidden_states)
                 arch_vector_quantized, q_loss, _ = quantizer(arch_vector)
-
                 contrastive_loss = clip_loss(torch.sum(encoder_hidden_states, dim=1).squeeze(1), arch_vector)
+
+                if not hasattr(unet, "total_flops"):
+                    with torch.no_grad():
+                        unet.set_structure(torch.ones_like(arch_vector_quantized))
+                        unet(noisy_latents, timesteps, encoder_hidden_states)
+                        unet.total_flops = unet.compute_average_flops_cost()[0]
 
                 unet.set_structure(arch_vector_quantized)
 
@@ -1176,17 +1166,15 @@ def main():
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                     loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                     loss = loss.mean()
+
                 curr_flops, _ = unet.compute_average_flops_cost()
 
-                if global_step == 0:
-                    unet.__total_flops__ = curr_flops
-
-                resource_ratio = (curr_flops / unet.__total_flops__)
+                resource_ratio = (curr_flops / unet.total_flops)
                 if args.resource_loss_type == "log":
-                    abs_rv = torch.clamp(torch.tensor(resource_ratio), min=args.pruning_p)
+                    abs_rv = torch.clamp(resource_ratio, min=args.pruning_p)
                     resource_loss = torch.log(abs_rv / args.pruning_p)
                 elif args.resource_loss_type == "mae":
-                    resource_loss = torch.abs(torch.tensor(resource_ratio - args.pruning_p))
+                    resource_loss = torch.abs(resource_ratio - args.pruning_p)
                 elif args.resource_loss_type == "mse":
                     resource_loss = (resource_ratio - args.pruning_p) ** 2
                 else:
@@ -1314,10 +1302,6 @@ def main():
                     image = pipeline(args.validation_prompts[i], num_inference_steps=20, generator=generator).images[0]
                 images.append(image)
 
-        # save images to disk
-        # if args.output_dir is not None:
-        #     for i, image in enumerate(images):
-        #         image.save(os.path.join(args.output_dir, f"image_{i}.png"))
 
         if args.push_to_hub:
             save_model_card(args, repo_id, images, repo_folder=args.output_dir)
