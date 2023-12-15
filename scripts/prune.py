@@ -527,7 +527,7 @@ def parse_args():
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
-    parser.add_argument("--clip_loss_temperature", type=float, default=0.07,
+    parser.add_argument("--clip_loss_temperature", type=float, default=1.0,
                         help="The temperature for the clip loss.")
     parser.add_argument(
         "--hypernet_T",
@@ -590,6 +590,22 @@ def parse_args():
                         required=False,
                         choices=["log", "mae", "mse"],
                         help="The resource loss type. Choose between `log`, `mae` and `mse`.")
+
+    parser.add_argument("--resource_loss_weight",
+                        type=float,
+                        default=1.0,
+                        required=False,
+                        help="The resource loss weight.")
+    parser.add_argument("--q_loss_weight",
+                        type=float,
+                        default=1.0,
+                        required=False,
+                        help="The quantizer loss weight.")
+    parser.add_argument("--contrastive_loss_weight",
+                        type=float,
+                        default=1.0,
+                        required=False,
+                        help="The contrastive loss weight.")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -1179,14 +1195,15 @@ def main():
                     resource_loss = (resource_ratio - args.pruning_p) ** 2
                 else:
                     raise ValueError(f"Unknown resource loss type {args.resource_loss_type}")
-                loss += resource_loss
-                loss += 0.5 * q_loss
-                loss += 0.1 * contrastive_loss
+                loss += args.resource_loss_weight * resource_loss
+                loss += args.q_loss_weight * q_loss
+                loss += args.contrastive_loss_weight * contrastive_loss
+
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
-                # Backpropagate
+                # Back-propagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
@@ -1204,6 +1221,9 @@ def main():
                 train_loss = 0.0
                 accelerator.log({"resource_ratio": resource_ratio}, step=global_step)
                 accelerator.log({"resource_loss": resource_loss}, step=global_step)
+                accelerator.log({"q_loss": q_loss}, step=global_step)
+                accelerator.log({"contrastive_loss": contrastive_loss}, step=global_step)
+                accelerator.log({"lr": lr_scheduler.get_last_lr()[0]}, step=global_step)
 
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
@@ -1232,7 +1252,9 @@ def main():
 
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0],
+                    "q_loss": q_loss.detach().item(), "contrastive_loss": contrastive_loss.detach().item(),
+                    "resource_loss": resource_loss.detach().item()}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
