@@ -25,6 +25,7 @@ from pathlib import Path
 import PIL
 import accelerate
 import numpy as np
+import pandas as pd
 import requests
 import torch
 import torch.nn.functional as F
@@ -54,7 +55,7 @@ from diffusers.utils import check_min_version, deprecate, is_wandb_available, ma
 from diffusers.utils.import_utils import is_xformers_available
 from pdm.models import HyperStructure
 from pdm.models import StructureVectorQuantizer
-from pdm.losses import ClipLoss
+from pdm.losses import ClipLoss, ResourceLoss
 
 if is_wandb_available():
     import wandb
@@ -62,7 +63,7 @@ if is_wandb_available():
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.22.0.dev0")
 
-logger = get_logger(__name__, log_level="INFO")
+logger = get_logger(__name__)
 
 DATASET_NAME_MAPPING = {
     "lambdalabs/pokemon-blip-captions": ("image", "text"),
@@ -146,7 +147,8 @@ image.save("my_image.png")
 These are the key hyperparameters used during training:
 
 * Epochs: {args.num_train_epochs}
-* Learning rate: {args.learning_rate}
+* Hypernet Learning rate: {args.hypernet_learning_rate}
+* Quantizer Learning rate: {args.quantizer_learning_rate}
 * Batch size: {args.train_batch_size}
 * Gradient accumulation steps: {args.gradient_accumulation_steps}
 * Image resolution: {args.resolution}
@@ -199,12 +201,22 @@ def log_validation(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, arg
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
+    image_output_dir = os.path.join(args.output_dir, "validation_images", f"epoch_{epoch}")
+    os.makedirs(image_output_dir, exist_ok=True)
     images = []
-    for i in range(len(args.validation_prompts)):
+    for step in range(0, len(args.validation_prompts), args.train_batch_size * accelerator.num_processes):
+        batch = args.validation_prompts[step:step + args.train_batch_size * accelerator.num_processes]
         with torch.autocast("cuda"):
-            image = pipeline(args.validation_prompts[i], num_inference_steps=100, generator=generator).images[0]
+            with accelerator.split_between_processes(batch) as batch:
+                gen_images = pipeline(batch, num_inference_steps=args.num_inference_steps, generator=generator).images
+                for i, image in enumerate(gen_images):
+                    try:
+                        image.save(os.path.join(image_output_dir, f"{step + i}.png"))
+                    except Exception as e:
+                        logger.error(f"Error saving image {batch[i]}: {e}")
 
-        images.append(image)
+                if step == 0:
+                    images = gen_images
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
@@ -231,7 +243,8 @@ def log_validation(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, arg
 def parse_args():
     parser = argparse.ArgumentParser(description="Dynamic Pruning of StableDiffusion-2.1")
     parser.add_argument(
-        "--input_perturbation", type=float, default=0, help="The scale of input perturbation. Recommended 0.1."
+        "--input_perturbation", type=float, default=0,
+        help="The scale of input perturbation. Recommended 0.1."
     )
     parser.add_argument(
         "--pretrained_model_name_or_path",
@@ -365,11 +378,14 @@ def parse_args():
         help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
     )
     parser.add_argument(
-        "--learning_rate",
+        "--hypernet_learning_rate",
         type=float,
         default=1e-1,
-        help="Initial learning rate (after the potential warmup period) to use.",
+        help="Initial hypernet learning rate (after the potential warmup period) to use.",
     )
+    parser.add_argument("--quantizer_learning_rate",
+                        help="Initial quantizer learning rate (after the potential warmup period) to use.",
+                        type=float, default=1e-1)
     parser.add_argument(
         "--scale_lr",
         action="store_true",
@@ -527,7 +543,9 @@ def parse_args():
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
-    parser.add_argument("--clip_loss_temperature", type=float, default=1.0,
+    parser.add_argument("--num_inference_steps", type=int, default=100,
+                        help="The number of inference steps to run.")
+    parser.add_argument("--contrastive_loss_temperature", type=float, default=1.0,
                         help="The temperature for the clip loss.")
     parser.add_argument(
         "--hypernet_T",
@@ -579,7 +597,7 @@ def parse_args():
         default=("UpBlock2DHalfGated", "CrossAttnUpBlock2DHalfGated", "CrossAttnUpBlock2DHalfGated",
                  "CrossAttnUpBlock2DHalfGated"),
     )
-    parser.add_argument("--pruning_p",
+    parser.add_argument("--pruning_target",
                         type=float,
                         required=False,
                         default=0.7,
@@ -639,6 +657,26 @@ def main():
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir,
                                                       total_limit=args.checkpoints_total_limit)
+
+    # if validation_prompts is a file or a dir, load the prompts from there
+    if args.validation_prompts is not None:
+        if args.validation_prompts[0].endswith(".csv"):
+            validation_data = pd.read_csv(args.validation_prompts[0], sep="\t", header=None,
+                                          names=[args.image_column, args.caption_column])[
+                args.caption_column].values.astype(str).tolist()
+            args.validation_prompts = validation_data
+
+        elif os.path.isfile(args.validation_prompts[0]):
+            with open(args.validation_prompts[0], "r") as f:
+                args.validation_prompts = [line.strip() for line in f.readlines()]
+        elif os.path.isdir(args.validation_prompts[0]):
+            prompts = []
+            for d in args.validation_prompts:
+                files = [os.path.join(d, caption_file) for caption_file in os.listdir(d) if f.endswith(".txt")]
+                for f in files:
+                    with open(f, "r") as f:
+                        prompts.extend([line.strip() for line in f.readlines()])
+            args.validation_prompts = prompts
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -722,7 +760,8 @@ def main():
                                          vq_embed_dim=sum(unet.get_structure()), beta=args.arch_vq_beta,
                                          temperature=args.hypernet_T, base=args.hypernet_base)
 
-    clip_loss = ClipLoss(temperature=args.clip_loss_temperature)
+    r_loss = ResourceLoss(p=args.pruning_target, loss_type=args.resource_loss_type)
+    clip_loss = ClipLoss(temperature=args.contrastive_loss_temperature)
 
     # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
@@ -816,8 +855,11 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
 
     if args.scale_lr:
-        args.learning_rate = (
-                args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+        args.hypernet_learning_rate = (
+                args.hypernet_learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+        )
+        args.quantizer_learning_rate = (
+                args.quantizer_learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
     # Initialize the optimizer
@@ -836,18 +878,16 @@ def main():
     unet = add_flops_counting_methods(unet)
     unet.start_flops_count(ost=sys.stdout, verbose=False, ignore_list=[])
 
-    # TODO possibly two learning rates for hypernet and quantizer
     optimizer = optimizer_cls(
         [
-            {"params": hyper_net.parameters(), "lr": args.learning_rate},
-            {"params": quantizer.parameters(), "lr": args.learning_rate},
+            {"params": hyper_net.parameters(), "lr": args.hypernet_learning_rate},
+            {"params": quantizer.parameters(), "lr": args.quantizer_learning_rate},
         ],
-        lr=args.learning_rate,
+        lr=args.hypernet_learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
-
 
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
@@ -867,9 +907,9 @@ def main():
     else:
         if "aesthetics" in args.train_data_dir:
             if args.data_files is None:
-
                 # datafiles a list of 5-char strs from 00000 to 00200
                 args.data_files = [f"{i:05d}" for i in range(250)]
+
             def load_dataset_dir(dataset_dir):
                 dataset = []
                 image_files = [f for f in os.listdir(dataset_dir) if f.endswith('.jpg')]
@@ -1052,7 +1092,7 @@ def main():
         tracker_config = dict(vars(args))
         tracker_config.pop("validation_prompts")
         accelerator.init_trackers(args.tracker_project_name, tracker_config,
-                                  # init_kwargs={"wandb": {"name": args.run_name}}
+                                  init_kwargs={"wandb": {"name": args.run_name}}
                                   )
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -1140,7 +1180,7 @@ def main():
 
                 arch_vector = hyper_net(encoder_hidden_states)
                 arch_vector_quantized, q_loss, _ = quantizer(arch_vector)
-                contrastive_loss = clip_loss(torch.sum(encoder_hidden_states, dim=1).squeeze(1), arch_vector)
+                contrastive_loss = clip_loss(torch.sum(encoder_hidden_states, dim=1).squeeze(1), arch_vector_quantized)
 
                 if not hasattr(unet, "total_flops"):
                     with torch.no_grad():
@@ -1186,15 +1226,8 @@ def main():
                 curr_flops, _ = unet.compute_average_flops_cost()
 
                 resource_ratio = (curr_flops / unet.total_flops)
-                if args.resource_loss_type == "log":
-                    abs_rv = torch.clamp(resource_ratio, min=args.pruning_p)
-                    resource_loss = torch.log(abs_rv / args.pruning_p)
-                elif args.resource_loss_type == "mae":
-                    resource_loss = torch.abs(resource_ratio - args.pruning_p)
-                elif args.resource_loss_type == "mse":
-                    resource_loss = (resource_ratio - args.pruning_p) ** 2
-                else:
-                    raise ValueError(f"Unknown resource loss type {args.resource_loss_type}")
+                resource_loss = r_loss(resource_ratio)
+
                 loss += args.resource_loss_weight * resource_loss
                 loss += args.q_loss_weight * q_loss
                 loss += args.contrastive_loss_weight * contrastive_loss
@@ -1261,12 +1294,13 @@ def main():
                 break
 
         if accelerator.is_main_process:
-            if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
+            if args.validation_prompts is not None and (epoch % args.validation_epochs == 0 or
+                                                        epoch == args.num_train_epochs - 1):
                 if args.use_ema:
                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                     ema_unet.store(unet.parameters())
                     ema_unet.copy_to(unet.parameters())
-                log_validation(
+                val_images = log_validation(
                     hyper_net,
                     quantizer,
                     vae,
@@ -1284,49 +1318,10 @@ def main():
 
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
+
     if accelerator.is_main_process:
-        unet = accelerator.unwrap_model(unet)
-        if args.use_ema:
-            ema_unet.copy_to(unet.parameters())
-
-        pipeline = StableDiffusionPruningPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
-            text_encoder=text_encoder,
-            vae=vae,
-            unet=unet,
-            revision=args.revision,
-            tokenizer=tokenizer,
-            hyper_net=hyper_net,
-            quantizer=quantizer,
-        )
-        # pipeline.save_pretrained(args.output_dir)
-        hyper_net.save_pretrained(args.output_dir)
-        quantizer.save_pretrained(args.output_dir)
-
-        # Run a final round of inference.
-        images = []
-        if args.validation_prompts is not None:
-            logger.info("Running inference for collecting generated images...")
-            pipeline = pipeline.to(accelerator.device)
-            pipeline.torch_dtype = weight_dtype
-            pipeline.set_progress_bar_config(disable=True)
-
-            if args.enable_xformers_memory_efficient_attention:
-                pipeline.enable_xformers_memory_efficient_attention()
-
-            if args.seed is None:
-                generator = None
-            else:
-                generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-
-            for i in range(len(args.validation_prompts)):
-                with torch.autocast("cuda"):
-                    image = pipeline(args.validation_prompts[i], num_inference_steps=20, generator=generator).images[0]
-                images.append(image)
-
-
         if args.push_to_hub:
-            save_model_card(args, repo_id, images, repo_folder=args.output_dir)
+            save_model_card(args, repo_id, val_images, repo_folder=args.output_dir)
             upload_folder(
                 repo_id=repo_id,
                 folder_path=args.output_dir,
