@@ -56,9 +56,12 @@ from diffusers.utils.import_utils import is_xformers_available
 from pdm.models import HyperStructure
 from pdm.models import StructureVectorQuantizer
 from pdm.losses import ClipLoss, ResourceLoss
+from PIL import ImageFile
 
 if is_wandb_available():
     import wandb
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.22.0.dev0")
@@ -187,7 +190,7 @@ def log_validation(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, arg
         revision=args.revision,
         torch_dtype=weight_dtype,
         hyper_net=hyper_net,
-        quantizer=quantizer
+        quantizer=quantizer,
     )
 
     pipeline = pipeline.to(accelerator.device)
@@ -238,6 +241,10 @@ def log_validation(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, arg
     torch.cuda.empty_cache()
 
     return images
+
+
+def interpret_quantizer_codebook(quantizer, args):
+    pass
 
 
 def parse_args():
@@ -319,6 +326,9 @@ def parse_args():
         nargs="+",
         help=("A set of prompts evaluated every `--validation_epochs` and logged to `--report_to`."),
     )
+    parser.add_argument("--num_validation_samples", type=int, default=16,
+                        help="The number of validation samples to generate.")
+
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -543,6 +553,8 @@ def parse_args():
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="The `run_name` argument passed to Accelerator.init_trackers")
     parser.add_argument("--num_inference_steps", type=int, default=100,
                         help="The number of inference steps to run.")
     parser.add_argument("--contrastive_loss_temperature", type=float, default=1.0,
@@ -660,7 +672,7 @@ def main():
 
     # if validation_prompts is a file or a dir, load the prompts from there
     if args.validation_prompts is not None:
-        if args.validation_prompts[0].endswith(".csv"):
+        if args.validation_prompts[0].endswith(".csv") or args.validation_prompts[0].endswith(".tsv"):
             validation_data = pd.read_csv(args.validation_prompts[0], sep="\t", header=None,
                                           names=[args.image_column, args.caption_column])[
                 args.caption_column].values.astype(str).tolist()
@@ -677,6 +689,9 @@ def main():
                     with open(f, "r") as f:
                         prompts.extend([line.strip() for line in f.readlines()])
             args.validation_prompts = prompts
+
+    if args.num_validation_samples is not None:
+        args.validation_prompts = args.validation_prompts[:args.num_validation_samples]
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -894,6 +909,7 @@ def main():
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
+    logger.info("Loading dataset...")
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         dataset = load_dataset(
@@ -944,6 +960,45 @@ def main():
                 tr_datasets.append(Dataset.from_list(dataset))
 
             dataset = {'train': concatenate_datasets(tr_datasets)}
+
+        elif "captions" in args.train_data_dir:
+            captions = pd.read_csv(os.path.join(args.train_data_dir, "Train_GCC-training.tsv"),
+                                   sep="\t", header=None, names=["caption", "link"],
+                                   dtype={"caption": str, "link": str})
+            images = os.listdir(os.path.join(args.train_data_dir, "training"))
+            images = [os.path.join(args.train_data_dir, "training", image) for image in images]
+            if os.path.exists(os.path.join(args.output_dir, "cc3m_bad_images.txt")):
+                with open(os.path.join(args.output_dir, "cc3m_bad_images.txt"), "r") as f:
+                    bad_images = f.readlines()
+                bad_images = [image.strip() for image in bad_images]
+                images = set(images) - set(bad_images)
+                images = list(images)
+
+            else:
+                # remove images that cant be opened by PIL
+                imgs = []
+                bad_images = []
+                PIL.Image.MAX_IMAGE_PIXELS = 933120000
+                for image in images:
+                    try:
+                        with PIL.Image.open(image) as img:
+                            imgs.append(img)
+                    except PIL.UnidentifiedImageError:
+                        bad_images.append(image)
+                        logger.info(
+                            f"Image file `{image}` is corrupt and can't be opened."
+                        )
+                images = imgs
+
+                # save the bad images to a file
+                with open(os.path.join(args.output_dir, "cc3m_bad_images.txt"), "w") as f:
+                    f.write("\n".join(bad_images))
+
+            image_indices = [int(os.path.basename(image).split("_")[0]) for image in images]
+            captions = captions.iloc[image_indices].caption.values.tolist()
+            train_dataset = Dataset.from_dict({"image": images, "caption": captions})
+
+            dataset = {"train": train_dataset}
 
         else:
             data_files = {}
@@ -1017,6 +1072,7 @@ def main():
                 examples[image_column] = [requests.get(image).content for image in examples[image_column]]
             else:
                 examples[image_column] = [PIL.Image.open(image) for image in examples[image_column]]
+
         images = [image.convert("RGB") for image in examples[image_column]]
         examples["pixel_values"] = [train_transforms(image) for image in images]
         examples["input_ids"] = tokenize_captions(examples)
@@ -1091,8 +1147,10 @@ def main():
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
         tracker_config.pop("validation_prompts")
+        if args.wandb_run_name is None:
+            args.wandb_run_name = f"{args.dataset_name if args.dataset_name else args.train_data_dir.split('/')[-1]}-{args.max_train_samples}"
         accelerator.init_trackers(args.tracker_project_name, tracker_config,
-                                  init_kwargs={"wandb": {"name": args.run_name}}
+                                  init_kwargs={"wandb": {"name": args.wandb_run_name}}
                                   )
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -1180,13 +1238,18 @@ def main():
 
                 arch_vector = hyper_net(encoder_hidden_states)
                 arch_vector_quantized, q_loss, _ = quantizer(arch_vector)
-                contrastive_loss = clip_loss(torch.sum(encoder_hidden_states, dim=1).squeeze(1), arch_vector_quantized)
+
+                # gather the arch_vector_quantized across all processes to get large batch for contrastive loss
+                encoder_hidden_states_list = accelerator.gather(encoder_hidden_states)
+                arch_vector_quantized_list = accelerator.gather(arch_vector_quantized)
+                contrastive_loss = clip_loss(torch.sum(encoder_hidden_states_list, dim=1).squeeze(1), arch_vector_quantized_list)
 
                 if not hasattr(unet, "total_flops"):
                     with torch.no_grad():
-                        unet.set_structure(torch.ones_like(arch_vector_quantized))
+                        unet.set_structure(arch_vector_quantized)
                         unet(noisy_latents, timesteps, encoder_hidden_states)
                         unet.total_flops = unet.compute_average_flops_cost()[0]
+                        unet.reset_flops_count()
 
                 unet.set_structure(arch_vector_quantized)
 
@@ -1254,9 +1317,27 @@ def main():
                 train_loss = 0.0
                 accelerator.log({"resource_ratio": resource_ratio}, step=global_step)
                 accelerator.log({"resource_loss": resource_loss}, step=global_step)
-                accelerator.log({"q_loss": q_loss}, step=global_step)
+                accelerator.log({"commitment_loss": q_loss}, step=global_step)
                 accelerator.log({"contrastive_loss": contrastive_loss}, step=global_step)
                 accelerator.log({"lr": lr_scheduler.get_last_lr()[0]}, step=global_step)
+
+                # log the pairwise cosine similarity of the embeddings of the quantizer:
+                if accelerator.num_processes == 1:
+                    # TODO apply gumble softmax to the embeddings before computing the similarity
+                    quantizer_embeddings = quantizer.embedding.weight.data.cpu().numpy()
+                else:
+                    quantizer_embeddings = quantizer.module.embedding.weight.data.cpu().numpy()
+                quantizer_embeddings = quantizer_embeddings / np.linalg.norm(quantizer_embeddings, axis=1, keepdims=True)
+                quantizer_embeddings = quantizer_embeddings @ quantizer_embeddings.T
+                accelerator.log({"quantizer embeddings pairwise similarity": wandb.Image(quantizer_embeddings)},
+                                step=global_step)
+
+                # log the pairwise cosine similarity of the embeddings of the architecture vectors quantized:
+                arch_vector_ = arch_vector_quantized.data.cpu().numpy()
+                arch_vector_ = arch_vector_ / np.linalg.norm(arch_vector_, axis=1, keepdims=True)
+                arch_vector_ = arch_vector_ @ arch_vector_.T
+                accelerator.log({"arch vector pairwise similarity": wandb.Image(arch_vector_)},
+                                step=global_step)
 
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
@@ -1282,6 +1363,10 @@ def main():
 
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
+
+                        # save architecture vector quantized
+                        torch.save(arch_vector_quantized, os.path.join(args.output_dir,
+                                                                       f"arch_vector_quantized-{global_step}.pt"))
 
                         logger.info(f"Saved state to {save_path}")
 
@@ -1334,3 +1419,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+#1520451_2413603269

@@ -321,6 +321,7 @@ MODULES_MAPPING = {
     nn.LeakyReLU: relu_flops_counter_hook,
     nn.ReLU6: relu_flops_counter_hook,
     nn.SiLU: relu_flops_counter_hook,
+    #TODO fix this
     GEGLU: relu_flops_counter_hook,
     # poolings
     nn.MaxPool1d: pool_flops_counter_hook,
@@ -385,8 +386,11 @@ def accumulate_flops(self):
         sum = 0
         for m in self.children():
             sum += m.accumulate_flops()
+
         if isinstance(self, (ResnetBlock2DGated, BasicTransformerBlockGated)):
+            #TODO write as sum of prunable modules
             norm1_flops = self.norm1.accumulate_flops()
+            #TODO include nonlinearity
             prunable_flops = sum - norm1_flops
             hard_out = hard_concrete(self.gate.gate_f)
             current_prunable_flops = prunable_flops * hard_out.sum() / hard_out.numel()
@@ -397,6 +401,7 @@ def accumulate_flops(self):
             prunable_flops = sum - norm1_flops
             hard_out = hard_concrete(self.gate.gate_f)
             current_prunable_flops = prunable_flops * hard_out.sum() / hard_out.numel()
+            #TODO detach current_prunable_flops
             current_total_flops = current_prunable_flops + norm1_flops
             hard_out = hard_concrete(self.depth_gate.gate_f)
             current_total_flops = current_total_flops * hard_out.sum() / hard_out.numel()

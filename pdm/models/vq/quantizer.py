@@ -36,7 +36,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         self.beta = beta
 
         self.embedding = nn.Embedding(self.n_e, self.vq_embed_dim)
-        self.embedding.weight.data.uniform_(-1.0 / self.n_e, 1.0 / self.n_e)
+        nn.init.orthogonal_(self.embedding.weight)
 
         self.remap = remap
         if self.remap is not None:
