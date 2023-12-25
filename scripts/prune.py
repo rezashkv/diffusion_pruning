@@ -738,10 +738,6 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # dump the args to a yaml file
-    with open(os.path.join(args.output_dir, "args.yaml"), "w") as f:
-        yaml.dump(vars(args), f)
-
     if args.non_ema_revision is not None:
         deprecate(
             "non_ema_revision!=None",
@@ -811,6 +807,10 @@ def main():
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
+
+            # dump the args to a yaml file
+            with open(os.path.join(args.output_dir, "args.yaml"), "w") as f:
+                yaml.dump(vars(args), f)
 
         if args.push_to_hub:
             repo_id = create_repo(
@@ -1058,8 +1058,9 @@ def main():
                 images = images[:args.max_train_samples * 5]
 
             images = [os.path.join(args.train_data_dir, "training", image) for image in images]
-            if os.path.exists(os.path.join(args.output_dir, "cc3m_bad_images.txt")):
-                with open(os.path.join(args.output_dir, "cc3m_bad_images.txt"), "r") as f:
+            bad_images_path = "/fs/nexus-scratch/rezashkv/data/sd-pruning/cc3m_bad_images.txt"
+            if os.path.exists(bad_images_path):
+                with open(os.path.join(bad_images_path), "r") as f:
                     bad_images = f.readlines()
                 bad_images = [image.strip() for image in bad_images]
                 images = set(images) - set(bad_images)
@@ -1082,7 +1083,7 @@ def main():
                 images = imgs
 
                 # save the bad images to a file
-                with open(os.path.join(args.output_dir, "cc3m_bad_images.txt"), "w") as f:
+                with open(bad_images_path, "w") as f:
                     f.write("\n".join(bad_images))
 
             image_indices = [int(os.path.basename(image).split("_")[0]) for image in images]
