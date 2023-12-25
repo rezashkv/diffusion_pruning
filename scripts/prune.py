@@ -62,7 +62,6 @@ from pdm.utils.arg_utils import parse_args
 from pdm.utils.metric_utils import compute_snr
 
 
-
 if is_wandb_available():
     import wandb
 
@@ -401,7 +400,9 @@ def main():
                 images = images[:args.max_train_samples * 5]
 
             images = [os.path.join(args.train_data_dir, "training", image) for image in images]
-            bad_images_path = "/fs/nexus-scratch/rezashkv/data/sd-pruning/cc3m_bad_images.txt"
+            bad_images_path = args.bad_images_path
+            if bad_images_path is None:
+                bad_images_path = os.path.join(os.path.dirname(args.output_dir), "cc3m_bad_images.txt")
             if os.path.exists(bad_images_path):
                 with open(os.path.join(bad_images_path), "r") as f:
                     bad_images = f.readlines()
@@ -425,7 +426,8 @@ def main():
                         )
                 images = imgs
 
-                # save the bad images to a file
+                # save the bad images to a file in the parent directory of output_dir
+                bad_images_path = os.path.join(os.path.dirname(args.output_dir), "cc3m_bad_images.txt")
                 with open(bad_images_path, "w") as f:
                     f.write("\n".join(bad_images))
 
@@ -758,10 +760,10 @@ def main():
                 accelerator.log({"lr": lr_scheduler.get_last_lr()[0]}, step=global_step)
 
                 # log the pairwise cosine similarity of the embeddings of the quantizer:
-                if accelerator.num_processes == 1:
-                    quantizer_embeddings = quantizer.embedding.weight.data.cpu().numpy()
-                else:
+                if hasattr(quantizer, "module"):
                     quantizer_embeddings = quantizer.module.embedding.weight.data.cpu().numpy()
+                else:
+                    quantizer_embeddings = quantizer.embedding.weight.data.cpu().numpy()
                 quantizer_embeddings = quantizer_embeddings / np.linalg.norm(quantizer_embeddings, axis=1,
                                                                              keepdims=True)
                 quantizer_embeddings = quantizer_embeddings @ quantizer_embeddings.T

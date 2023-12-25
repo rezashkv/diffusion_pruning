@@ -57,6 +57,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--bad_images_path",
+        type=str,
+        default=None,
+        help=(
+            "A path to a file containing a list of bad images. If specified, these images will be ignored during"
+            " training."
+        ),
+    )
+    parser.add_argument(
         "--image_column", type=str, default="image", help="The column of the dataset containing an image."
     )
     parser.add_argument(
