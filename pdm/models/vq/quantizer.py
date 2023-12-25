@@ -118,7 +118,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
         return z_q, loss, (perplexity, min_encodings, min_encoding_indices)
 
-    def get_codebook_entry(self, indices: torch.LongTensor, shape: Tuple[int, ...]) -> torch.FloatTensor:
+    def get_codebook_entry(self, indices: torch.LongTensor, shape: Tuple[int, ...] = None) -> torch.FloatTensor:
         # shape specifying (batch, dim)
         if self.remap is not None:
             indices = indices.reshape(shape[0], -1)  # add batch axis
@@ -135,10 +135,12 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
         return z_q
 
+    def get_codebook_entry_gumbel_sigmoid(self, indices: torch.LongTensor, shape: Tuple[int, ...] = None) -> torch.FloatTensor:
+        z_q = self.get_codebook_entry(indices, shape)
+        z_q = gumbel_softmax_sample(z_q, temperature=self.temperature, offset=self.base)
+        return z_q
+
     def print_param_stats(self):
         for name, param in self.named_parameters():
             if "weight" in name:
                 print(f"{name}: {param.mean()}, {param.std()}")
-
-
-

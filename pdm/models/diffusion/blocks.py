@@ -1,6 +1,7 @@
 from typing import Optional, Dict, Any
 
 import torch
+import torch.nn.functional as F
 
 from diffusers.models import DualTransformer2DModel, Transformer2DModel
 from diffusers.models.resnet import ResnetBlock2D, Upsample2D, Downsample2D
@@ -11,11 +12,102 @@ from pdm.models.hypernet.gates import BlockVirtualGate
 from diffusers.models.attention import BasicTransformerBlock
 from diffusers.models.unet_2d_blocks import CrossAttnDownBlock2D, CrossAttnUpBlock2D, DownBlock2D, UpBlock2D
 from diffusers.utils import logging, USE_PEFT_BACKEND
+from diffusers.models.attention_processor import AttnProcessor2_0, Attention
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 # TODO extract super classes and reduce code duplication
+
+class GatedAttnProcessor2(AttnProcessor2_0):
+    def __init__(self):
+        super().__init__()
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.FloatTensor,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        temb: Optional[torch.FloatTensor] = None,
+        scale: float = 1.0,
+    ) -> torch.FloatTensor:
+        residual = hidden_states
+
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            # scaled_dot_product_attention expects attention_mask shape to be
+            # (batch, heads, source_length, target_length)
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        args = () if USE_PEFT_BACKEND else (scale,)
+        query = attn.to_q(hidden_states, *args)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = (
+            attn.to_k(encoder_hidden_states, scale=scale) if not USE_PEFT_BACKEND else attn.to_k(encoder_hidden_states)
+        )
+        value = (
+            attn.to_v(encoder_hidden_states, scale=scale) if not USE_PEFT_BACKEND else attn.to_v(encoder_hidden_states)
+        )
+
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        # apply gate
+        query = attn.gate(query)
+        key = attn.gate(key)
+        value = attn.gate(value)
+
+        # the output of sdp = (batch, num_heads, seq_len, head_dim)
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+
+        # linear proj
+        hidden_states = (
+            attn.to_out[0](hidden_states, scale=scale) if not USE_PEFT_BACKEND else attn.to_out[0](hidden_states)
+        )
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+
+        return hidden_states
 
 
 class ResnetBlock2DGated(ResnetBlock2D):
@@ -207,7 +299,15 @@ class BasicTransformerBlockGated(BasicTransformerBlock):
         super().__init__(*args, **kwargs)
         self.num_attention_heads = args[1]
         self.attention_head_dim = args[2]
-        self.gate = BlockVirtualGate(self.num_attention_heads)
+        gate1 = BlockVirtualGate(self.num_attention_heads)
+        if self.attn1 is not None:
+            self.attn1.set_processor(GatedAttnProcessor2())
+            self.attn1.gate = gate1
+
+        gate2 = BlockVirtualGate(self.num_attention_heads)
+        if self.attn2 is not None:
+            self.attn2.set_processor(GatedAttnProcessor2())
+            self.attn2.gate = gate2
 
     def forward(
             self,
@@ -237,21 +337,6 @@ class BasicTransformerBlockGated(BasicTransformerBlock):
         cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
         gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
 
-        # norm_hidden_states has (batch_size, seq_len, hidden_size=num_attention_heads * attention_head_dim) shape.
-        # We need to reshape it to (batch_size, num_attention_heads, seq_len, attention_head_dim) shape. Then we can
-        # apply the gate function.
-        # if self.gated:
-        # norm_hidden_states = norm_hidden_states.reshape(
-        #     norm_hidden_states.shape[0], norm_hidden_states.shape[1], self.num_attention_heads,
-        #     self.attention_head_dim,
-        # ).transpose(1, 2)
-        #
-        # norm_hidden_states = self.gate(norm_hidden_states).transpose(1, 2)
-        #
-        # norm_hidden_states = norm_hidden_states.reshape(
-        #     norm_hidden_states.shape[0], -1, self.num_attention_heads * self.attention_head_dim,
-        # )
-
         attn_output = self.attn1(
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
@@ -266,17 +351,6 @@ class BasicTransformerBlockGated(BasicTransformerBlock):
         if gligen_kwargs is not None:
             hidden_states = self.fuser(hidden_states, gligen_kwargs["objs"])
         # 2.5 ends
-
-        hidden_states = hidden_states.reshape(
-            hidden_states.shape[0], hidden_states.shape[1], self.num_attention_heads,
-            self.attention_head_dim,
-        ).transpose(1, 2)
-
-        hidden_states = self.gate(hidden_states).transpose(1, 2)
-
-        hidden_states = hidden_states.reshape(
-            hidden_states.shape[0], -1, self.num_attention_heads * self.attention_head_dim,
-        )
 
         # 3. Cross-Attention
         if self.attn2 is not None:
@@ -324,10 +398,13 @@ class BasicTransformerBlockGated(BasicTransformerBlock):
         return hidden_states
 
     def set_virtual_gate(self, gate_val):
-        self.gate.set_structure_value(gate_val)
+        gate_1_val = gate_val[:, :self.attn1.gate.width]
+        gate_2_val = gate_val[:, self.attn1.gate.width:]
+        self.attn1.gate.set_structure_value(gate_1_val)
+        self.attn2.gate.set_structure_value(gate_2_val)
 
     def get_gate_structure(self):
-        return self.gate.width
+        return self.attn1.gate.width + self.attn2.gate.width
 
 
 class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
@@ -335,7 +412,15 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
         super().__init__(*args, **kwargs)
         self.num_attention_heads = args[1]
         self.attention_head_dim = args[2]
-        self.gate = BlockVirtualGate(self.num_attention_heads)
+
+        gate1 = BlockVirtualGate(self.num_attention_heads)
+        if self.attn1 is not None:
+            self.attn1.set_processor(GatedAttnProcessor2())
+            self.attn1.gate = gate1
+        gate2 = BlockVirtualGate(self.num_attention_heads)
+        if self.attn2 is not None:
+            self.attn2.set_processor(GatedAttnProcessor2())
+            self.attn2.gate = gate2
         self.depth_gate = BlockVirtualGate(1)
 
     def forward(
@@ -366,19 +451,6 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
         cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
         gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
 
-        # norm_hidden_states has (batch_size, seq_len, hidden_size=num_attention_heads * attention_head_dim) shape.
-        # We need to reshape it to (batch_size, num_attention_heads, seq_len, attention_head_dim) shape. Then we can
-        # apply the gate function.
-        # if self.gated:
-        # norm_hidden_states = norm_hidden_states.reshape(
-        #     norm_hidden_states.shape[0], norm_hidden_states.shape[1], self.num_attention_heads,
-        #     self.attention_head_dim,
-        # ).transpose(1, 2)
-        # norm_hidden_states = self.gate(norm_hidden_states).transpose(1, 2)
-        # norm_hidden_states = norm_hidden_states.reshape(
-        #     norm_hidden_states.shape[0], -1, self.num_attention_heads * self.attention_head_dim,
-        # )
-
         attn_output = self.attn1(
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
@@ -393,17 +465,6 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
         if gligen_kwargs is not None:
             hidden_states = self.fuser(hidden_states, gligen_kwargs["objs"])
         # 2.5 ends
-
-        hidden_states = hidden_states.reshape(
-            hidden_states.shape[0], hidden_states.shape[1], self.num_attention_heads,
-            self.attention_head_dim,
-        ).transpose(1, 2)
-
-        hidden_states = self.gate(hidden_states).transpose(1, 2)
-
-        hidden_states = hidden_states.reshape(
-            hidden_states.shape[0], -1, self.num_attention_heads * self.attention_head_dim,
-        )
 
         # 3. Cross-Attention
         if self.attn2 is not None:
@@ -453,11 +514,14 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
         return hidden_states
 
     def set_virtual_gate(self, gate_val):
-        self.gate.set_structure_value(gate_val[:, :-1])
+        gate_1_val = gate_val[:, :self.attn1.gate.width]
+        gate_2_val = gate_val[:, self.attn1.gate.width:-1]
+        self.attn1.gate.set_structure_value(gate_1_val)
+        self.attn2.gate.set_structure_value(gate_2_val)
         self.depth_gate.set_structure_value(gate_val[:, -1:])
 
     def get_gate_structure(self):
-        return self.gate.width + self.depth_gate.width
+        return self.attn1.gate.width + self.attn2.gate.width + self.depth_gate.width
 
 
 class Transformer2DModelGated(Transformer2DModel):

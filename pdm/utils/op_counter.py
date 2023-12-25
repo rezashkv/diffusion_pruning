@@ -16,7 +16,7 @@ from diffusers.models.activations import GEGLU
 from diffusers.models.resnet import Upsample2D
 from diffusers.models.lora import (LoRACompatibleConv, LoRACompatibleLinear)
 from pdm.models.diffusion.blocks import (ResnetBlock2DGated, BasicTransformerBlockGated,
-                                       ResnetBlock2DWidthDepthGated, BasicTransformerBlockWidthDepthGated)
+                                         ResnetBlock2DWidthDepthGated, BasicTransformerBlockWidthDepthGated)
 from pdm.utils.estimation_utils import hard_concrete
 
 import sys
@@ -74,6 +74,20 @@ def upsample_flops_counter_hook(module, input, output):
 def relu_flops_counter_hook(module, input, output):
     active_elements_count = output.numel()
     module.__flops__ += int(active_elements_count)
+
+
+def silu_flops_counter_hook(module, input, output):
+    active_elements_count = output.numel()
+    module.__flops__ += int(active_elements_count * 2)
+
+
+def geglu_flops_counter_hook(module, input, output):
+    input = input[0]
+    output_last_dim = output.shape[-1]
+    bias_flops = output_last_dim if module.proj.bias is not None else 0
+    proj_flops = np.prod(input.shape) * output_last_dim * 2 + bias_flops
+    gelu_flops = output.numel()
+    module.__flops__ += int(proj_flops + gelu_flops * 2)
 
 
 def linear_flops_counter_hook(module, input, output):
@@ -320,9 +334,9 @@ MODULES_MAPPING = {
     nn.ELU: relu_flops_counter_hook,
     nn.LeakyReLU: relu_flops_counter_hook,
     nn.ReLU6: relu_flops_counter_hook,
-    nn.SiLU: relu_flops_counter_hook,
-    #TODO fix this
-    GEGLU: relu_flops_counter_hook,
+    nn.SiLU: silu_flops_counter_hook,
+    GEGLU: geglu_flops_counter_hook,
+
     # poolings
     nn.MaxPool1d: pool_flops_counter_hook,
     nn.AvgPool1d: pool_flops_counter_hook,
@@ -384,29 +398,45 @@ def accumulate_flops(self):
         return self.__flops__
     else:
         sum = 0
-        for m in self.children():
-            sum += m.accumulate_flops()
+        if not isinstance(self, (ResnetBlock2DGated, BasicTransformerBlockGated,
+                                 ResnetBlock2DWidthDepthGated, BasicTransformerBlockWidthDepthGated)):
+            for m in self.children():
+                sum += m.accumulate_flops()
+            return sum
 
-        if isinstance(self, (ResnetBlock2DGated, BasicTransformerBlockGated)):
-            #TODO write as sum of prunable modules
+        elif isinstance(self, (ResnetBlock2DGated, ResnetBlock2DWidthDepthGated)):
+            for m in self.children():
+                sum += m.accumulate_flops()
             norm1_flops = self.norm1.accumulate_flops()
-            #TODO include nonlinearity
-            prunable_flops = sum - norm1_flops
+            nonlinearity_flops = self.nonlinearity.accumulate_flops()
+            non_prunable_flops = norm1_flops + nonlinearity_flops
+
+            prunable_flops = sum - non_prunable_flops
             hard_out = hard_concrete(self.gate.gate_f)
             current_prunable_flops = prunable_flops * hard_out.sum() / hard_out.numel()
-            current_total_flops = current_prunable_flops + norm1_flops
-            return current_total_flops
-        elif isinstance(self, (ResnetBlock2DWidthDepthGated, BasicTransformerBlockWidthDepthGated)):
+            current_total_flops = current_prunable_flops + non_prunable_flops
+
+        # instance of BasicTransformerBlockGated or BasicTransformerBlockWidthDepthGated
+        else:
             norm1_flops = self.norm1.accumulate_flops()
-            prunable_flops = sum - norm1_flops
-            hard_out = hard_concrete(self.gate.gate_f)
-            current_prunable_flops = prunable_flops * hard_out.sum() / hard_out.numel()
-            #TODO detach current_prunable_flops
-            current_total_flops = current_prunable_flops + norm1_flops
+            att1_flops = self.attn1.accumulate_flops()
+            norm2_flops = self.norm2.accumulate_flops()
+            att2_flops = self.attn2.accumulate_flops()
+            norm3_flops = self.norm3.accumulate_flops()
+            ff_flops = self.ff.accumulate_flops()
+
+            gate_1_hard_out = hard_concrete(self.attn1.gate.gate_f)
+            gate_2_hard_out = hard_concrete(self.attn2.gate.gate_f)
+            curr_att1_flops = att1_flops * gate_1_hard_out.sum() / gate_1_hard_out.numel()
+            curr_att2_flops = att2_flops * gate_2_hard_out.sum() / gate_2_hard_out.numel()
+            current_total_flops = (
+                        norm1_flops + curr_att1_flops + curr_att2_flops + norm2_flops + norm3_flops + ff_flops)
+
+        if hasattr(self, 'depth_gate'):
             hard_out = hard_concrete(self.depth_gate.gate_f)
-            current_total_flops = current_total_flops * hard_out.sum() / hard_out.numel()
-            return current_total_flops
-        return sum
+            current_total_flops = current_total_flops* hard_out.sum() / hard_out.numel()
+
+        return current_total_flops
 
 
 def get_model_parameters_number(model):

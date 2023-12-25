@@ -31,6 +31,7 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
+import yaml
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
@@ -243,8 +244,66 @@ def log_validation(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, arg
     return images
 
 
-def interpret_quantizer_codebook(quantizer, args):
-    pass
+def log_quantizer_embedding_samples(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, args, accelerator,
+                                    weight_dtype, epoch):
+    logger.info("Running validation... ")
+
+    hyper_net.eval()
+    quantizer.eval()
+    pipeline = StableDiffusionPruningPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        vae=accelerator.unwrap_model(vae),
+        text_encoder=accelerator.unwrap_model(text_encoder),
+        tokenizer=tokenizer,
+        unet=accelerator.unwrap_model(unet),
+        safety_checker=None,
+        revision=args.revision,
+        torch_dtype=weight_dtype,
+        hyper_net=hyper_net,
+        quantizer=quantizer,
+    )
+
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    if args.enable_xformers_memory_efficient_attention:
+        pipeline.enable_xformers_memory_efficient_attention()
+
+    if args.seed is None:
+        generator = None
+    else:
+        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+
+    image_output_dir = os.path.join(args.output_dir, "quantizer_embedding_images", f"epoch_{epoch}")
+    os.makedirs(image_output_dir, exist_ok=True)
+    images = pipeline.quantizer_samples(num_inference_steps=args.num_inference_steps, generator=generator).images
+
+    for i, image in enumerate(images):
+        try:
+            image.save(os.path.join(image_output_dir, f"{i}.png"))
+        except Exception as e:
+            logger.error(f"Error saving quantizer embedding {i} image: {e}")
+
+    for tracker in accelerator.trackers:
+        if tracker.name == "tensorboard":
+            np_images = np.stack([np.asarray(img) for img in images])
+            tracker.writer.add_images("quantizer embedding images", np_images, epoch, dataformats="NHWC")
+        elif tracker.name == "wandb":
+            tracker.log(
+                {
+                    "quantizer embedding images": [
+                        wandb.Image(image, caption=f"{i}: {args.validation_prompts[i]}")
+                        for i, image in enumerate(images)
+                    ]
+                }
+            )
+        else:
+            logger.warn(f"image logging not implemented for {tracker.name}")
+
+    del pipeline
+    torch.cuda.empty_cache()
+
+    return images
 
 
 def parse_args():
@@ -655,6 +714,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # dump the args to a yaml file
+    with open(os.path.join(args.output_dir, "args.yaml"), "w") as f:
+        yaml.dump(vars(args), f)
 
     if args.non_ema_revision is not None:
         deprecate(
@@ -1242,7 +1305,8 @@ def main():
                 # gather the arch_vector_quantized across all processes to get large batch for contrastive loss
                 encoder_hidden_states_list = accelerator.gather(encoder_hidden_states)
                 arch_vector_quantized_list = accelerator.gather(arch_vector_quantized)
-                contrastive_loss = clip_loss(torch.sum(encoder_hidden_states_list, dim=1).squeeze(1), arch_vector_quantized_list)
+                contrastive_loss = clip_loss(torch.sum(encoder_hidden_states_list, dim=1).squeeze(1),
+                                             arch_vector_quantized_list)
 
                 if not hasattr(unet, "total_flops"):
                     with torch.no_grad():
@@ -1323,11 +1387,11 @@ def main():
 
                 # log the pairwise cosine similarity of the embeddings of the quantizer:
                 if accelerator.num_processes == 1:
-                    # TODO apply gumble softmax to the embeddings before computing the similarity
                     quantizer_embeddings = quantizer.embedding.weight.data.cpu().numpy()
                 else:
                     quantizer_embeddings = quantizer.module.embedding.weight.data.cpu().numpy()
-                quantizer_embeddings = quantizer_embeddings / np.linalg.norm(quantizer_embeddings, axis=1, keepdims=True)
+                quantizer_embeddings = quantizer_embeddings / np.linalg.norm(quantizer_embeddings, axis=1,
+                                                                             keepdims=True)
                 quantizer_embeddings = quantizer_embeddings @ quantizer_embeddings.T
                 accelerator.log({"quantizer embeddings pairwise similarity": wandb.Image(quantizer_embeddings)},
                                 step=global_step)
@@ -1379,6 +1443,29 @@ def main():
                 break
 
         if accelerator.is_main_process:
+            # log quantizer embeddings samples
+            if epoch % args.validation_epochs == 0 or epoch == args.num_train_epochs - 1:
+                if args.use_ema:
+                    # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                    ema_unet.store(unet.parameters())
+                    ema_unet.copy_to(unet.parameters())
+                log_quantizer_embedding_samples(
+                    hyper_net,
+                    quantizer,
+                    vae,
+                    text_encoder,
+                    tokenizer,
+                    unet,
+                    args,
+                    accelerator,
+                    weight_dtype,
+                    global_step,
+                )
+                if args.use_ema:
+                    # Switch back to the original UNet parameters.
+                    ema_unet.restore(unet.parameters())
+
+            # generate some validation images
             if args.validation_prompts is not None and (epoch % args.validation_epochs == 0 or
                                                         epoch == args.num_train_epochs - 1):
                 if args.use_ema:
@@ -1420,4 +1507,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-#1520451_2413603269
+# 1520451_2413603269
