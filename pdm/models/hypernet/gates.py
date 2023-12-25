@@ -39,6 +39,9 @@ class BlockVirtualGate(VirtualGate):
 
     def forward(self, x):
         gate_f = torch.repeat_interleave(self.gate_f, x.shape[1] // self.width, dim=1)
+        if gate_f.shape[0] > 1 and gate_f.shape[0] != x.shape[0]:
+            # cat the gate_f to itself to match the batch size for classifier-free guidance
+            gate_f = torch.cat([gate_f] * (x.shape[0] // gate_f.shape[0]))
         if x.is_cuda:
             gate_f = gate_f.cuda()
         for _ in range(len(x.size()) - 2):

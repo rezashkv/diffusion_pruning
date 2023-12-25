@@ -1053,6 +1053,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
     @torch.no_grad()
     def quantizer_samples(
             self,
+            indices: List[int],
             height: Optional[int] = None,
             width: Optional[int] = None,
             num_inference_steps: int = 50,
@@ -1069,12 +1070,13 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
             callback_steps: int = 1,
             cross_attention_kwargs: Optional[Dict[str, Any]] = None,
             guidance_rescale: float = 0.0,
-            save_dir: Optional[str] = None,
     ):
         r"""
                 The function to the pipeline for generating unprompted samples from the quantizer embeddings.
 
                 Args:
+                    indices (`List[int]`):
+                        The indices of the quantizer embeddings to generate from.
                     prompt (`str` or `List[str]`, *optional*):
                         The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
                     height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
@@ -1136,134 +1138,128 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
                         second element is a list of `bool`s indicating whether the corresponding generated image contains
                         "not-safe-for-work" (nsfw) content.
                 """
-        image_list = []
-        nsfw_list = []
-        q_embedding_gumbel_sigmoid = []
-        for i in range(self.quantizer.n_e):
-            prompt = ""
-            # 0. Default height and width to unet
-            height = height or self.unet.config.sample_size * self.vae_scale_factor
-            width = width or self.unet.config.sample_size * self.vae_scale_factor
+        # 0. Default height and width to unet
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
 
-            # 1. Check inputs. Raise error if not correct
-            self.check_inputs(
-                prompt, height, width, callback_steps, negative_prompt, prompt_embeds, negative_prompt_embeds
-            )
+        prompt = ["" for _ in range(len(indices))]
 
-            # 2. Define call parameters
-            if prompt is not None and isinstance(prompt, str):
-                batch_size = 1
-            elif prompt is not None and isinstance(prompt, list):
-                batch_size = len(prompt)
-            else:
-                batch_size = prompt_embeds.shape[0]
+        # 1. Check inputs. Raise error if not correct
+        self.check_inputs(
+            prompt, height, width, callback_steps, negative_prompt, prompt_embeds, negative_prompt_embeds
+        )
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
 
-            device = self._execution_device
-            # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-            # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-            # corresponds to doing no classifier free guidance.
-            do_classifier_free_guidance = guidance_scale > 1.0
+        device = self._execution_device
+        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # corresponds to doing no classifier free guidance.
+        do_classifier_free_guidance = guidance_scale > 1.0
 
-            # 3. Encode input prompt
-            text_encoder_lora_scale = (
-                cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
-            )
+        # 3. Encode input prompt
+        text_encoder_lora_scale = (
+            cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
+        )
 
-            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
-                prompt,
-                device,
-                num_images_per_prompt,
-                do_classifier_free_guidance,
-                negative_prompt,
-                prompt_embeds=prompt_embeds,
-                negative_prompt_embeds=negative_prompt_embeds,
-                lora_scale=text_encoder_lora_scale,
-            )
+        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+            prompt,
+            device,
+            num_images_per_prompt,
+            do_classifier_free_guidance,
+            negative_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            lora_scale=text_encoder_lora_scale,
+        )
+        if hasattr(self.quantizer, "module"):
+            structure_vector_quantized = self.quantizer.module.get_codebook_entry_gumbel_sigmoid(indices)
+        else:
+            structure_vector_quantized = self.quantizer.get_codebook_entry_gumbel_sigmoid(indices)
 
-            structure_vector_quantized = self.quantizer.get_codebook_entry_gumbel_sigmoid(i)
-            q_embedding_gumbel_sigmoid.append(structure_vector_quantized.reshape(1, -1))
-            self.unet.set_structure(structure_vector_quantized)
+        self.unet.set_structure(structure_vector_quantized)
 
-            # For classifier free guidance, we need to do two forward passes.
-            # Here we concatenate the unconditional and text embeddings into a single batch
-            # to avoid doing two forward passes
-            if do_classifier_free_guidance:
-                prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
+        # For classifier free guidance, we need to do two forward passes.
+        # Here we concatenate the unconditional and text embeddings into a single batch
+        # to avoid doing two forward passes
+        if do_classifier_free_guidance:
+            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
 
-            # 4. Prepare timesteps
-            self.scheduler.set_timesteps(num_inference_steps, device=device)
-            timesteps = self.scheduler.timesteps
+        # 4. Prepare timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
 
-            # 5. Prepare latent variables
-            num_channels_latents = self.unet.config.in_channels
-            latents = self.prepare_latents(
-                batch_size * num_images_per_prompt,
-                num_channels_latents,
-                height,
-                width,
-                prompt_embeds.dtype,
-                device,
-                generator,
-                latents,
-            )
+        # 5. Prepare latent variables
+        num_channels_latents = self.unet.config.in_channels
+        latents = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            latents,
+        )
 
-            # 6. Prepare extra step kwargs.
-            extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+        # 6. Prepare extra step kwargs.
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-            # 7. Denoising loop
-            num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-            with self.progress_bar(total=num_inference_steps) as progress_bar:
-                for i, t in enumerate(timesteps):
-                    # expand the latents if we are doing classifier free guidance
-                    latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+        # 7. Denoising loop
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                # expand the latents if we are doing classifier free guidance
+                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                    # predict the noise residual
-                    noise_pred = self.unet(
-                        latent_model_input,
-                        t,
-                        encoder_hidden_states=prompt_embeds,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        return_dict=False,
-                    )[0]
+                # predict the noise residual
+                noise_pred = self.unet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=prompt_embeds,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    return_dict=False,
+                )[0]
 
-                    # perform guidance
-                    if do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                # perform guidance
+                if do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                    if do_classifier_free_guidance and guidance_rescale > 0.0:
-                        # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-                        noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
+                if do_classifier_free_guidance and guidance_rescale > 0.0:
+                    # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
+                    noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
 
-                    # compute the previous noisy sample x_t -> x_t-1
-                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                # compute the previous noisy sample x_t -> x_t-1
+                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
-                    # call the callback, if provided
-                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                        progress_bar.update()
-                        if callback is not None and i % callback_steps == 0:
-                            callback(i, t, latents)
+                # call the callback, if provided
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+                    if callback is not None and i % callback_steps == 0:
+                        callback(i, t, latents)
 
-            if not output_type == "latent":
-                image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
-                image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
-            else:
-                image = latents
-                has_nsfw_concept = None
+        if not output_type == "latent":
+            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+        else:
+            image = latents
+            has_nsfw_concept = None
 
-            if has_nsfw_concept is None:
-                do_denormalize = [True] * image.shape[0]
-            else:
-                do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
+        if has_nsfw_concept is None:
+            do_denormalize = [True] * image.shape[0]
+        else:
+            do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
 
-            image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+        image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
 
-            # Offload all models
-            self.maybe_free_model_hooks()
-            image_list.append(image)
-            nsfw_list.append(has_nsfw_concept)
-        q_embedding_gumbel_sigmoid = torch.stack(q_embedding_gumbel_sigmoid, dim=0)
-        if save_dir is not None:
-            torch.save(q_embedding_gumbel_sigmoid, os.path.join(save_dir, "quantizer_embeddings_gumbel_sigmoid.pt"))
-        return StableDiffusionPipelineOutput(images=image_list, nsfw_content_detected=nsfw_list)
+        # Offload all models
+        self.maybe_free_model_hooks()
+
+        return StableDiffusionPipelineOutput(images=image,
+                                             nsfw_content_detected=has_nsfw_concept), structure_vector_quantized

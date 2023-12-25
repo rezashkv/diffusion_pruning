@@ -208,14 +208,14 @@ def log_validation(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, arg
     image_output_dir = os.path.join(args.output_dir, "validation_images", f"epoch_{epoch}")
     os.makedirs(image_output_dir, exist_ok=True)
     images = []
-    for step in range(0, len(args.validation_prompts), args.train_batch_size * accelerator.num_processes):
-        batch = args.validation_prompts[step:step + args.train_batch_size * accelerator.num_processes]
+    for step in range(0, len(args.validation_prompts), args.validation_batch_size * accelerator.num_processes):
+        batch = args.validation_prompts[step:step + args.validation_batch_size * accelerator.num_processes]
         with torch.autocast("cuda"):
             with accelerator.split_between_processes(batch) as batch:
                 gen_images = pipeline(batch, num_inference_steps=args.num_inference_steps, generator=generator).images
                 for i, image in enumerate(gen_images):
                     try:
-                        image.save(os.path.join(image_output_dir, f"{step + i}.png"))
+                        image.save(os.path.join(image_output_dir, f"{batch[i]}.png"))
                     except Exception as e:
                         logger.error(f"Error saving image {batch[i]}: {e}")
 
@@ -246,7 +246,7 @@ def log_validation(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, arg
 
 def log_quantizer_embedding_samples(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, args, accelerator,
                                     weight_dtype, epoch):
-    logger.info("Running validation... ")
+    logger.info("Sampling from quantizer... ")
 
     hyper_net.eval()
     quantizer.eval()
@@ -276,14 +276,33 @@ def log_quantizer_embedding_samples(hyper_net, quantizer, vae, text_encoder, tok
 
     image_output_dir = os.path.join(args.output_dir, "quantizer_embedding_images", f"epoch_{epoch}")
     os.makedirs(image_output_dir, exist_ok=True)
-    images = pipeline.quantizer_samples(num_inference_steps=args.num_inference_steps, generator=generator).images
 
-    for i, image in enumerate(images):
-        try:
-            image.save(os.path.join(image_output_dir, f"{i}.png"))
-        except Exception as e:
-            logger.error(f"Error saving quantizer embedding {i} image: {e}")
+    images = []
 
+    if hasattr(pipeline.quantizer, "module"):
+        n_e = pipeline.quantizer.module.n_e
+    else:
+        n_e = pipeline.quantizer.n_e
+    quantizer_embedding_gumbel_sigmoid = []
+    for step in range(0, n_e, args.validation_batch_size * accelerator.num_processes):
+        indices = torch.arange(step, step + args.validation_batch_size * accelerator.num_processes,
+                               device=accelerator.device)
+        with torch.autocast("cuda"):
+            with accelerator.split_between_processes(indices) as indices:
+                gen_images, quantizer_embed_gs = pipeline.quantizer_samples(indices=indices,
+                                                                            num_inference_steps=args.num_inference_steps,
+                                                                            generator=generator)
+                gen_images = gen_images.images
+                quantizer_embedding_gumbel_sigmoid.append(quantizer_embed_gs)
+                images += gen_images
+                for i, image in enumerate(gen_images):
+                    try:
+                        image.save(os.path.join(image_output_dir, f"code-{step + i}.png"))
+                    except Exception as e:
+                        logger.error(f"Error saving image from code {step + i}: {e}")
+    quantizer_embedding_gumbel_sigmoid = torch.cat(quantizer_embedding_gumbel_sigmoid, dim=0)
+    torch.save(quantizer_embedding_gumbel_sigmoid, os.path.join(args.output_dir,
+                                                                "quantizer_embeddings_gumbel_sigmoid.pt"))
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
@@ -292,7 +311,7 @@ def log_quantizer_embedding_samples(hyper_net, quantizer, vae, text_encoder, tok
             tracker.log(
                 {
                     "quantizer embedding images": [
-                        wandb.Image(image, caption=f"{i}: {args.validation_prompts[i]}")
+                        wandb.Image(image, caption=f"Code: {i}")
                         for i, image in enumerate(images)
                     ]
                 }
@@ -425,8 +444,12 @@ def parse_args():
         help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=16,
+        "--train_batch_size", type=int, default=8,
         help="Batch size (per device) for the training dataloader."
+    )
+    parser.add_argument(
+        "--validation_batch_size", type=int, default=4,
+        help="Batch size (per device) for the validation dataloader."
     )
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
@@ -737,9 +760,10 @@ def main():
     if args.validation_prompts is not None:
         if args.validation_prompts[0].endswith(".csv") or args.validation_prompts[0].endswith(".tsv"):
             validation_data = pd.read_csv(args.validation_prompts[0], sep="\t", header=None,
-                                          names=[args.image_column, args.caption_column])[
-                args.caption_column].values.astype(str).tolist()
+                                          names=[args.caption_column, args.image_column])
+            validation_data = validation_data[args.caption_column].values.astype(str).tolist()
             args.validation_prompts = validation_data
+            del validation_data
 
         elif os.path.isfile(args.validation_prompts[0]):
             with open(args.validation_prompts[0], "r") as f:
@@ -1029,6 +1053,10 @@ def main():
                                    sep="\t", header=None, names=["caption", "link"],
                                    dtype={"caption": str, "link": str})
             images = os.listdir(os.path.join(args.train_data_dir, "training"))
+
+            if args.max_train_samples is not None and args.max_train_samples < 1000:
+                images = images[:args.max_train_samples * 5]
+
             images = [os.path.join(args.train_data_dir, "training", image) for image in images]
             if os.path.exists(os.path.join(args.output_dir, "cc3m_bad_images.txt")):
                 with open(os.path.join(args.output_dir, "cc3m_bad_images.txt"), "r") as f:
@@ -1443,13 +1471,15 @@ def main():
                 break
 
         if accelerator.is_main_process:
-            # log quantizer embeddings samples
-            if epoch % args.validation_epochs == 0 or epoch == args.num_train_epochs - 1:
+
+            # generate some validation images
+            if args.validation_prompts is not None and (epoch % args.validation_epochs == 0 or
+                                                        epoch == args.num_train_epochs - 1):
                 if args.use_ema:
                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                     ema_unet.store(unet.parameters())
                     ema_unet.copy_to(unet.parameters())
-                log_quantizer_embedding_samples(
+                val_images = log_validation(
                     hyper_net,
                     quantizer,
                     vae,
@@ -1465,14 +1495,13 @@ def main():
                     # Switch back to the original UNet parameters.
                     ema_unet.restore(unet.parameters())
 
-            # generate some validation images
-            if args.validation_prompts is not None and (epoch % args.validation_epochs == 0 or
-                                                        epoch == args.num_train_epochs - 1):
+            # log quantizer embeddings samples
+            if epoch % args.validation_epochs == 0 or epoch == args.num_train_epochs - 1:
                 if args.use_ema:
                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                     ema_unet.store(unet.parameters())
                     ema_unet.copy_to(unet.parameters())
-                val_images = log_validation(
+                log_quantizer_embedding_samples(
                     hyper_net,
                     quantizer,
                     vae,
@@ -1506,5 +1535,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# 1520451_2413603269
