@@ -5,9 +5,6 @@
 
 from __future__ import absolute_import
 
-import os
-from typing import Union, Callable, Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

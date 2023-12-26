@@ -126,14 +126,14 @@ def log_validation(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, arg
         with torch.autocast("cuda"):
             with accelerator.split_between_processes(batch) as batch:
                 gen_images = pipeline(batch, num_inference_steps=args.num_inference_steps, generator=generator).images
+                gen_images = accelerator.gather(gen_images)
                 for i, image in enumerate(gen_images):
                     try:
                         image.save(os.path.join(image_output_dir, f"{batch[i]}.png"))
                     except Exception as e:
                         logger.error(f"Error saving image {batch[i]}: {e}")
 
-                if step == 0:
-                    images = gen_images
+                    images += gen_images
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
@@ -206,6 +206,8 @@ def log_quantizer_embedding_samples(hyper_net, quantizer, vae, text_encoder, tok
                                                                             num_inference_steps=args.num_inference_steps,
                                                                             generator=generator)
                 gen_images = gen_images.images
+                gen_images = accelerator.gather(gen_images)
+                quantizer_embed_gs = accelerator.gather(quantizer_embed_gs)
                 quantizer_embedding_gumbel_sigmoid.append(quantizer_embed_gs)
                 images += gen_images
                 for i, image in enumerate(gen_images):
@@ -214,7 +216,7 @@ def log_quantizer_embedding_samples(hyper_net, quantizer, vae, text_encoder, tok
                     except Exception as e:
                         logger.error(f"Error saving image from code {step + i}: {e}")
     quantizer_embedding_gumbel_sigmoid = torch.cat(quantizer_embedding_gumbel_sigmoid, dim=0)
-    torch.save(quantizer_embedding_gumbel_sigmoid, os.path.join(args.output_dir,
+    torch.save(quantizer_embedding_gumbel_sigmoid, os.path.join(image_output_dir,
                                                                 "quantizer_embeddings_gumbel_sigmoid.pt"))
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":

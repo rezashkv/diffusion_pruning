@@ -1,19 +1,5 @@
 #!/usr/bin/env python
-# coding=utf-8
-# Copyright 2023 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
 
-import argparse
 import logging
 import math
 import os
@@ -21,42 +7,48 @@ import random
 import shutil
 import sys
 from pathlib import Path
+from packaging import version
+import requests
+import yaml
 
 import PIL
+from PIL import ImageFile
+from tqdm.auto import tqdm
+
 import accelerate
-import numpy as np
-import pandas as pd
-import requests
-import torch
-import torch.nn.functional as F
-import torch.utils.checkpoint
-import transformers
-import yaml
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from accelerate.utils import ProjectConfiguration, set_seed
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+import torch.utils.checkpoint
+from torchvision import transforms
+
+from huggingface_hub import create_repo, upload_folder
+
 from datasets import load_dataset, Dataset, concatenate_datasets
 from datasets.utils.logging import set_verbosity_error, set_verbosity_warning
-from huggingface_hub import create_repo, upload_folder
-from packaging import version
-from torchvision import transforms
-from tqdm.auto import tqdm
+
+import transformers
 from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.utils import ContextManagers
-from pdm.utils.op_counter import (add_flops_counting_methods)
 
 import diffusers
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
-from pdm.models.diffusion import UNet2DConditionModelGated
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
+
+from pdm.models.diffusion import UNet2DConditionModelGated
 from pdm.models import HyperStructure
 from pdm.models import StructureVectorQuantizer
 from pdm.losses import ClipLoss, ResourceLoss
-from PIL import ImageFile
+from pdm.utils.op_counter import (add_flops_counting_methods)
 from pdm.utils.logging_utils import save_model_card, log_validation, log_quantizer_embedding_samples
 from pdm.utils.arg_utils import parse_args
 from pdm.utils.metric_utils import compute_snr
@@ -69,6 +61,8 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.22.0.dev0")
+
+PIL.Image.MAX_IMAGE_PIXELS = 933120000
 
 logger = get_logger(__name__)
 
@@ -207,7 +201,6 @@ def main():
     r_loss = ResourceLoss(p=args.pruning_target, loss_type=args.resource_loss_type)
     clip_loss = ClipLoss(temperature=args.contrastive_loss_temperature)
 
-    # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
 
@@ -232,7 +225,9 @@ def main():
             xformers_version = version.parse(xformers.__version__)
             if xformers_version == version.parse("0.0.16"):
                 logger.warn(
-                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
+                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training,"
+                    " please update xFormers to at least 0.0.17."
+                    " See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
                 )
             unet.enable_xformers_memory_efficient_attention()
         else:
@@ -418,7 +413,6 @@ def main():
                 # remove images that cant be opened by PIL
                 imgs = []
                 bad_images = []
-                PIL.Image.MAX_IMAGE_PIXELS = 933120000
                 for image in images:
                     try:
                         with PIL.Image.open(image) as img:
@@ -808,7 +802,7 @@ def main():
 
                         # save architecture vector quantized
                         torch.save(arch_vector_quantized, os.path.join(args.output_dir,
-                                                                       f"arch_vector_quantized-{global_step}.pt"))
+                                                                       f"arch_vector_quantized.pt"))
 
                         logger.info(f"Saved state to {save_path}")
 
