@@ -267,23 +267,27 @@ def main():
                 ema_unet.to(accelerator.device)
                 del load_model
 
-            for i in range(len(models)):
+            for _ in range(len(models)):
                 # pop models so that they are not loaded again
                 model = models.pop()
 
                 # load diffusers style into model
                 if isinstance(model, (UNet2DConditionModel, UNet2DConditionModelGated)):
-
                     load_model = UNet2DConditionModelGated.from_pretrained(input_dir, subfolder="unet")
-
                     model.register_to_config(**load_model.config)
-
                     model.load_state_dict(load_model.state_dict())
+                    model.total_flops = load_model.total_flops
                     del load_model
                 elif isinstance(model, HyperStructure):
-                    model.from_pretrained(input_dir, subfolder="hypernet")
+                    load_model = HyperStructure.from_pretrained(input_dir, subfolder="hypernet")
+                    model.register_to_config(**load_model.config)
+                    model.load_state_dict(load_model.state_dict())
+                    del load_model
                 elif isinstance(model, StructureVectorQuantizer):
-                    model.from_pretrained(input_dir, subfolder="quantizer")
+                    load_model = StructureVectorQuantizer.from_pretrained(input_dir, subfolder="quantizer")
+                    model.register_to_config(**load_model.config)
+                    model.load_state_dict(load_model.state_dict())
+                    del load_model
                 else:
                     models.append(model)
 
@@ -434,7 +438,7 @@ def main():
             image_indices = [int(os.path.basename(image).split("_")[0]) for image in images]
             captions = captions.iloc[image_indices].caption.values.tolist()
             train_dataset = Dataset.from_dict({"image": images, "caption": captions})
-
+            del images, captions, image_indices, bad_images
             dataset = {"train": train_dataset}
 
         else:
@@ -679,10 +683,11 @@ def main():
                 # gather the arch_vector_quantized across all processes to get large batch for contrastive loss
                 encoder_hidden_states_list = accelerator.gather(encoder_hidden_states)
                 arch_vector_quantized_list = accelerator.gather(arch_vector_quantized)
+                logger.info(f"contrastive loss batch size: {arch_vector_quantized_list.shape[0]}")
                 contrastive_loss = clip_loss(torch.sum(encoder_hidden_states_list, dim=1).squeeze(1),
                                              arch_vector_quantized_list)
 
-                if not hasattr(unet, "total_flops"):
+                if unet.total_flops is None:
                     with torch.no_grad():
                         unet.set_structure(arch_vector_quantized)
                         unet(noisy_latents, timesteps, encoder_hidden_states)

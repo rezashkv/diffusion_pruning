@@ -51,8 +51,8 @@ from diffusers.models.unet_2d_blocks import (
 )
 
 from .blocks import (CrossAttnDownBlock2DGated, CrossAttnUpBlock2DGated, CrossAttnUpBlock2DHalfGated,
-                    CrossAttnDownBlock2DHalfGated, DownBlock2DGated, UpBlock2DGated,
-                    DownBlock2DHalfGated, UpBlock2DHalfGated)
+                     CrossAttnDownBlock2DHalfGated, DownBlock2DGated, UpBlock2DGated,
+                     DownBlock2DHalfGated, UpBlock2DHalfGated)
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -780,6 +780,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
             mid_block_only_cross_attention: Optional[bool] = None,
             cross_attention_norm: Optional[str] = None,
             addition_embed_type_num_heads=64,
+            total_flops=None,
     ):
         super().__init__()
 
@@ -1157,6 +1158,8 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
             self.position_net = PositionNet(
                 positive_len=positive_len, out_dim=cross_attention_dim, feature_type=feature_type
             )
+
+        self.total_flops = total_flops
 
     @property
     def attn_processors(self) -> Dict[str, AttentionProcessor]:
