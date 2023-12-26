@@ -24,7 +24,10 @@
                 "PYTHONPATH": "${workspaceFolder}"
               },
             "args": [
-                "--base_config_path", "configs/pruning/sd-2-1_cc3m.yaml"
+                "--base_config_path", 
+                "configs/pruning/sd-2-1_cc3m.yaml",
+                "--name", 
+                "debug_prune"
             ]
         }
 

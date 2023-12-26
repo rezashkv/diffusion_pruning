@@ -20,6 +20,7 @@ import os
 import random
 import shutil
 import sys
+import datetime
 
 from pathlib import Path
 from omegaconf import OmegaConf
@@ -79,31 +80,10 @@ DATASET_NAME_MAPPING = {
 }
 
 
-def main(base_args):
-
-    configs = OmegaConf.load(base_args.base_config_path)
-    default_parser = parse_args()
-    final_config = {}
-
-    # for k in default_parser:
-    #     if k in configs:
-    #     if getattr(default_parser, k) != configs[k]:
-    #         final_config[k] = configs[k]
-    #     else:
-    #         final_config[k] = default_parser[k]
-
-    args = parser.parse_args()
-    env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
-    if env_local_rank != -1 and env_local_rank != args.local_rank:
-        args.local_rank = env_local_rank
-
-    # Sanity checks
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Need either a dataset name or a training folder.")
-
-    # default to using the same revision for the non-ema model if not specified
-    if args.non_ema_revision is None:
-        args.non_ema_revision = args.revision
+def main():
+    # configs = OmegaConf.load(base_args.base_config_path)
+    args = parse_args()
+    config = OmegaConf.load(args.base_config_path)
 
     if args.non_ema_revision is not None:
         deprecate(
@@ -114,39 +94,53 @@ def main(base_args):
                 " use `--variant=non_ema` instead."
             ),
         )
-    logging_dir = os.path.join(args.output_dir, args.logging_dir)
+    
+    now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    
+    if args.name != "":
+        nowname = now + f"_{args.name}"  
+    else:
+        nowname = now
 
-    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir,
-                                                      total_limit=args.checkpoints_total_limit)
+    config["training"]["logging"]["logging_dir"] = os.path.join(config["training"]["logging"]["logging_dir"], os.getcwd().split('/')[-1], nowname)
+    logging_dir = config["training"]["logging"]["logging_dir"]
+
+    accelerator_project_config = ProjectConfiguration(project_dir=logging_dir,
+                                                      logging_dir=logging_dir,
+                                                      total_limit=config["training"]["logging"]["checkpoints_total_limit"])
 
     # if validation_prompts is a file or a dir, load the prompts from there
-    if args.validation_prompts is not None:
-        if args.validation_prompts[0].endswith(".csv") or args.validation_prompts[0].endswith(".tsv"):
-            validation_data = pd.read_csv(args.validation_prompts[0], sep="\t", header=None,
-                                          names=[args.caption_column, args.image_column])
-            validation_data = validation_data[args.caption_column].values.astype(str).tolist()
-            args.validation_prompts = validation_data
+    if config["data"]["validation_prompts"] is not None:
+        if config["data"]["validation_prompts"].endswith(".csv") or config["data"]["validation_prompts"].endswith(".tsv"):
+            validation_data = pd.read_csv(config["data"]["validation_prompts"], 
+                                          sep="\t", 
+                                          header=None,
+                                          names=[config["data"]["caption_column"], config["data"]["image_column"]])
+            validation_data = validation_data[config["data"]["caption_column"]].values.astype(str).tolist()
+            config["validation_prompts"] = validation_data
             del validation_data
 
-        elif os.path.isfile(args.validation_prompts[0]):
-            with open(args.validation_prompts[0], "r") as f:
-                args.validation_prompts = [line.strip() for line in f.readlines()]
-        elif os.path.isdir(args.validation_prompts[0]):
-            prompts = []
-            for d in args.validation_prompts:
-                files = [os.path.join(d, caption_file) for caption_file in os.listdir(d) if f.endswith(".txt")]
-                for f in files:
-                    with open(f, "r") as f:
-                        prompts.extend([line.strip() for line in f.readlines()])
-            args.validation_prompts = prompts
+        else:
+            raise NotImplementedError
+            # elif os.path.isfile(config["data"]["validation_prompts"]):
+            #     with open(config["data"]["validation_prompts"], "r") as f:
+            #         config["validation_prompts"] = [line.strip() for line in f.readlines()]
+            # elif os.path.isdir(args.validation_prompts[0]):
+            #     prompts = []
+            #     for d in args.validation_prompts:
+            #         files = [os.path.join(d, caption_file) for caption_file in os.listdir(d) if f.endswith(".txt")]
+            #         for f in files:
+            #             with open(f, "r") as f:
+            #                 prompts.extend([line.strip() for line in f.readlines()])
+            #     args.validation_prompts = prompts
 
-    if args.num_validation_samples is not None:
-        args.validation_prompts = args.validation_prompts[:args.num_validation_samples]
+    if config["data"]["num_validation_samples"] is not None:
+        config["validation_prompts"] = config["validation_prompts"][:config["data"]["num_validation_samples"]]
 
     accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
+        gradient_accumulation_steps=config["training"]["gradient_accumulation_steps"],
+        mixed_precision=config["training"]["mixed_precision"],
+        log_with=config["training"]["logging"]["report_to"],
         project_config=accelerator_project_config,
     )
 
@@ -172,16 +166,18 @@ def main(base_args):
 
     # Handle the repository creation
     if accelerator.is_main_process:
-        if args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
+        if config["training"]["logging"]["logging_dir"] is not None:
+            os.makedirs(config["training"]["logging"]["logging_dir"], exist_ok=True)
 
             # dump the args to a yaml file
-            with open(os.path.join(args.output_dir, "args.yaml"), "w") as f:
-                yaml.dump(vars(args), f)
+            logging.info("Project config")
+            print(OmegaConf.to_yaml(config))
+            OmegaConf.save(config, os.path.join(logging_dir, "config.yaml"))
+            # with open(os.path.join(args.output_dir, "config.yaml"), "w") as f:
 
-        if args.push_to_hub:
+        if config["training"]["hf_hub"]["push_to_hub"]:
             repo_id = create_repo(
-                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
+                repo_id=config["training"]["hf_hub"]["hub_model_id"] or Path(logging_dir).name, exist_ok=True, token=config["training"]["hf_hub"]["hub_token"]
             ).repo_id
 
     # Load scheduler, tokenizer and models.
@@ -218,20 +214,28 @@ def main(base_args):
         )
     
     unet = UNet2DConditionModelGated.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision,
-        down_block_types=args.unet_down_blocks, up_block_types=args.unet_up_blocks
+        args.pretrained_model_name_or_path, 
+        subfolder="unet", 
+        revision=args.non_ema_revision,
+        down_block_types=config["model"]["unet"]["unet_down_blocks"], 
+        up_block_types=config["model"]["unet"]["unet_up_blocks"]
     )
     hyper_net = HyperStructure(input_dim=text_encoder.config.hidden_size,
                                seq_len=text_encoder.config.max_position_embeddings,
                                structure=unet.get_structure(),
-                               T=args.hypernet_T, base=args.hypernet_base)
+                               T=config["model"]["hypernet"]["hypernet_T"], 
+                               base=config["model"]["hypernet"]["hypernet_base"])
 
-    quantizer = StructureVectorQuantizer(n_e=args.num_arch_vq_codebook_embeddings,
-                                         vq_embed_dim=sum(unet.get_structure()), beta=args.arch_vq_beta,
-                                         temperature=args.hypernet_T, base=args.hypernet_base)
+    quantizer = StructureVectorQuantizer(n_e=config["model"]["quantizer"]["num_arch_vq_codebook_embeddings"],
+                                         vq_embed_dim=sum(unet.get_structure()), 
+                                         beta=config["model"]["quantizer"]["arch_vq_beta"],
+                                         temperature=config["model"]["hypernet"]["hypernet_T"], 
+                                         base=config["model"]["hypernet"]["hypernet_base"])
 
-    r_loss = ResourceLoss(p=args.pruning_target, loss_type=args.resource_loss_type)
-    clip_loss = ClipLoss(temperature=args.contrastive_loss_temperature)
+    r_loss = ResourceLoss(p=config["training"]["losses"]["resource_loss"]["pruning_target"], 
+                          loss_type=config["training"]["losses"]["resource_loss"]["resource_loss_type"])
+
+    clip_loss = ClipLoss(temperature=config["training"]["losses"]["contrastive_clip_loss"]["contrastive_loss_temperature"])
 
     # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
@@ -240,10 +244,14 @@ def main(base_args):
     # Create EMA for the unet.
     if args.use_ema:
         ema_unet = UNet2DConditionModelGated.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision,
-            down_block_types=args.unet_down_blocks, up_block_types=args.unet_up_blocks
+            args.pretrained_model_name_or_path, 
+            subfolder="unet", 
+            revision=args.revision,
+            down_block_types=config["model"]["unet"]["unet_down_blocks"], 
+            up_block_types=config["model"]["unet"]["unet_up_blocks"]
         )
-        ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModelGated,
+        ema_unet = EMAModel(ema_unet.parameters(), 
+                            model_cls=UNet2DConditionModelGated,
                             model_config=ema_unet.config)
 
     unet.eval()
@@ -251,7 +259,7 @@ def main(base_args):
     hyper_net.train()
     quantizer.train()
 
-    if args.enable_xformers_memory_efficient_attention:
+    if config["training"]["enable_xformers_memory_efficient_attention"]:
         if is_xformers_available():
             import xformers
 
@@ -320,24 +328,30 @@ def main(base_args):
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
-    if args.gradient_checkpointing:
+    if config["training"]["gradient_checkpointing"]:
         unet.enable_gradient_checkpointing()
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
-    if args.allow_tf32:
+    if config["training"]["allow_tf32"]:
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    if args.scale_lr:
-        args.hypernet_learning_rate = (
-                args.hypernet_learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+    if config["training"]["scale_lr"]:
+        config["training"]["optim"]["hypernet_learning_rate"] = (
+                config["training"]["optim"]["hypernet_learning_rate"] * 
+                config["training"]["optim"]["gradient_accumulation_steps"] * 
+                config["data"]["dataloader"]["train_batch_size"] * 
+                accelerator.num_processes
         )
-        args.quantizer_learning_rate = (
-                args.quantizer_learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+        config["training"]["optim"]["quantizer_learning_rate"] = (
+                config["training"]["optim"]["quantizer_learning_rate"] * 
+                config["training"]["optim"]["gradient_accumulation_steps"] * 
+                config["data"]["dataloader"]["train_batch_size"] * 
+                accelerator.num_processes
         )
 
     # Initialize the optimizer
-    if args.use_8bit_adam:
+    if config["training"]["optim"]["use_8bit_adam"]:
         try:
             import bitsandbytes as bnb
         except ImportError:
@@ -357,10 +371,10 @@ def main(base_args):
             {"params": hyper_net.parameters(), "lr": args.hypernet_learning_rate},
             {"params": quantizer.parameters(), "lr": args.quantizer_learning_rate},
         ],
-        lr=args.hypernet_learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
+        lr=config["training"]["optim"]["hypernet_learning_rate"],
+        betas=(config["training"]["optim"]["adam_beta1"], config["training"]["optim"]["adam_beta2"]),
+        weight_decay=config["training"]["optim"]["adam_weight_decay"],
+        eps=config["training"]["optim"]["adam_epsilon"],
     )
 
     # Get the datasets: you can either provide your own training and evaluation files (see below)
@@ -368,8 +382,10 @@ def main(base_args):
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
+    dataset_name = getattr(config["data"], "dataset_name", None)
+    train_data_dir = getattr(config["data"], "train_data_dir", None)
     logger.info("Loading dataset...")
-    if args.dataset_name is not None:
+    if dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         dataset = load_dataset(
             args.dataset_name,
@@ -910,7 +926,8 @@ def main(base_args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--base_config_path", type=str, required=True)
-    args = parser.parse_args()
-    main(args)
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("--base_config_path", type=str, required=True)
+    # args = parser.parse_args()
+    # main(args)
+    main()

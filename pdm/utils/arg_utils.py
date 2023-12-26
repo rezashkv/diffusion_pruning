@@ -11,6 +11,31 @@ def parse_args():
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
+        "--base_config_path",
+        type=str,
+        required=True,
+        help="Path to the model/data/training config file.",
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="Path to the model/data/training config file.",
+    )
+    parser.add_argument(
+        "--name",
+        type=str,
+        default="",
+        help="Experiment name. Will be added to the name of the logging directory for easier tracking of experiments.",
+    )
+    parser.add_argument(
+        "--non_ema_revision",
+        type=str,
+        default=None,
+        required=False,
+        help="Revision of pretrained model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
         "--revision",
         type=str,
         default=None,
@@ -32,20 +57,24 @@ def parse_args():
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
-    parser.add_argument("--wandb_run_name", type=str, default=None,
-                        help="The `run_name` argument passed to Accelerator.init_trackers")
+    parser.add_argument(
+        "--wandb_run_name", 
+        type=str, 
+        default=None, 
+        help="The `run_name` argument passed to Accelerator.init_trackers"
+    )
+    args = parser.parse_args()
+    env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    if env_local_rank != -1 and env_local_rank != args.local_rank:
+        args.local_rank = env_local_rank
 
-    # args = parser.parse_args()
-    # env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
-    # if env_local_rank != -1 and env_local_rank != args.local_rank:
-    #     args.local_rank = env_local_rank
-
-    # # Sanity checks
+    # Sanity checks
     # if args.dataset_name is None and args.train_data_dir is None:
     #     raise ValueError("Need either a dataset name or a training folder.")
 
-    # # default to using the same revision for the non-ema model if not specified
-    # if args.non_ema_revision is None:
-    #     args.non_ema_revision = args.revision
+    # default to using the same revision for the non-ema model if not specified
+    if args.non_ema_revision is None:
+        args.non_ema_revision = args.revision
 
-    return parser
+    # return parser
+    return args

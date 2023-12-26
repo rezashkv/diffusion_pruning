@@ -425,6 +425,8 @@ def accumulate_flops(self):
             norm3_flops = self.norm3.accumulate_flops()
             ff_flops = self.ff.accumulate_flops()
 
+            "linear -> SiLU -> chunk product -> linear"
+
             gate_1_hard_out = hard_concrete(self.attn1.gate.gate_f)
             gate_2_hard_out = hard_concrete(self.attn2.gate.gate_f)
             curr_att1_flops = att1_flops * gate_1_hard_out.sum() / gate_1_hard_out.numel()
