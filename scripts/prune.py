@@ -683,7 +683,6 @@ def main():
                 # gather the arch_vector_quantized across all processes to get large batch for contrastive loss
                 encoder_hidden_states_list = accelerator.gather(encoder_hidden_states)
                 arch_vector_quantized_list = accelerator.gather(arch_vector_quantized)
-                logger.info(f"contrastive loss batch size: {arch_vector_quantized_list.shape[0]}")
                 contrastive_loss = clip_loss(torch.sum(encoder_hidden_states_list, dim=1).squeeze(1),
                                              arch_vector_quantized_list)
 
@@ -776,7 +775,7 @@ def main():
                                 step=global_step)
 
                 # log the pairwise cosine similarity of the embeddings of the architecture vectors quantized:
-                arch_vector_ = arch_vector_quantized.data.cpu().numpy()
+                arch_vector_ = accelerator.gather(arch_vector_quantized).data.cpu().numpy()
                 arch_vector_ = arch_vector_ / np.linalg.norm(arch_vector_, axis=1, keepdims=True)
                 arch_vector_ = arch_vector_ @ arch_vector_.T
                 accelerator.log({"arch vector pairwise similarity": wandb.Image(arch_vector_)},
