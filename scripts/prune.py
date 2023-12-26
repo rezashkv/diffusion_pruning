@@ -20,7 +20,9 @@ import os
 import random
 import shutil
 import sys
+
 from pathlib import Path
+from omegaconf import OmegaConf
 
 import PIL
 import accelerate
@@ -77,8 +79,31 @@ DATASET_NAME_MAPPING = {
 }
 
 
-def main():
-    args = parse_args()
+def main(base_args):
+
+    configs = OmegaConf.load(base_args.base_config_path)
+    default_parser = parse_args()
+    final_config = {}
+
+    # for k in default_parser:
+    #     if k in configs:
+    #     if getattr(default_parser, k) != configs[k]:
+    #         final_config[k] = configs[k]
+    #     else:
+    #         final_config[k] = default_parser[k]
+
+    args = parser.parse_args()
+    env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    if env_local_rank != -1 and env_local_rank != args.local_rank:
+        args.local_rank = env_local_rank
+
+    # Sanity checks
+    if args.dataset_name is None and args.train_data_dir is None:
+        raise ValueError("Need either a dataset name or a training folder.")
+
+    # default to using the same revision for the non-ema model if not specified
+    if args.non_ema_revision is None:
+        args.non_ema_revision = args.revision
 
     if args.non_ema_revision is not None:
         deprecate(
@@ -191,6 +216,7 @@ def main():
         vae = AutoencoderKL.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision
         )
+    
     unet = UNet2DConditionModelGated.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision,
         down_block_types=args.unet_down_blocks, up_block_types=args.unet_up_blocks
@@ -501,7 +527,7 @@ def main():
             transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
             transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ]
     )
 
@@ -884,4 +910,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base_config_path", type=str, required=True)
+    args = parser.parse_args()
+    main(args)
