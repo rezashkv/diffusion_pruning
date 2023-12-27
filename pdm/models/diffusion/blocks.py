@@ -4,12 +4,14 @@ import torch
 import torch.nn.functional as F
 
 from diffusers.models import DualTransformer2DModel, Transformer2DModel
+from diffusers.models.activations import GEGLU, GELU, ApproximateGELU
+from diffusers.models.lora import LoRACompatibleLinear
 from diffusers.models.resnet import ResnetBlock2D, Upsample2D, Downsample2D
 from torch import nn
 from diffusers.configuration_utils import register_to_config
 
 from pdm.models.hypernet.gates import BlockVirtualGate
-from diffusers.models.attention import BasicTransformerBlock
+from diffusers.models.attention import BasicTransformerBlock, FeedForward
 from diffusers.models.unet_2d_blocks import CrossAttnDownBlock2D, CrossAttnUpBlock2D, DownBlock2D, UpBlock2D
 from diffusers.utils import logging, USE_PEFT_BACKEND
 from diffusers.models.attention_processor import AttnProcessor2_0, Attention
@@ -17,7 +19,61 @@ from diffusers.models.attention_processor import AttnProcessor2_0, Attention
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
-# TODO extract super classes and reduce code duplication
+class GEGLUGated(GEGLU):
+    r"""
+    A [variant](https://arxiv.org/abs/2002.05202) of the gated linear unit activation function.
+
+    Parameters:
+        dim_in (`int`): The number of channels in the input.
+        dim_out (`int`): The number of channels in the output.
+    """
+
+    def __init__(self, dim_in: int, dim_out: int):
+        super().__init__(dim_in, dim_out)
+        self.gate = BlockVirtualGate(dim_out * 2)
+
+    def forward(self, hidden_states, scale: float = 1.0):
+        args = () if USE_PEFT_BACKEND else (scale,)
+        hidden_states = self.proj(hidden_states, *args)
+        hidden_states, gate = (self.gate(hidden_states)).chunk(2, dim=-1)
+        return hidden_states * self.gelu(gate)
+
+
+class FeedForwardGated(FeedForward):
+    r"""
+     A Gated feed-forward layer.
+
+     Parameters:
+         dim (`int`): The number of channels in the input.
+         dim_out (`int`, *optional*): The number of channels in the output. If not given, defaults to `dim`.
+         mult (`int`, *optional*, defaults to 4): The multiplier to use for the hidden dimension.
+         dropout (`float`, *optional*, defaults to 0.0): The dropout probability to use.
+         activation_fn (`str`, *optional*, defaults to `"geglu"`): Activation function to be used in feed-forward.
+         final_dropout (`bool` *optional*, defaults to False): Apply a final dropout.
+     """
+
+    def __init__(
+            self,
+            dim: int,
+            dim_out: Optional[int] = None,
+            mult: int = 4,
+            dropout: float = 0.0,
+            activation_fn: str = "geglu",
+            final_dropout: bool = False,
+    ):
+        super().__init__(dim, dim_out, mult, dropout, activation_fn, final_dropout)
+        inner_dim = int(dim * mult)
+
+        if activation_fn == "geglu":
+            act_fn = GEGLUGated(dim, inner_dim)
+            self.net[0] = act_fn
+
+    def set_virtual_gate(self, gate_val):
+        self.net[0].gate.set_structure_value(gate_val)
+
+    def get_gate_structure(self):
+        return self.net[0].gate.width
+
 
 class GatedAttnProcessor2(AttnProcessor2_0):
     def __init__(self):
@@ -295,10 +351,29 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
 
 
 class BasicTransformerBlockGated(BasicTransformerBlock):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.num_attention_heads = args[1]
-        self.attention_head_dim = args[2]
+    def __init__(
+            self,
+            dim: int,
+            num_attention_heads: int,
+            attention_head_dim: int,
+            dropout=0.0,
+            cross_attention_dim: Optional[int] = None,
+            activation_fn: str = "geglu",
+            num_embeds_ada_norm: Optional[int] = None,
+            attention_bias: bool = False,
+            only_cross_attention: bool = False,
+            double_self_attention: bool = False,
+            upcast_attention: bool = False,
+            norm_elementwise_affine: bool = True,
+            norm_type: str = "layer_norm",
+            final_dropout: bool = False,
+            attention_type: str = "default",
+    ):
+        super().__init__(dim, num_attention_heads, attention_head_dim, dropout, cross_attention_dim, activation_fn,
+                         num_embeds_ada_norm, attention_bias, only_cross_attention, double_self_attention,
+                         upcast_attention, norm_elementwise_affine, norm_type, final_dropout, attention_type)
+        self.num_attention_heads = b=num_attention_heads
+        self.attention_head_dim = attention_head_dim
         gate1 = BlockVirtualGate(self.num_attention_heads)
         if self.attn1 is not None:
             self.attn1.set_processor(GatedAttnProcessor2())
@@ -308,6 +383,8 @@ class BasicTransformerBlockGated(BasicTransformerBlock):
         if self.attn2 is not None:
             self.attn2.set_processor(GatedAttnProcessor2())
             self.attn2.gate = gate2
+
+        self.ff = FeedForwardGated(dim, dropout=dropout, activation_fn=activation_fn, final_dropout=final_dropout)
 
     def forward(
             self,
@@ -399,19 +476,40 @@ class BasicTransformerBlockGated(BasicTransformerBlock):
 
     def set_virtual_gate(self, gate_val):
         gate_1_val = gate_val[:, :self.attn1.gate.width]
-        gate_2_val = gate_val[:, self.attn1.gate.width:]
+        gate_2_val = gate_val[:, self.attn1.gate.width:self.attn1.gate.width + self.attn2.gate.width]
+        gate_3_val = gate_val[:, self.attn1.gate.width + self.attn2.gate.width:]
         self.attn1.gate.set_structure_value(gate_1_val)
         self.attn2.gate.set_structure_value(gate_2_val)
+        self.ff.set_structure_value(gate_3_val)
 
     def get_gate_structure(self):
-        return self.attn1.gate.width + self.attn2.gate.width
+        return self.attn1.gate.width + self.attn2.gate.width + self.ff.get_gate_structure()
 
 
 class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.num_attention_heads = args[1]
-        self.attention_head_dim = args[2]
+    def __init__(
+            self,
+            dim: int,
+            num_attention_heads: int,
+            attention_head_dim: int,
+            dropout=0.0,
+            cross_attention_dim: Optional[int] = None,
+            activation_fn: str = "geglu",
+            num_embeds_ada_norm: Optional[int] = None,
+            attention_bias: bool = False,
+            only_cross_attention: bool = False,
+            double_self_attention: bool = False,
+            upcast_attention: bool = False,
+            norm_elementwise_affine: bool = True,
+            norm_type: str = "layer_norm",
+            final_dropout: bool = False,
+            attention_type: str = "default",
+    ):
+        super().__init__(dim, num_attention_heads, attention_head_dim, dropout, cross_attention_dim, activation_fn,
+                         num_embeds_ada_norm, attention_bias, only_cross_attention, double_self_attention,
+                         upcast_attention, norm_elementwise_affine, norm_type, final_dropout, attention_type)
+        self.num_attention_heads = num_attention_heads
+        self.attention_head_dim = attention_head_dim
 
         gate1 = BlockVirtualGate(self.num_attention_heads)
         if self.attn1 is not None:
@@ -421,6 +519,9 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
         if self.attn2 is not None:
             self.attn2.set_processor(GatedAttnProcessor2())
             self.attn2.gate = gate2
+
+        self.ff = FeedForwardGated(dim, dropout=dropout, activation_fn=activation_fn, final_dropout=final_dropout)
+
         self.depth_gate = BlockVirtualGate(1)
 
     def forward(
@@ -515,13 +616,15 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
 
     def set_virtual_gate(self, gate_val):
         gate_1_val = gate_val[:, :self.attn1.gate.width]
-        gate_2_val = gate_val[:, self.attn1.gate.width:-1]
+        gate_2_val = gate_val[:, self.attn1.gate.width:self.attn1.gate.width + self.attn2.gate.width]
+        gate_3_val = gate_val[:, self.attn1.gate.width + self.attn2.gate.width:-1]
         self.attn1.gate.set_structure_value(gate_1_val)
         self.attn2.gate.set_structure_value(gate_2_val)
+        self.ff.set_structure_value(gate_3_val)
         self.depth_gate.set_structure_value(gate_val[:, -1:])
 
     def get_gate_structure(self):
-        return self.attn1.gate.width + self.attn2.gate.width + self.depth_gate.width
+        return self.attn1.gate.width + self.attn2.gate.width + self.ff.get_gate_structure() + self.depth_gate.width
 
 
 class Transformer2DModelGated(Transformer2DModel):
