@@ -4,13 +4,12 @@ import torch
 import torch.nn.functional as F
 
 from diffusers.models import DualTransformer2DModel, Transformer2DModel
-from diffusers.models.activations import GEGLU, GELU, ApproximateGELU
-from diffusers.models.lora import LoRACompatibleLinear
+from diffusers.models.activations import GEGLU
 from diffusers.models.resnet import ResnetBlock2D, Upsample2D, Downsample2D
 from torch import nn
 from diffusers.configuration_utils import register_to_config
 
-from pdm.models.hypernet.gates import BlockVirtualGate
+from pdm.models.hypernet.gates import BlockVirtualGate, LinearVirtualGate
 from diffusers.models.attention import BasicTransformerBlock, FeedForward
 from diffusers.models.unet_2d_blocks import CrossAttnDownBlock2D, CrossAttnUpBlock2D, DownBlock2D, UpBlock2D
 from diffusers.utils import logging, USE_PEFT_BACKEND
@@ -30,7 +29,7 @@ class GEGLUGated(GEGLU):
 
     def __init__(self, dim_in: int, dim_out: int):
         super().__init__(dim_in, dim_out)
-        self.gate = BlockVirtualGate(dim_out * 2)
+        self.gate = LinearVirtualGate(dim_out * 2)
 
     def forward(self, hidden_states, scale: float = 1.0):
         args = () if USE_PEFT_BACKEND else (scale,)

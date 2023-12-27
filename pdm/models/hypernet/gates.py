@@ -9,7 +9,6 @@ import torch.autograd.function
 class VirtualGate(nn.Module):
     def __init__(self, width, bs=1):
         super(VirtualGate, self).__init__()
-        self.g_w = 1
         self.width = width
         self.gate_f = torch.ones(bs, width)
 
@@ -22,7 +21,7 @@ class VirtualGate(nn.Module):
             x = gate_f.expand_as(x) * x
             return x
 
-        elif len(x.size()) == 4:
+        elif len(x.size()) == 3:
             gate_f = self.gate_f.unsqueeze(-1).unsqueeze(-1)
             if x.is_cuda:
                 gate_f = gate_f.cuda()
@@ -50,3 +49,16 @@ class BlockVirtualGate(VirtualGate):
         x = gate_f * x
         return x
 
+
+class LinearVirtualGate(VirtualGate):
+    def __init__(self, width):
+        super(LinearVirtualGate, self).__init__(width)
+
+    def forward(self, x):
+        gate_f = self.gate_f
+        for _ in range(len(x.size()) - 2):
+            gate_f = gate_f.unsqueeze(1)
+        if x.is_cuda:
+            gate_f = gate_f.cuda()
+        x = gate_f.expand_as(x) * x
+        return x
