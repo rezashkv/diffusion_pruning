@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="SshConfigs">
+    <configs>
+      <sshConfig authType="PASSWORD" host="nexus" id="e244ee99-9a1e-4654-8f27-a0869c73c126" port="22" nameFormat="DESCRIPTIVE" username="rezashkv" useOpenSSHConfig="true" />
+    </configs>
+  </component>
+</project>

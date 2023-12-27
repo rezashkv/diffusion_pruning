@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="ea5d8d15-932b-42fd-bb23-bc9f0d49c0fc" name="nexus">
+        <fileTransfer rootFolder="/fs/nexus-scratch/rezashkv/research/" accessType="SFTP" host="nexus" port="22" sshConfigId="e244ee99-9a1e-4654-8f27-a0869c73c126" sshConfig="rezashkv@nexus:22 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>
