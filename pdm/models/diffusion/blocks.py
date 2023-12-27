@@ -480,7 +480,7 @@ class BasicTransformerBlockGated(BasicTransformerBlock):
         gate_3_val = gate_val[:, self.attn1.gate.width + self.attn2.gate.width:]
         self.attn1.gate.set_structure_value(gate_1_val)
         self.attn2.gate.set_structure_value(gate_2_val)
-        self.ff.set_structure_value(gate_3_val)
+        self.ff.set_virtual_gate(gate_3_val)
 
     def get_gate_structure(self):
         return self.attn1.gate.width + self.attn2.gate.width + self.ff.get_gate_structure()
@@ -620,7 +620,7 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
         gate_3_val = gate_val[:, self.attn1.gate.width + self.attn2.gate.width:-1]
         self.attn1.gate.set_structure_value(gate_1_val)
         self.attn2.gate.set_structure_value(gate_2_val)
-        self.ff.set_structure_value(gate_3_val)
+        self.ff.set_virtual_gate(gate_3_val)
         self.depth_gate.set_structure_value(gate_val[:, -1:])
 
     def get_gate_structure(self):

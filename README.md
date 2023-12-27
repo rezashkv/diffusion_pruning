@@ -1,5 +1,5 @@
 # diffusion-pruning
-An open-source implementation of diffusion model pruning.
+An open-source implementation of dynamic prompt-based pruning of diffusion models.
 
 ## Installation
 
