@@ -105,7 +105,10 @@ def main():
     else:
         nowname = now
 
-    config["training"]["logging"]["logging_dir"] = os.path.join(config["training"]["logging"]["logging_dir"], os.getcwd().split('/')[-1], nowname)
+    config["training"]["logging"]["logging_dir"] = os.path.join(config["training"]["logging"]["logging_dir"], 
+                                                                os.getcwd().split('/')[-1], 
+                                                                os.path.basename(__file__).split('.')[0], 
+                                                                nowname)
     logging_dir = config["training"]["logging"]["logging_dir"]
 
     accelerator_project_config = ProjectConfiguration(project_dir=logging_dir,

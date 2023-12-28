@@ -9,7 +9,6 @@ import torch.autograd.function
 class VirtualGate(nn.Module):
     def __init__(self, width, bs=1):
         super(VirtualGate, self).__init__()
-        self.g_w = 1
         self.width = width
         self.gate_f = torch.ones(bs, width)
 
@@ -22,7 +21,7 @@ class VirtualGate(nn.Module):
             x = gate_f.expand_as(x) * x
             return x
 
-        elif len(x.size()) == 4:
+        elif len(x.size()) == 3:
             gate_f = self.gate_f.unsqueeze(-1).unsqueeze(-1)
             if x.is_cuda:
                 gate_f = gate_f.cuda()
@@ -33,20 +32,45 @@ class VirtualGate(nn.Module):
         self.gate_f = value
 
 
-class BlockVirtualGate(VirtualGate):
+class WidthGate(VirtualGate):
     def __init__(self, width):
-        super(BlockVirtualGate, self).__init__(width)
+        super(WidthGate, self).__init__(width)
 
-    def forward(self, x):
-        gate_f = torch.repeat_interleave(self.gate_f, x.shape[1] // self.width, dim=1)
-        if gate_f.shape[0] > 1 and gate_f.shape[0] != x.shape[0]:
-            # cat the gate_f to itself to match the batch size for classifier-free guidance
-            gate_f = torch.cat([gate_f] * (x.shape[0] // gate_f.shape[0]))
-        if x.is_cuda:
-            gate_f = gate_f.cuda()
-        for _ in range(len(x.size()) - 2):
-            gate_f = gate_f.unsqueeze(-1)
-        gate_f = gate_f.expand_as(x)
-        x = gate_f * x
-        return x
+
+class DepthGate(VirtualGate):
+    def __init__(self, width):
+        super(DepthGate, self).__init__(width)
+
+
+# class BlockVirtualGate(VirtualGate):
+#     def __init__(self, width):
+#         super(BlockVirtualGate, self).__init__(width)
+
+#     def forward(self, x):
+#         gate_f = torch.repeat_interleave(self.gate_f, x.shape[1] // self.width, dim=1)
+#         if gate_f.shape[0] > 1 and gate_f.shape[0] != x.shape[0]:
+#             # cat the gate_f to itself to match the batch size for classifier-free guidance
+#             gate_f = torch.cat([gate_f] * (x.shape[0] // gate_f.shape[0]))
+#         if x.is_cuda:
+#             gate_f = gate_f.cuda()
+#         for _ in range(len(x.size()) - 2):
+#             gate_f = gate_f.unsqueeze(-1)
+#         gate_f = gate_f.expand_as(x)
+#         x = gate_f * x
+#         return x
+
+
+# class LinearVirtualGate(VirtualGate):
+#     def __init__(self, width):
+#         super(LinearVirtualGate, self).__init__(width)
+
+#     def forward(self, x):
+#         gate_f = self.gate_f
+#         for _ in range(len(x.size()) - 2):
+#             gate_f = gate_f.unsqueeze(1)
+#         if x.is_cuda:
+#             gate_f = gate_f.cuda()
+#         x = gate_f.expand_as(x) * x
+#         return x
+        
 
