@@ -72,7 +72,7 @@ class FeedForwardWidthGated(FeedForward):
         self.net[0].gate.set_structure_value(gate_val)
 
     def get_gate_structure(self):
-        return self.net[0].gate.width
+        return {"width": self.net[0].gate.width}
 
 
 class HeadGatedAttnProcessor2(AttnProcessor2_0):
@@ -253,7 +253,7 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
         self.gate.set_structure_value(gate_val)
 
     def get_gate_structure(self):
-        return self.gate.width
+        return {"width": self.gate.width}
 
 
 class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
@@ -347,7 +347,7 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         self.depth_gate.set_structure_value(gate_val[:, -1:])
 
     def get_gate_structure(self):
-        return self.gate.width + self.depth_gate.width
+        return {"depth": self.depth_gate.width, "width": self.gate.width}
 
 
 class BasicTransformerBlockWidthGated(BasicTransformerBlock):
@@ -368,11 +368,12 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
             norm_type: str = "layer_norm",
             final_dropout: bool = False,
             attention_type: str = "default",
+            gated_ff: bool = False,
     ):
         super().__init__(dim, num_attention_heads, attention_head_dim, dropout, cross_attention_dim, activation_fn,
                          num_embeds_ada_norm, attention_bias, only_cross_attention, double_self_attention,
                          upcast_attention, norm_elementwise_affine, norm_type, final_dropout, attention_type)
-        self.num_attention_heads = b = num_attention_heads
+        self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
         gate1 = BlockVirtualGate(self.num_attention_heads)
         if self.attn1 is not None:
@@ -384,7 +385,11 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
             self.attn2.set_processor(HeadGatedAttnProcessor2())
             self.attn2.gate = gate2
 
-        self.ff = FeedForwardWidthGated(dim, dropout=dropout, activation_fn=activation_fn, final_dropout=final_dropout)
+        if gated_ff:
+            self.ff = FeedForwardWidthGated(dim, dropout=dropout, activation_fn=activation_fn,
+                                            final_dropout=final_dropout)
+        else:
+            self.ff = FeedForward(dim, dropout=dropout, activation_fn=activation_fn, final_dropout=final_dropout)
 
     def forward(
             self,
@@ -477,13 +482,18 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
     def set_virtual_gate(self, gate_val):
         gate_1_val = gate_val[:, :self.attn1.gate.width]
         gate_2_val = gate_val[:, self.attn1.gate.width:self.attn1.gate.width + self.attn2.gate.width]
-        gate_3_val = gate_val[:, self.attn1.gate.width + self.attn2.gate.width:]
         self.attn1.gate.set_structure_value(gate_1_val)
         self.attn2.gate.set_structure_value(gate_2_val)
-        self.ff.set_virtual_gate(gate_3_val)
+
+        if isinstance(self.ff, FeedForwardWidthGated):
+            gate_3_val = gate_val[:, self.attn1.gate.width + self.attn2.gate.width:-1]
+            self.ff.set_virtual_gate(gate_3_val)
 
     def get_gate_structure(self):
-        return self.attn1.gate.width + self.attn2.gate.width + self.ff.get_gate_structure()
+        width = self.attn1.gate.width + self.attn2.gate.width
+        if isinstance(self.ff, FeedForwardWidthGated):
+            width += self.ff.get_gate_structure()
+        return {"width": width}
 
 
 class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
@@ -504,6 +514,7 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
             norm_type: str = "layer_norm",
             final_dropout: bool = False,
             attention_type: str = "default",
+            gated_ff: bool = False,
     ):
         super().__init__(dim, num_attention_heads, attention_head_dim, dropout, cross_attention_dim, activation_fn,
                          num_embeds_ada_norm, attention_bias, only_cross_attention, double_self_attention,
@@ -520,7 +531,11 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
             self.attn2.set_processor(HeadGatedAttnProcessor2())
             self.attn2.gate = gate2
 
-        self.ff = FeedForwardWidthGated(dim, dropout=dropout, activation_fn=activation_fn, final_dropout=final_dropout)
+        if gated_ff:
+            self.ff = FeedForwardWidthGated(dim, dropout=dropout, activation_fn=activation_fn,
+                                            final_dropout=final_dropout)
+        else:
+            self.ff = FeedForward(dim, dropout=dropout, activation_fn=activation_fn, final_dropout=final_dropout)
 
         self.depth_gate = BlockVirtualGate(1)
 
@@ -560,6 +575,9 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
         )
         if self.use_ada_layer_norm_zero:
             attn_output = gate_msa.unsqueeze(1) * attn_output
+
+        attn_output = self.depth_gate(attn_output)
+
         hidden_states = attn_output + hidden_states
 
         # 2.5 GLIGEN Control
@@ -579,6 +597,8 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
                 attention_mask=encoder_attention_mask,
                 **cross_attention_kwargs,
             )
+
+            attn_output = self.depth_gate(attn_output)
             hidden_states = attn_output + hidden_states
 
         # 4. Feed-forward
@@ -608,23 +628,28 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
         if self.use_ada_layer_norm_zero:
             ff_output = gate_mlp.unsqueeze(1) * ff_output
 
+        ff_output = self.depth_gate(ff_output)
         hidden_states = ff_output + hidden_states
-
-        hidden_states = self.depth_gate(hidden_states)
 
         return hidden_states
 
     def set_virtual_gate(self, gate_val):
         gate_1_val = gate_val[:, :self.attn1.gate.width]
         gate_2_val = gate_val[:, self.attn1.gate.width:self.attn1.gate.width + self.attn2.gate.width]
-        gate_3_val = gate_val[:, self.attn1.gate.width + self.attn2.gate.width:-1]
         self.attn1.gate.set_structure_value(gate_1_val)
         self.attn2.gate.set_structure_value(gate_2_val)
-        self.ff.set_virtual_gate(gate_3_val)
+
+        if isinstance(self.ff, FeedForwardWidthGated):
+            gate_3_val = gate_val[:, self.attn1.gate.width + self.attn2.gate.width:-1]
+            self.ff.set_virtual_gate(gate_3_val)
+
         self.depth_gate.set_structure_value(gate_val[:, -1:])
 
     def get_gate_structure(self):
-        return self.attn1.gate.width + self.attn2.gate.width + self.ff.get_gate_structure() + self.depth_gate.width
+        width = self.attn1.gate.width + self.attn2.gate.width
+        if isinstance(self.ff, FeedForwardWidthGated):
+            width += self.ff.get_gate_structure()
+        return {"width": width, "depth": self.depth_gate.width}
 
 
 class Transformer2DModelWidthGated(Transformer2DModel):
