@@ -127,13 +127,13 @@ def log_validation(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, arg
             with accelerator.split_between_processes(batch) as batch:
                 gen_images = pipeline(batch, num_inference_steps=args.num_inference_steps, generator=generator).images
                 gen_images = accelerator.gather(gen_images)
+                images += gen_images
                 for i, image in enumerate(gen_images):
                     try:
                         image.save(os.path.join(image_output_dir, f"{batch[i]}.png"))
                     except Exception as e:
                         logger.error(f"Error saving image {batch[i]}: {e}")
 
-                    images += gen_images
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":

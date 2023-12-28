@@ -72,6 +72,7 @@ DATASET_NAME_MAPPING = {
 
 
 def main():
+    torch.autograd.set_detect_anomaly(True)
     args = parse_args()
 
     if args.non_ema_revision is not None:
@@ -189,17 +190,16 @@ def main():
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision,
         down_block_types=args.unet_down_blocks, up_block_types=args.unet_up_blocks
     )
-    hyper_net = HyperStructure(input_dim=text_encoder.config.hidden_size,
+    unet_structure, unet_structure_widths = unet.get_structure()
+    hyper_net = HyperStructure(structure=unet_structure_widths, input_dim=text_encoder.config.hidden_size,
                                seq_len=text_encoder.config.max_position_embeddings,
-                               structure=unet.get_structure(),
                                T=args.hypernet_T, base=args.hypernet_base)
 
-    quantizer = StructureVectorQuantizer(n_e=args.num_arch_vq_codebook_embeddings,
-                                         vq_embed_dim=sum(unet.get_structure()), beta=args.arch_vq_beta,
-                                         temperature=args.hypernet_T, base=args.hypernet_base)
+    quantizer = StructureVectorQuantizer(n_e=args.num_arch_vq_codebook_embeddings, structure=unet_structure,
+                                         beta=args.arch_vq_beta, temperature=args.hypernet_T, base=args.hypernet_base)
 
     r_loss = ResourceLoss(p=args.pruning_target, loss_type=args.resource_loss_type)
-    clip_loss = ClipLoss(temperature=args.contrastive_loss_temperature)
+    clip_loss = ClipLoss(temperature=args.contrastive_loss_temperature, structure=unet_structure)
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)

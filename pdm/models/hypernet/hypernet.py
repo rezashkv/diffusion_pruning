@@ -25,7 +25,7 @@ class SimpleGate(nn.Module):
 
 class HyperStructure(ModelMixin, ConfigMixin):
     @register_to_config
-    def __init__(self, input_dim=1024, seq_len=77, structure=None, T=0.4, sparsity=0, base=2, wn_flag=True):
+    def __init__(self, structure, input_dim=1024, seq_len=77, T=0.4, sparsity=0, base=2, wn_flag=True):
         super(HyperStructure, self).__init__()
 
         self.T = T

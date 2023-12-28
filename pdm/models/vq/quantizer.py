@@ -4,9 +4,10 @@ import numpy as np
 import torch
 from diffusers.configuration_utils import register_to_config, ConfigMixin
 from torch import nn
-from pdm.utils.estimation_utils import gumbel_softmax_sample, hard_concrete
+from pdm.utils.estimation_utils import gumbel_softmax_sample, hard_concrete, importance_gumble_softmax_sample
 from diffusers import ModelMixin
 
+DEPTH_ORDER = [-1, -2, -3, -4, -5, 0, 1, 2, -6, -7, 3, 4]
 
 class StructureVectorQuantizer(ModelMixin, ConfigMixin):
     """
@@ -21,7 +22,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
     def __init__(
             self,
             n_e: int,
-            vq_embed_dim: int = 256,
+            structure: list[dict],
             beta: float = 0.25,
             remap=None,
             unknown_index: str = "random",
@@ -30,9 +31,27 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
             base: int = 2,
     ):
         super().__init__()
+
+        vq_embed_dim = 0
+        depth_indices = []
+        for elem in structure:
+            if "width" in elem:
+                vq_embed_dim += elem["width"]
+            if "depth" in elem:
+                depth_indices.append(vq_embed_dim)
+                vq_embed_dim += elem["depth"]
+
+        self.depth_indices = depth_indices
+        self.depth_order = DEPTH_ORDER
+        depth_order = [i % len(depth_indices) for i in DEPTH_ORDER]
+        for i in range(len(depth_indices)):
+            if i not in depth_order:
+                self.depth_order.append(i)
+
         self.n_e = n_e
         self.vq_embed_dim = vq_embed_dim
         self.beta = beta
+        self.structure = structure
 
         self.embedding = nn.Embedding(self.n_e, self.vq_embed_dim)
         nn.init.orthogonal_(self.embedding.weight)
@@ -111,7 +130,12 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         if self.sane_index_shape:
             min_encoding_indices = min_encoding_indices.reshape(z_q.shape[0])
 
+        z_q_depth = z_q[:, self.depth_indices]
+        z_q_depth = importance_gumble_softmax_sample(z_q_depth, temperature=self.temperature, offset=self.base)
+
         z_q = gumbel_softmax_sample(z_q, temperature=self.temperature, offset=self.base)
+        # z_q[:, self.depth_order] = z_q_depth
+
         if not self.training:
             z_q = hard_concrete(z_q)
 
@@ -136,7 +160,13 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
     def get_codebook_entry_gumbel_sigmoid(self, indices: torch.LongTensor, shape: Tuple[int, ...] = None) -> torch.FloatTensor:
         z_q = self.get_codebook_entry(indices, shape)
+
+        z_q_depth = z_q[:, self.depth_indices]
+        z_q_depth = importance_gumble_softmax_sample(z_q_depth, temperature=self.temperature, offset=self.base)
+
         z_q = gumbel_softmax_sample(z_q, temperature=self.temperature, offset=self.base)
+        z_q[:, self.depth_order] = z_q_depth
+
         return z_q
 
     def print_param_stats(self):
