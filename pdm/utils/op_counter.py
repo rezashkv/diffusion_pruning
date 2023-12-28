@@ -15,7 +15,7 @@ from diffusers.models.normalization import AdaGroupNorm
 from diffusers.models.activations import GEGLU
 from diffusers.models.resnet import Upsample2D
 from diffusers.models.lora import (LoRACompatibleConv, LoRACompatibleLinear)
-from pdm.models.diffusion.blocks import (ResnetBlock2DGated, BasicTransformerBlockGated,
+from pdm.models.diffusion.blocks import (ResnetBlock2DWidthGated, BasicTransformerBlockWidthGated,
                                          ResnetBlock2DWidthDepthGated, BasicTransformerBlockWidthDepthGated)
 from pdm.utils.estimation_utils import hard_concrete
 
@@ -398,13 +398,13 @@ def accumulate_flops(self):
         return self.__flops__
     else:
         sum = 0
-        if not isinstance(self, (ResnetBlock2DGated, BasicTransformerBlockGated,
+        if not isinstance(self, (ResnetBlock2DWidthGated, BasicTransformerBlockWidthGated,
                                  ResnetBlock2DWidthDepthGated, BasicTransformerBlockWidthDepthGated)):
             for m in self.children():
                 sum += m.accumulate_flops()
             return sum
 
-        elif isinstance(self, (ResnetBlock2DGated, ResnetBlock2DWidthDepthGated)):
+        elif isinstance(self, (ResnetBlock2DWidthGated, ResnetBlock2DWidthDepthGated)):
             for m in self.children():
                 sum += m.accumulate_flops()
             norm1_flops = self.norm1.accumulate_flops()

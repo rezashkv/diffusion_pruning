@@ -371,6 +371,11 @@ def parse_args():
                  "CrossAttnDownBlock2DHalfGated", "DownBlock2DHalfGated"),
     )
     parser.add_argument(
+        "--unet_mid_block",
+        type=str,
+        default="UNetMidBlock2DCrossAttnWidthGated",
+    )
+    parser.add_argument(
         "--unet_up_blocks",
         type=str,
         nargs="*",

@@ -14,6 +14,8 @@ model:
       - CrossAttnDownBlock2DHalfGated
       - CrossAttnDownBlock2DHalfGated
       - DownBlock2DHalfGated
+    unet_mid_block:
+      - UNetMidBlock2DCrossAttnWidthGated
     unet_up_blocks:
       - UpBlock2DHalfGated
       - CrossAttnUpBlock2DHalfGated

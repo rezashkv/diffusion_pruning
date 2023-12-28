@@ -32,19 +32,21 @@ class HyperStructure(ModelMixin, ConfigMixin):
         self.structure = structure
         self.input_dim = input_dim
 
-        self.Bi_GRU = nn.GRU(self.input_dim, self.input_dim, bidirectional=True)
+        gru_hidden_dim = 2 * self.input_dim
 
-        self.bn1 = nn.LayerNorm([2 * self.input_dim])
+        self.Bi_GRU = nn.GRU(self.input_dim, gru_hidden_dim, bidirectional=True)
 
-        self.h0 = torch.zeros(2, seq_len, self.input_dim)
+        self.bn1 = nn.LayerNorm([2 * gru_hidden_dim])
+
+        self.h0 = torch.zeros(2, seq_len, gru_hidden_dim)
 
         self.sparsity = [sparsity] * len(structure)
 
         if wn_flag:
-            self.linear_list = [weight_norm(nn.Linear(2 * self.input_dim, structure[i], bias=False))
+            self.linear_list = [weight_norm(nn.Linear(2 * gru_hidden_dim, structure[i], bias=False))
                                 for i in range(len(structure))]
         else:
-            self.linear_list = [nn.Linear(2 * self.input_dim, structure[i], bias=False, ) for i
+            self.linear_list = [nn.Linear(2 * gru_hidden_dim, structure[i], bias=False) for i
                                 in range(len(structure))]
 
         self.mh_fc = torch.nn.ModuleList(self.linear_list)

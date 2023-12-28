@@ -47,12 +47,12 @@ from diffusers.models.unet_2d_blocks import (
     SkipDownBlock2D, CrossAttnDownBlock2D, AttnSkipDownBlock2D, DownEncoderBlock2D, AttnDownEncoderBlock2D,
     KDownBlock2D, KCrossAttnDownBlock2D, UpBlock2D, ResnetUpsampleBlock2D, CrossAttnUpBlock2D, SimpleCrossAttnUpBlock2D,
     AttnUpBlock2D, SkipUpBlock2D, AttnSkipUpBlock2D, UpDecoderBlock2D, AttnUpDecoderBlock2D, KUpBlock2D,
-    KCrossAttnUpBlock2D
+    KCrossAttnUpBlock2D, UNetMidBlock2D
 )
 
-from .blocks import (CrossAttnDownBlock2DGated, CrossAttnUpBlock2DGated, CrossAttnUpBlock2DHalfGated,
-                     CrossAttnDownBlock2DHalfGated, DownBlock2DGated, UpBlock2DGated,
-                     DownBlock2DHalfGated, UpBlock2DHalfGated)
+from .blocks import (CrossAttnDownBlock2DWidthDepthGated, CrossAttnUpBlock2DWidthDepthGated, CrossAttnUpBlock2DWidthHalfDepthGated,
+                     CrossAttnDownBlock2DWidthHalfDepthGated, DownBlock2DWidthDepthGated, UpBlock2DWidthDepthGated,
+                     DownBlock2DWidthHalfDepthGated, UpBlock2DWidthHalfDepthGated, UNetMidBlock2DCrossAttnWidthGated)
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -107,7 +107,7 @@ def get_down_block(
             resnet_time_scale_shift=resnet_time_scale_shift,
         )
     elif down_block_type == "DownBlock2DGated":
-        return DownBlock2DGated(
+        return DownBlock2DWidthDepthGated(
             num_layers=num_layers,
             in_channels=in_channels,
             out_channels=out_channels,
@@ -121,7 +121,7 @@ def get_down_block(
             resnet_time_scale_shift=resnet_time_scale_shift,
         )
     elif down_block_type == "DownBlock2DHalfGated":
-        return DownBlock2DHalfGated(
+        return DownBlock2DWidthHalfDepthGated(
             num_layers=num_layers,
             in_channels=in_channels,
             out_channels=out_channels,
@@ -195,7 +195,7 @@ def get_down_block(
     elif down_block_type == "CrossAttnDownBlock2DGated":
         if cross_attention_dim is None:
             raise ValueError("cross_attention_dim must be specified for CrossAttnDownBlock2D")
-        return CrossAttnDownBlock2DGated(
+        return CrossAttnDownBlock2DWidthDepthGated(
             num_layers=num_layers,
             transformer_layers_per_block=transformer_layers_per_block,
             in_channels=in_channels,
@@ -219,7 +219,7 @@ def get_down_block(
     elif down_block_type == "CrossAttnDownBlock2DHalfGated":
         if cross_attention_dim is None:
             raise ValueError("cross_attention_dim must be specified for CrossAttnDownBlock2D")
-        return CrossAttnDownBlock2DHalfGated(
+        return CrossAttnDownBlock2DWidthHalfDepthGated(
             num_layers=num_layers,
             transformer_layers_per_block=transformer_layers_per_block,
             in_channels=in_channels,
@@ -393,7 +393,7 @@ def get_up_block(
             resnet_time_scale_shift=resnet_time_scale_shift,
         )
     elif up_block_type == "UpBlock2DHalfGated":
-        return UpBlock2DHalfGated(
+        return UpBlock2DWidthHalfDepthGated(
             num_layers=num_layers,
             in_channels=in_channels,
             out_channels=out_channels,
@@ -407,7 +407,7 @@ def get_up_block(
             resnet_time_scale_shift=resnet_time_scale_shift,
         )
     elif up_block_type == "UpBlock2DGated":
-        return UpBlock2DGated(
+        return UpBlock2DWidthDepthGated(
             num_layers=num_layers,
             in_channels=in_channels,
             out_channels=out_channels,
@@ -463,7 +463,7 @@ def get_up_block(
     elif up_block_type == "CrossAttnUpBlock2DGated":
         if cross_attention_dim is None:
             raise ValueError("cross_attention_dim must be specified for CrossAttnUpBlock2D")
-        return CrossAttnUpBlock2DGated(
+        return CrossAttnUpBlock2DWidthDepthGated(
             num_layers=num_layers,
             transformer_layers_per_block=transformer_layers_per_block,
             in_channels=in_channels,
@@ -487,7 +487,7 @@ def get_up_block(
     elif up_block_type == "CrossAttnUpBlock2DHalfGated":
         if cross_attention_dim is None:
             raise ValueError("cross_attention_dim must be specified for CrossAttnUpBlock2D")
-        return CrossAttnUpBlock2DHalfGated(
+        return CrossAttnUpBlock2DWidthHalfDepthGated(
             num_layers=num_layers,
             transformer_layers_per_block=transformer_layers_per_block,
             in_channels=in_channels,
@@ -738,7 +738,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
                     "CrossAttnDownBlock2DHalfGated",
                     "DownBlock2DHalfGated",
             ),
-            mid_block_type: Optional[str] = "UNetMidBlock2DCrossAttn",
+            mid_block_type: Optional[str] = "UNetMidBlock2DCrossAttnWidthGated",
             up_block_types: Tuple[str] = (
                     "UpBlock2DHalfGated", "CrossAttnUpBlock2DHalfGated", "CrossAttnUpBlock2DHalfGated",
                     "CrossAttnUpBlock2DHalfGated"),
@@ -1036,8 +1036,8 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
             self.down_blocks.append(down_block)
 
         # mid
-        if mid_block_type == "UNetMidBlock2DCrossAttn":
-            self.mid_block = UNetMidBlock2DCrossAttn(
+        if mid_block_type == "UNetMidBlock2DCrossAttnWidthGated":
+            self.mid_block = UNetMidBlock2DCrossAttnWidthGated(
                 transformer_layers_per_block=transformer_layers_per_block[-1],
                 in_channels=block_out_channels[-1],
                 temb_channels=blocks_time_embed_dim,
@@ -1069,6 +1069,19 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
                 skip_time_act=resnet_skip_time_act,
                 only_cross_attention=mid_block_only_cross_attention,
                 cross_attention_norm=cross_attention_norm,
+            )
+        elif mid_block_type == "UNetMidBlock2D":
+            self.mid_block = UNetMidBlock2D(
+                in_channels=block_out_channels[-1],
+                temb_channels=blocks_time_embed_dim,
+                dropout=dropout,
+                num_layers=0,
+                resnet_eps=norm_eps,
+                resnet_act_fn=act_fn,
+                output_scale_factor=mid_block_scale_factor,
+                resnet_groups=norm_num_groups,
+                resnet_time_scale_shift=resnet_time_scale_shift,
+                add_attention=False,
             )
         elif mid_block_type is None:
             self.mid_block = None

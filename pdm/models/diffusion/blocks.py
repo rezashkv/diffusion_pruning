@@ -1,4 +1,4 @@
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -11,7 +11,8 @@ from diffusers.configuration_utils import register_to_config
 
 from pdm.models.hypernet.gates import BlockVirtualGate, LinearVirtualGate
 from diffusers.models.attention import BasicTransformerBlock, FeedForward
-from diffusers.models.unet_2d_blocks import CrossAttnDownBlock2D, CrossAttnUpBlock2D, DownBlock2D, UpBlock2D
+from diffusers.models.unet_2d_blocks import (CrossAttnDownBlock2D, CrossAttnUpBlock2D, DownBlock2D, UpBlock2D,
+                                             UNetMidBlock2DCrossAttn)
 from diffusers.utils import logging, USE_PEFT_BACKEND
 from diffusers.models.attention_processor import AttnProcessor2_0, Attention
 
@@ -29,16 +30,16 @@ class GEGLUGated(GEGLU):
 
     def __init__(self, dim_in: int, dim_out: int):
         super().__init__(dim_in, dim_out)
-        self.gate = LinearVirtualGate(dim_out * 2)
+        self.gate = LinearVirtualGate(dim_out)
 
     def forward(self, hidden_states, scale: float = 1.0):
         args = () if USE_PEFT_BACKEND else (scale,)
-        hidden_states = self.proj(hidden_states, *args)
-        hidden_states, gate = (self.gate(hidden_states)).chunk(2, dim=-1)
+        hidden_states, gate = self.proj(hidden_states, *args).chunk(2, dim=-1)
+        hidden_states, gate = (self.gate(hidden_states), self.gate(gate))
         return hidden_states * self.gelu(gate)
 
 
-class FeedForwardGated(FeedForward):
+class FeedForwardWidthGated(FeedForward):
     r"""
      A Gated feed-forward layer.
 
@@ -74,18 +75,18 @@ class FeedForwardGated(FeedForward):
         return self.net[0].gate.width
 
 
-class GatedAttnProcessor2(AttnProcessor2_0):
+class HeadGatedAttnProcessor2(AttnProcessor2_0):
     def __init__(self):
         super().__init__()
 
     def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        temb: Optional[torch.FloatTensor] = None,
-        scale: float = 1.0,
+            self,
+            attn: Attention,
+            hidden_states: torch.FloatTensor,
+            encoder_hidden_states: Optional[torch.FloatTensor] = None,
+            attention_mask: Optional[torch.FloatTensor] = None,
+            temb: Optional[torch.FloatTensor] = None,
+            scale: float = 1.0,
     ) -> torch.FloatTensor:
         residual = hidden_states
 
@@ -165,7 +166,7 @@ class GatedAttnProcessor2(AttnProcessor2_0):
         return hidden_states
 
 
-class ResnetBlock2DGated(ResnetBlock2D):
+class ResnetBlock2DWidthGated(ResnetBlock2D):
     def __init__(self, *args, **kwargs):
         # extract gate_flag from kwargs
         super().__init__(*args, **kwargs)
@@ -349,7 +350,7 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         return self.gate.width + self.depth_gate.width
 
 
-class BasicTransformerBlockGated(BasicTransformerBlock):
+class BasicTransformerBlockWidthGated(BasicTransformerBlock):
     def __init__(
             self,
             dim: int,
@@ -371,19 +372,19 @@ class BasicTransformerBlockGated(BasicTransformerBlock):
         super().__init__(dim, num_attention_heads, attention_head_dim, dropout, cross_attention_dim, activation_fn,
                          num_embeds_ada_norm, attention_bias, only_cross_attention, double_self_attention,
                          upcast_attention, norm_elementwise_affine, norm_type, final_dropout, attention_type)
-        self.num_attention_heads = b=num_attention_heads
+        self.num_attention_heads = b = num_attention_heads
         self.attention_head_dim = attention_head_dim
         gate1 = BlockVirtualGate(self.num_attention_heads)
         if self.attn1 is not None:
-            self.attn1.set_processor(GatedAttnProcessor2())
+            self.attn1.set_processor(HeadGatedAttnProcessor2())
             self.attn1.gate = gate1
 
         gate2 = BlockVirtualGate(self.num_attention_heads)
         if self.attn2 is not None:
-            self.attn2.set_processor(GatedAttnProcessor2())
+            self.attn2.set_processor(HeadGatedAttnProcessor2())
             self.attn2.gate = gate2
 
-        self.ff = FeedForwardGated(dim, dropout=dropout, activation_fn=activation_fn, final_dropout=final_dropout)
+        self.ff = FeedForwardWidthGated(dim, dropout=dropout, activation_fn=activation_fn, final_dropout=final_dropout)
 
     def forward(
             self,
@@ -512,14 +513,14 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
 
         gate1 = BlockVirtualGate(self.num_attention_heads)
         if self.attn1 is not None:
-            self.attn1.set_processor(GatedAttnProcessor2())
+            self.attn1.set_processor(HeadGatedAttnProcessor2())
             self.attn1.gate = gate1
         gate2 = BlockVirtualGate(self.num_attention_heads)
         if self.attn2 is not None:
-            self.attn2.set_processor(GatedAttnProcessor2())
+            self.attn2.set_processor(HeadGatedAttnProcessor2())
             self.attn2.gate = gate2
 
-        self.ff = FeedForwardGated(dim, dropout=dropout, activation_fn=activation_fn, final_dropout=final_dropout)
+        self.ff = FeedForwardWidthGated(dim, dropout=dropout, activation_fn=activation_fn, final_dropout=final_dropout)
 
         self.depth_gate = BlockVirtualGate(1)
 
@@ -626,7 +627,7 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
         return self.attn1.gate.width + self.attn2.gate.width + self.ff.get_gate_structure() + self.depth_gate.width
 
 
-class Transformer2DModelGated(Transformer2DModel):
+class Transformer2DModelWidthGated(Transformer2DModel):
     @register_to_config
     def __init__(
             self,
@@ -666,7 +667,7 @@ class Transformer2DModelGated(Transformer2DModel):
 
         self.transformer_blocks = nn.ModuleList(
             [
-                BasicTransformerBlockGated(
+                BasicTransformerBlockWidthGated(
                     inner_dim,
                     num_attention_heads,
                     attention_head_dim,
@@ -748,7 +749,7 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
         )
 
 
-class DualTransformer2DModelGated(DualTransformer2DModel):
+class DualTransformer2DModelWidthGated(DualTransformer2DModel):
     def __init__(
             self,
             num_attention_heads: int = 16,
@@ -772,7 +773,7 @@ class DualTransformer2DModelGated(DualTransformer2DModel):
 
         self.transformers = nn.ModuleList(
             [
-                Transformer2DModelGated(
+                Transformer2DModelWidthGated(
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
                     in_channels=in_channels,
@@ -834,7 +835,7 @@ class DualTransformer2DModelWidthDepthGated(DualTransformer2DModel):
         )
 
 
-class CrossAttnDownBlock2DGated(CrossAttnDownBlock2D):
+class CrossAttnDownBlock2DWidthDepthGated(CrossAttnDownBlock2D):
     def __init__(
             self,
             in_channels: int,
@@ -919,7 +920,7 @@ class CrossAttnDownBlock2DGated(CrossAttnDownBlock2D):
         self.resnets = nn.ModuleList(resnets)
 
 
-class CrossAttnDownBlock2DHalfGated(CrossAttnDownBlock2D):
+class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
     def __init__(
             self,
             in_channels: int,
@@ -957,10 +958,10 @@ class CrossAttnDownBlock2DHalfGated(CrossAttnDownBlock2D):
         resnets = []
         attentions = []
 
-        for i in range(num_layers // 2):
+        for i in range(num_layers - 1):
             in_channels = in_channels if i == 0 else out_channels
             resnets.append(
-                ResnetBlock2DGated(
+                ResnetBlock2DWidthGated(
                     in_channels=in_channels,
                     out_channels=out_channels,
                     temb_channels=temb_channels,
@@ -975,7 +976,7 @@ class CrossAttnDownBlock2DHalfGated(CrossAttnDownBlock2D):
             )
             if not dual_cross_attention:
                 attentions.append(
-                    Transformer2DModelGated(
+                    Transformer2DModelWidthGated(
                         num_attention_heads,
                         out_channels // num_attention_heads,
                         in_channels=out_channels,
@@ -990,7 +991,7 @@ class CrossAttnDownBlock2DHalfGated(CrossAttnDownBlock2D):
                 )
             else:
                 attentions.append(
-                    DualTransformer2DModelGated(
+                    DualTransformer2DModelWidthGated(
                         num_attention_heads,
                         out_channels // num_attention_heads,
                         in_channels=out_channels,
@@ -1000,7 +1001,7 @@ class CrossAttnDownBlock2DHalfGated(CrossAttnDownBlock2D):
                     )
                 )
 
-        for i in range(num_layers // 2, num_layers):
+        for i in range(num_layers - 1, num_layers):
             in_channels = in_channels if i == 0 else out_channels
             resnets.append(
                 ResnetBlock2DWidthDepthGated(
@@ -1047,7 +1048,7 @@ class CrossAttnDownBlock2DHalfGated(CrossAttnDownBlock2D):
         self.resnets = nn.ModuleList(resnets)
 
 
-class CrossAttnUpBlock2DGated(CrossAttnUpBlock2D):
+class CrossAttnUpBlock2DWidthDepthGated(CrossAttnUpBlock2D):
     def __init__(
             self,
             in_channels: int,
@@ -1134,7 +1135,7 @@ class CrossAttnUpBlock2DGated(CrossAttnUpBlock2D):
         self.resnets = nn.ModuleList(resnets)
 
 
-class CrossAttnUpBlock2DHalfGated(CrossAttnUpBlock2D):
+class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
     def __init__(
             self,
             in_channels: int,
@@ -1173,12 +1174,12 @@ class CrossAttnUpBlock2DHalfGated(CrossAttnUpBlock2D):
         resnets = []
         attentions = []
 
-        for i in range(num_layers // 2):
+        for i in range(num_layers - 1):
             res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
             resnet_in_channels = prev_output_channel if i == 0 else out_channels
 
             resnets.append(
-                ResnetBlock2DGated(
+                ResnetBlock2DWidthGated(
                     in_channels=resnet_in_channels + res_skip_channels,
                     out_channels=out_channels,
                     temb_channels=temb_channels,
@@ -1193,7 +1194,7 @@ class CrossAttnUpBlock2DHalfGated(CrossAttnUpBlock2D):
             )
             if not dual_cross_attention:
                 attentions.append(
-                    Transformer2DModelGated(
+                    Transformer2DModelWidthGated(
                         num_attention_heads,
                         out_channels // num_attention_heads,
                         in_channels=out_channels,
@@ -1208,7 +1209,7 @@ class CrossAttnUpBlock2DHalfGated(CrossAttnUpBlock2D):
                 )
             else:
                 attentions.append(
-                    DualTransformer2DModelGated(
+                    DualTransformer2DModelWidthGated(
                         num_attention_heads,
                         out_channels // num_attention_heads,
                         in_channels=out_channels,
@@ -1218,7 +1219,7 @@ class CrossAttnUpBlock2DHalfGated(CrossAttnUpBlock2D):
                     )
                 )
 
-        for i in range(num_layers // 2, num_layers):
+        for i in range(num_layers - 1, num_layers):
             res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
             resnet_in_channels = prev_output_channel if i == 0 else out_channels
 
@@ -1267,7 +1268,7 @@ class CrossAttnUpBlock2DHalfGated(CrossAttnUpBlock2D):
         self.resnets = nn.ModuleList(resnets)
 
 
-class DownBlock2DGated(DownBlock2D):
+class DownBlock2DWidthDepthGated(DownBlock2D):
     def __init__(
             self,
             in_channels: int,
@@ -1312,7 +1313,7 @@ class DownBlock2DGated(DownBlock2D):
         self.resnets = nn.ModuleList(resnets)
 
 
-class DownBlock2DHalfGated(DownBlock2D):
+class DownBlock2DWidthHalfDepthGated(DownBlock2D):
     def __init__(
             self,
             in_channels: int,
@@ -1337,10 +1338,10 @@ class DownBlock2DHalfGated(DownBlock2D):
                          downsample_padding=downsample_padding)
         resnets = []
 
-        for i in range(num_layers // 2):
+        for i in range(num_layers - 1):
             in_channels = in_channels if i == 0 else out_channels
             resnets.append(
-                ResnetBlock2DGated(
+                ResnetBlock2DWidthGated(
                     in_channels=in_channels,
                     out_channels=out_channels,
                     temb_channels=temb_channels,
@@ -1353,7 +1354,7 @@ class DownBlock2DHalfGated(DownBlock2D):
                     pre_norm=resnet_pre_norm,
                 )
             )
-        for i in range(num_layers // 2, num_layers):
+        for i in range(num_layers - 1, num_layers):
             in_channels = in_channels if i == 0 else out_channels
             resnets.append(
                 ResnetBlock2DWidthDepthGated(
@@ -1373,7 +1374,7 @@ class DownBlock2DHalfGated(DownBlock2D):
         self.resnets = nn.ModuleList(resnets)
 
 
-class UpBlock2DGated(UpBlock2D):
+class UpBlock2DWidthDepthGated(UpBlock2D):
     def __init__(
             self,
             in_channels: int,
@@ -1419,7 +1420,7 @@ class UpBlock2DGated(UpBlock2D):
         self.resnets = nn.ModuleList(resnets)
 
 
-class UpBlock2DHalfGated(UpBlock2D):
+class UpBlock2DWidthHalfDepthGated(UpBlock2D):
     def __init__(
             self,
             in_channels: int,
@@ -1443,12 +1444,12 @@ class UpBlock2DHalfGated(UpBlock2D):
                          output_scale_factor=output_scale_factor, add_upsample=add_upsample)
         resnets = []
 
-        for i in range(num_layers // 2):
+        for i in range(num_layers - 1):
             res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
             resnet_in_channels = prev_output_channel if i == 0 else out_channels
 
             resnets.append(
-                ResnetBlock2DGated(
+                ResnetBlock2DWidthGated(
                     in_channels=resnet_in_channels + res_skip_channels,
                     out_channels=out_channels,
                     temb_channels=temb_channels,
@@ -1462,7 +1463,7 @@ class UpBlock2DHalfGated(UpBlock2D):
                 )
             )
 
-        for i in range(num_layers // 2, num_layers):
+        for i in range(num_layers - 1, num_layers):
             res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
             resnet_in_channels = prev_output_channel if i == 0 else out_channels
 
@@ -1481,4 +1482,97 @@ class UpBlock2DHalfGated(UpBlock2D):
                 )
             )
 
+        self.resnets = nn.ModuleList(resnets)
+
+
+class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
+    def __init__(
+            self,
+            in_channels: int,
+            temb_channels: int,
+            dropout: float = 0.0,
+            num_layers: int = 1,
+            transformer_layers_per_block: Union[int, Tuple[int]] = 1,
+            resnet_eps: float = 1e-6,
+            resnet_time_scale_shift: str = "default",
+            resnet_act_fn: str = "swish",
+            resnet_groups: int = 32,
+            resnet_pre_norm: bool = True,
+            num_attention_heads: int = 1,
+            output_scale_factor: float = 1.0,
+            cross_attention_dim: int = 1280,
+            dual_cross_attention: bool = False,
+            use_linear_projection: bool = False,
+            upcast_attention: bool = False,
+            attention_type: str = "default",
+    ):
+        super().__init__(in_channels=in_channels, temb_channels=temb_channels, dropout=dropout, num_layers=num_layers,
+                         transformer_layers_per_block=transformer_layers_per_block, resnet_eps=resnet_eps,
+                         resnet_time_scale_shift=resnet_time_scale_shift, resnet_act_fn=resnet_act_fn,
+                         resnet_groups=resnet_groups, resnet_pre_norm=resnet_pre_norm,
+                         num_attention_heads=num_attention_heads, output_scale_factor=output_scale_factor,
+                         cross_attention_dim=cross_attention_dim, dual_cross_attention=dual_cross_attention,
+                         use_linear_projection=use_linear_projection, upcast_attention=upcast_attention,
+                         attention_type=attention_type)
+
+        # support for variable transformer layers per block
+        if isinstance(transformer_layers_per_block, int):
+            transformer_layers_per_block = [transformer_layers_per_block] * num_layers
+
+        resnets = [ResnetBlock2DWidthGated(
+            in_channels=in_channels,
+            out_channels=in_channels,
+            temb_channels=temb_channels,
+            eps=resnet_eps,
+            groups=resnet_groups,
+            dropout=dropout,
+            time_embedding_norm=resnet_time_scale_shift,
+            non_linearity=resnet_act_fn,
+            output_scale_factor=output_scale_factor,
+            pre_norm=resnet_pre_norm,
+        )]
+        attentions = []
+
+        for i in range(num_layers):
+            if not dual_cross_attention:
+                attentions.append(
+                    Transformer2DModelWidthGated(
+                        num_attention_heads,
+                        in_channels // num_attention_heads,
+                        in_channels=in_channels,
+                        num_layers=transformer_layers_per_block[i],
+                        cross_attention_dim=cross_attention_dim,
+                        norm_num_groups=resnet_groups,
+                        use_linear_projection=use_linear_projection,
+                        upcast_attention=upcast_attention,
+                        attention_type=attention_type,
+                    )
+                )
+            else:
+                attentions.append(
+                    DualTransformer2DModelWidthGated(
+                        num_attention_heads,
+                        in_channels // num_attention_heads,
+                        in_channels=in_channels,
+                        num_layers=1,
+                        cross_attention_dim=cross_attention_dim,
+                        norm_num_groups=resnet_groups,
+                    )
+                )
+            resnets.append(
+                ResnetBlock2DWidthGated(
+                    in_channels=in_channels,
+                    out_channels=in_channels,
+                    temb_channels=temb_channels,
+                    eps=resnet_eps,
+                    groups=resnet_groups,
+                    dropout=dropout,
+                    time_embedding_norm=resnet_time_scale_shift,
+                    non_linearity=resnet_act_fn,
+                    output_scale_factor=output_scale_factor,
+                    pre_norm=resnet_pre_norm,
+                )
+            )
+
+        self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)

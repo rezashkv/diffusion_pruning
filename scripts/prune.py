@@ -395,6 +395,7 @@ def main():
                                    dtype={"caption": str, "link": str})
             images = os.listdir(os.path.join(args.train_data_dir, "training"))
 
+            # Faster debugging
             if args.max_train_samples is not None and args.max_train_samples < 1000:
                 images = images[:args.max_train_samples * 5]
 
