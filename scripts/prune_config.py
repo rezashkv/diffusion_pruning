@@ -21,6 +21,9 @@ import random
 import shutil
 import sys
 import datetime
+import pickle
+
+sys.path.append(os.getcwd())
 
 from pathlib import Path
 from omegaconf import OmegaConf
@@ -242,7 +245,7 @@ def main():
     text_encoder.requires_grad_(False)
 
     # Create EMA for the unet.
-    if args.use_ema:
+    if config["model"]["unet"]["use_ema"]:
         ema_unet = UNet2DConditionModelGated.from_pretrained(
             args.pretrained_model_name_or_path, 
             subfolder="unet", 
@@ -336,7 +339,7 @@ def main():
     if config["training"]["allow_tf32"]:
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    if config["training"]["scale_lr"]:
+    if config["training"]["optim"]["scale_lr"]:
         config["training"]["optim"]["hypernet_learning_rate"] = (
                 config["training"]["optim"]["hypernet_learning_rate"] * 
                 config["training"]["optim"]["gradient_accumulation_steps"] * 
@@ -368,14 +371,17 @@ def main():
 
     optimizer = optimizer_cls(
         [
-            {"params": hyper_net.parameters(), "lr": args.hypernet_learning_rate},
-            {"params": quantizer.parameters(), "lr": args.quantizer_learning_rate},
+            {"params": hyper_net.parameters(), "lr": config["training"]["optim"]["hypernet_learning_rate"]},
+            {"params": quantizer.parameters(), "lr": config["training"]["optim"]["quantizer_learning_rate"]},
         ],
         lr=config["training"]["optim"]["hypernet_learning_rate"],
         betas=(config["training"]["optim"]["adam_beta1"], config["training"]["optim"]["adam_beta2"]),
         weight_decay=config["training"]["optim"]["adam_weight_decay"],
         eps=config["training"]["optim"]["adam_epsilon"],
     )
+
+    # ##################################################################################################################
+    # #################################################### Datasets ####################################################
 
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
@@ -384,6 +390,10 @@ def main():
     # download the dataset.
     dataset_name = getattr(config["data"], "dataset_name", None)
     train_data_dir = getattr(config["data"], "train_data_dir", None)
+    data_files = getattr(config["data"], "data_files", None)
+    max_train_samples = getattr(config["data"], "max_train_samples", None)
+    bad_images_path = getattr(config["data"], "bad_images_path", None)
+
     logger.info("Loading dataset...")
     if dataset_name is not None:
         # Downloading and loading a dataset from the hub.
@@ -396,10 +406,10 @@ def main():
             ignore_verifications=True
         )
     else:
-        if "aesthetics" in args.train_data_dir:
-            if args.data_files is None:
+        if "aesthetics" in train_data_dir:
+            if data_files is None:
                 # datafiles a list of 5-char strs from 00000 to 00200
-                args.data_files = [f"{i:05d}" for i in range(250)]
+                data_files = [f"{i:05d}" for i in range(250)]
 
             def load_dataset_dir(dataset_dir):
                 dataset = []
@@ -427,7 +437,7 @@ def main():
 
                 return train_datasets
 
-            train_data = load_main_dataset(args.train_data_dir, list(args.data_files))
+            train_data = load_main_dataset(train_data_dir, list(data_files))
 
             # Convert the loaded data into a Hugging Face Dataset
             tr_datasets = []
@@ -436,19 +446,29 @@ def main():
 
             dataset = {'train': concatenate_datasets(tr_datasets)}
 
-        elif "captions" in args.train_data_dir:
-            captions = pd.read_csv(os.path.join(args.train_data_dir, "Train_GCC-training.tsv"),
+        elif "conceptual_captions" in train_data_dir:
+            captions = pd.read_csv(os.path.join(train_data_dir, "Train_GCC-training.tsv"),
                                    sep="\t", header=None, names=["caption", "link"],
                                    dtype={"caption": str, "link": str})
-            images = os.listdir(os.path.join(args.train_data_dir, "training"))
+            # import pdb
+            # pdb.set_trace()
+            
+            names_file = os.path.join(os.getcwd(), "pdm", "data", "cc_names.pkl")
+            if os.path.isfile(names_file):
+                with open(names_file, 'rb') as file:
+                    images = pickle.load(file)
+            
+            else:
+                images = os.listdir(os.path.join(train_data_dir, "training"))
+                with open(names_file, 'wb') as file:
+                    pickle.dump(images, file)
 
-            if args.max_train_samples is not None and args.max_train_samples < 1000:
-                images = images[:args.max_train_samples * 5]
+            if max_train_samples is not None and max_train_samples < 1000:
+                images = images[:max_train_samples * 5]
 
-            images = [os.path.join(args.train_data_dir, "training", image) for image in images]
-            bad_images_path = args.bad_images_path
+            images = [os.path.join(train_data_dir, "training", image) for image in images]
             if bad_images_path is None:
-                bad_images_path = os.path.join(os.path.dirname(args.output_dir), "cc3m_bad_images.txt")
+                bad_images_path = os.path.join(os.path.dirname(logging_dir), "cc3m_bad_images.txt")
             if os.path.exists(bad_images_path):
                 with open(os.path.join(bad_images_path), "r") as f:
                     bad_images = f.readlines()

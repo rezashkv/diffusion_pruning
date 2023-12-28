@@ -29,14 +29,14 @@ model:
 
 
 data:
-  train_data_dir: "/fs/cml-datasets/improved_aesthetics_6plus/data/"
+  train_data_dir: "/fs/vulcan-datasets/conceptual_captions"
   dataset_name: null
   data_files: null
   dataset_config_name: null
   bad_images_path: "pdm/data/cc3m_bad_images.txt"
   image_column: "image"
   caption_column: "caption"
-  max_train_samples: 2000000
+  max_train_samples: 900
   num_validation_samples: 16
   validation_prompts: "/fs/vulcan-datasets/conceptual_captions/Validation_GCC-1.1.0-Validation.tsv"
   validation_batch_size: 4

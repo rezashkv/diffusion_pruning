@@ -1071,98 +1071,102 @@ class CrossAttnUpBlock2DHalfGated(CrossAttnUpBlock2D):
         resnets = []
         attentions = []
 
-        for i in range(num_layers // 2):
-            res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
-            resnet_in_channels = prev_output_channel if i == 0 else out_channels
+        if num_layers % 2 == 1:
+            for i in range(num_layers // 2 + 1):
+                res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
+                resnet_in_channels = prev_output_channel if i == 0 else out_channels
 
-            resnets.append(
-                ResnetBlock2DGated(
-                    in_channels=resnet_in_channels + res_skip_channels,
-                    out_channels=out_channels,
-                    temb_channels=temb_channels,
-                    eps=resnet_eps,
-                    groups=resnet_groups,
-                    dropout=dropout,
-                    time_embedding_norm=resnet_time_scale_shift,
-                    non_linearity=resnet_act_fn,
-                    output_scale_factor=output_scale_factor,
-                    pre_norm=resnet_pre_norm,
-                )
-            )
-            if not dual_cross_attention:
-                attentions.append(
-                    Transformer2DModelGated(
-                        num_attention_heads,
-                        out_channels // num_attention_heads,
-                        in_channels=out_channels,
-                        num_layers=transformer_layers_per_block,
-                        cross_attention_dim=cross_attention_dim,
-                        norm_num_groups=resnet_groups,
-                        use_linear_projection=use_linear_projection,
-                        only_cross_attention=only_cross_attention,
-                        upcast_attention=upcast_attention,
-                        attention_type=attention_type,
+                resnets.append(
+                    ResnetBlock2DGated(
+                        in_channels=resnet_in_channels + res_skip_channels,
+                        out_channels=out_channels,
+                        temb_channels=temb_channels,
+                        eps=resnet_eps,
+                        groups=resnet_groups,
+                        dropout=dropout,
+                        time_embedding_norm=resnet_time_scale_shift,
+                        non_linearity=resnet_act_fn,
+                        output_scale_factor=output_scale_factor,
+                        pre_norm=resnet_pre_norm,
                     )
                 )
-            else:
-                attentions.append(
-                    DualTransformer2DModelGated(
-                        num_attention_heads,
-                        out_channels // num_attention_heads,
-                        in_channels=out_channels,
-                        num_layers=1,
-                        cross_attention_dim=cross_attention_dim,
-                        norm_num_groups=resnet_groups,
+                if not dual_cross_attention:
+                    attentions.append(
+                        Transformer2DModelGated(
+                            num_attention_heads,
+                            out_channels // num_attention_heads,
+                            in_channels=out_channels,
+                            num_layers=transformer_layers_per_block,
+                            cross_attention_dim=cross_attention_dim,
+                            norm_num_groups=resnet_groups,
+                            use_linear_projection=use_linear_projection,
+                            only_cross_attention=only_cross_attention,
+                            upcast_attention=upcast_attention,
+                            attention_type=attention_type,
+                        )
+                    )
+                else:
+                    attentions.append(
+                        DualTransformer2DModelGated(
+                            num_attention_heads,
+                            out_channels // num_attention_heads,
+                            in_channels=out_channels,
+                            num_layers=1,
+                            cross_attention_dim=cross_attention_dim,
+                            norm_num_groups=resnet_groups,
+                        )
+                    )
+
+            for i in range(num_layers // 2 + 1, num_layers):
+                res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
+                resnet_in_channels = prev_output_channel if i == 0 else out_channels
+
+                resnets.append(
+                    ResnetBlock2DWidthDepthGated(
+                        in_channels=resnet_in_channels + res_skip_channels,
+                        out_channels=out_channels,
+                        temb_channels=temb_channels,
+                        eps=resnet_eps,
+                        groups=resnet_groups,
+                        dropout=dropout,
+                        time_embedding_norm=resnet_time_scale_shift,
+                        non_linearity=resnet_act_fn,
+                        output_scale_factor=output_scale_factor,
+                        pre_norm=resnet_pre_norm,
                     )
                 )
-
-        for i in range(num_layers // 2, num_layers):
-            res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
-            resnet_in_channels = prev_output_channel if i == 0 else out_channels
-
-            resnets.append(
-                ResnetBlock2DWidthDepthGated(
-                    in_channels=resnet_in_channels + res_skip_channels,
-                    out_channels=out_channels,
-                    temb_channels=temb_channels,
-                    eps=resnet_eps,
-                    groups=resnet_groups,
-                    dropout=dropout,
-                    time_embedding_norm=resnet_time_scale_shift,
-                    non_linearity=resnet_act_fn,
-                    output_scale_factor=output_scale_factor,
-                    pre_norm=resnet_pre_norm,
-                )
-            )
-            if not dual_cross_attention:
-                attentions.append(
-                    Transformer2DModelWidthDepthGated(
-                        num_attention_heads,
-                        out_channels // num_attention_heads,
-                        in_channels=out_channels,
-                        num_layers=transformer_layers_per_block,
-                        cross_attention_dim=cross_attention_dim,
-                        norm_num_groups=resnet_groups,
-                        use_linear_projection=use_linear_projection,
-                        only_cross_attention=only_cross_attention,
-                        upcast_attention=upcast_attention,
-                        attention_type=attention_type,
+                if not dual_cross_attention:
+                    attentions.append(
+                        Transformer2DModelWidthDepthGated(
+                            num_attention_heads,
+                            out_channels // num_attention_heads,
+                            in_channels=out_channels,
+                            num_layers=transformer_layers_per_block,
+                            cross_attention_dim=cross_attention_dim,
+                            norm_num_groups=resnet_groups,
+                            use_linear_projection=use_linear_projection,
+                            only_cross_attention=only_cross_attention,
+                            upcast_attention=upcast_attention,
+                            attention_type=attention_type,
+                        )
                     )
-                )
-            else:
-                attentions.append(
-                    DualTransformer2DModelWidthDepthGated(
-                        num_attention_heads,
-                        out_channels // num_attention_heads,
-                        in_channels=out_channels,
-                        num_layers=1,
-                        cross_attention_dim=cross_attention_dim,
-                        norm_num_groups=resnet_groups,
+                else:
+                    attentions.append(
+                        DualTransformer2DModelWidthDepthGated(
+                            num_attention_heads,
+                            out_channels // num_attention_heads,
+                            in_channels=out_channels,
+                            num_layers=1,
+                            cross_attention_dim=cross_attention_dim,
+                            norm_num_groups=resnet_groups,
+                        )
                     )
-                )
 
-        self.attentions = nn.ModuleList(attentions)
-        self.resnets = nn.ModuleList(resnets)
+            self.attentions = nn.ModuleList(attentions)
+            self.resnets = nn.ModuleList(resnets)
+        
+        else:
+            raise NotImplementedError("SD uses 3 blocks in upsamplings. Other cases are not implemented yet!")
 
 
 class DownBlock2DGated(DownBlock2D):
@@ -1341,42 +1345,46 @@ class UpBlock2DHalfGated(UpBlock2D):
                          output_scale_factor=output_scale_factor, add_upsample=add_upsample)
         resnets = []
 
-        for i in range(num_layers // 2):
-            res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
-            resnet_in_channels = prev_output_channel if i == 0 else out_channels
+        if num_layers % 2 == 1:
+            for i in range(num_layers // 2 + 1):
+                res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
+                resnet_in_channels = prev_output_channel if i == 0 else out_channels
 
-            resnets.append(
-                ResnetBlock2DGated(
-                    in_channels=resnet_in_channels + res_skip_channels,
-                    out_channels=out_channels,
-                    temb_channels=temb_channels,
-                    eps=resnet_eps,
-                    groups=resnet_groups,
-                    dropout=dropout,
-                    time_embedding_norm=resnet_time_scale_shift,
-                    non_linearity=resnet_act_fn,
-                    output_scale_factor=output_scale_factor,
-                    pre_norm=resnet_pre_norm,
+                resnets.append(
+                    ResnetBlock2DGated(
+                        in_channels=resnet_in_channels + res_skip_channels,
+                        out_channels=out_channels,
+                        temb_channels=temb_channels,
+                        eps=resnet_eps,
+                        groups=resnet_groups,
+                        dropout=dropout,
+                        time_embedding_norm=resnet_time_scale_shift,
+                        non_linearity=resnet_act_fn,
+                        output_scale_factor=output_scale_factor,
+                        pre_norm=resnet_pre_norm,
+                    )
                 )
-            )
 
-        for i in range(num_layers // 2, num_layers):
-            res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
-            resnet_in_channels = prev_output_channel if i == 0 else out_channels
+            for i in range(num_layers // 2 + 1, num_layers):
+                res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
+                resnet_in_channels = prev_output_channel if i == 0 else out_channels
 
-            resnets.append(
-                ResnetBlock2DWidthDepthGated(
-                    in_channels=resnet_in_channels + res_skip_channels,
-                    out_channels=out_channels,
-                    temb_channels=temb_channels,
-                    eps=resnet_eps,
-                    groups=resnet_groups,
-                    dropout=dropout,
-                    time_embedding_norm=resnet_time_scale_shift,
-                    non_linearity=resnet_act_fn,
-                    output_scale_factor=output_scale_factor,
-                    pre_norm=resnet_pre_norm,
+                resnets.append(
+                    ResnetBlock2DWidthDepthGated(
+                        in_channels=resnet_in_channels + res_skip_channels,
+                        out_channels=out_channels,
+                        temb_channels=temb_channels,
+                        eps=resnet_eps,
+                        groups=resnet_groups,
+                        dropout=dropout,
+                        time_embedding_norm=resnet_time_scale_shift,
+                        non_linearity=resnet_act_fn,
+                        output_scale_factor=output_scale_factor,
+                        pre_norm=resnet_pre_norm,
+                    )
                 )
-            )
 
-        self.resnets = nn.ModuleList(resnets)
+            self.resnets = nn.ModuleList(resnets)
+        
+        else:
+            raise NotImplementedError("SD uses 3 blocks in upsamplings. Other cases are not implemented yet!")
