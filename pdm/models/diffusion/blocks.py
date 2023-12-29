@@ -256,10 +256,6 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
     def set_virtual_gate(self, gate_val):
         self.gate.set_structure_value(gate_val)
 
-    # def get_gate_structure(self):
-    # return self.gate.width
-    # return [[self.gate.width]]
-
     def get_gate_structure(self):
         return {"width": [self.gate.width]}
 
@@ -355,10 +351,6 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
     def set_virtual_gate(self, gate_val):
         self.gate.set_structure_value(gate_val[:, :-1])
         self.depth_gate.set_structure_value(gate_val[:, -1:])
-
-    # def get_gate_structure(self):
-    #     # return self.gate.width + self.depth_gate.width
-    #     return [[self.gate.width], [self.depth_gate.width]]
 
     def get_gate_structure(self):
         return {"depth": [self.depth_gate.width], "width": [self.gate.width]}
@@ -512,11 +504,6 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
         if isinstance(self.ff, FeedForwardWidthGated):
             gate_3_val = gate_val[:, self.attn1.gate.width + self.attn2.gate.width:-1]
             self.ff.set_virtual_gate(gate_3_val)
-
-    # def get_gate_structure(self):
-    #     # return self.attn1.gate.width + self.attn2.gate.width + self.ff.get_gate_structure()
-    #     assert isinstance(self.ff.net[0], GEGLUGated), "currently implemented only for GEGLU"
-    #     return [[self.attn1.gate.width, self.attn2.gate.width, self.ff.net[0].gate.width]]
 
 
 class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
@@ -678,20 +665,6 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
 
         self.depth_gate.set_structure_value(gate_val[:, -1:])
 
-        # self.depth_gate.set_structure_value(gate_val[:, -1:])
-
-    # def get_gate_structure(self):
-    #     width = self.attn1.gate.width + self.attn2.gate.width
-    #     if isinstance(self.ff, FeedForwardWidthGated):
-    #         width += self.ff.get_gate_structure()
-    #     return {"width": width, "depth": self.depth_gate.width}
-    #
-    #     gate_3_val = gate_val[:, self.attn1.gate.width + self.attn2.gate.width:-1]
-    #     self.attn1.gate.set_structure_value(gate_1_val)
-    #     self.attn2.gate.set_structure_value(gate_2_val)
-    #     self.ff.set_virtual_gate(gate_3_val)
-    #     self.depth_gate.set_structure_value(gate_val[:, -1:])
-
 
 class Transformer2DModelWidthGated(Transformer2DModel):
     @register_to_config
@@ -752,16 +725,6 @@ class Transformer2DModelWidthGated(Transformer2DModel):
                 for _ in range(num_layers)
             ]
         )
-        # self.structure = [[]]
-
-    # def get_gate_structure(self):
-    #     # return self.attn1.gate.width + self.attn2.gate.width + self.ff.get_gate_structure()
-    #     # assert isinstance(self.ff.net[0], GEGLUGated), "currently implemented only for GEGLU"
-    #     if self.structure == [[]]:
-    #         for tb in self.transformer_blocks:
-    #             self.structure[0] = self.structure[0] + tb.get_gate_structure()[0]
-    #
-    #     return self.structure
 
 
 class Transformer2DModelWidthDepthGated(Transformer2DModel):
@@ -804,7 +767,7 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
 
         self.transformer_blocks = nn.ModuleList(
             [
-                BasicTransformerBlockWidthGated(
+                BasicTransformerBlockWidthDepthGated(
                     inner_dim,
                     num_attention_heads,
                     attention_head_dim,
@@ -824,23 +787,6 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
             ]
         )
 
-        # self.depth_gate = DepthGate(1)
-        # self.structure = [[], []]
-
-    # def get_gate_structure(self):
-    #     # return self.attn1.gate.width + self.attn2.gate.width + self.ff.get_gate_structure()
-    #     # assert isinstance(self.ff.net[0], GEGLUGated), "currently implemented only for GEGLU"
-    #
-    #     if self.structure == [[], []]:
-    #         for tb in self.transformer_blocks:
-    #             tb_structure = tb.get_gate_structure()
-    #             assert len(tb_structure) == 1
-    #             self.structure[0] = self.structure[0] + tb_structure[0]
-    #
-    #         # Depth gate
-    #         self.structure[1].append(1)
-    #
-    #     return self.structure
 
     def forward(
         self,
@@ -1046,20 +992,6 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
             return (output,)
 
         return Transformer2DModelOutput(sample=output)
-
-    # TODO: Implement the forward pass
-    # def forward(self, x, context=None):
-    #     # note: if no context is given, cross-attention defaults to self-attention
-    #     b, c, h, w = x.shape
-    #     x_in = x
-    #     x = self.norm(x)
-    #     x = self.proj_in(x)
-    #     x = rearrange(x, 'b c h w -> b (h w) c')
-    #     for block in self.transformer_blocks:
-    #         x = block(x, context=context)
-    #     x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
-    #     x = self.proj_out(x)
-    #     return x + x_in
 
 
 class DualTransformer2DModelWidthGated(DualTransformer2DModel):
@@ -1422,36 +1354,6 @@ class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
         self.resnets = nn.ModuleList(resnets)
         self.structure = [[], []]
 
-    # def set_virtual_gate(self, gate_val):
-    #     raise NotImplementedError
-    #
-    # def get_gate_structure(self):
-    #     if self.structure == [[], []]:
-    #         structure = [[], []]
-    #         for b in self.resnets:
-    #             assert hasattr(b, "get_gate_structure")
-    #             b_structure = b.get_gate_structure()
-    #             if len(b_structure) == 1:
-    #                 structure[0] = structure[0] + b_structure[0]
-    #
-    #             elif len(b_structure) == 2:
-    #                 structure[0] = structure[0] + b_structure[0]
-    #                 structure[1] = structure[1] + b_structure[1]
-    #
-    #         for b in self.attentions:
-    #             assert hasattr(b, "get_gate_structure")
-    #             b_structure = b.get_gate_structure()
-    #             if len(b_structure) == 1:
-    #                 structure[0] = structure[0] + b_structure[0]
-    #
-    #             elif len(b_structure) == 2:
-    #                 structure[0] = structure[0] + b_structure[0]
-    #                 structure[1] = structure[1] + b_structure[1]
-    #
-    #         self.structure = structure
-    #
-    #     return self.structure
-
 
 class CrossAttnUpBlock2DWidthDepthGated(CrossAttnUpBlock2D):
     def __init__(
@@ -1778,19 +1680,6 @@ class DownBlock2DWidthHalfDepthGated(DownBlock2D):
 
         self.resnets = nn.ModuleList(resnets)
         self.structure = [[], []]
-
-    # def get_gate_structure(self):
-    #
-    #     if self.structure == [[], []]:
-    #         for tb in self.transformer_blocks:
-    #             tb_structure = tb.get_gate_structure()
-    #             assert len(tb_structure) == 1
-    #             self.structure[0] = self.structure[0] + tb_structure[0]
-    #
-    #         # Depth gate
-    #         self.structure[1].append(1)
-    #
-    #     return self.structure
 
 
 class UpBlock2DWidthDepthGated(UpBlock2D):

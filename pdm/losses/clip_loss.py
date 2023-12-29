@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 
 class ClipLoss(nn.Module):
-    def __init__(self, temperature=2.0, structure=None):
+    def __init__(self, structure, temperature=2.0):
         super().__init__()
         self.temperature = temperature
         self.structure = structure
@@ -13,11 +13,14 @@ class ClipLoss(nn.Module):
         depth_indices = []
         depth_corresponding_width_indices = []
         dim = 0
+
         for elem in self.structure:
             if "width" in elem:
+                elem["width"] = sum(elem["width"])
                 dim += elem["width"]
                 template.append(elem["width"])
             if "depth" in elem:
+                elem["depth"] = sum(elem["depth"])
                 template.append(elem["depth"])
                 depth_indices.append(dim)
                 depth_corresponding_width_indices.append((dim - elem["width"], dim))

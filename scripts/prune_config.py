@@ -223,7 +223,7 @@ def main():
                                base=config["model"]["hypernet"]["hypernet_base"])
 
     quantizer = StructureVectorQuantizer(n_e=config["model"]["quantizer"]["num_arch_vq_codebook_embeddings"],
-                                         vq_embed_dim=sum(unet.get_structure()),
+                                         structure=unet_structure,
                                          beta=config["model"]["quantizer"]["arch_vq_beta"],
                                          temperature=config["model"]["hypernet"]["hypernet_T"],
                                          base=config["model"]["hypernet"]["hypernet_base"])
@@ -231,8 +231,8 @@ def main():
     r_loss = ResourceLoss(p=config["training"]["losses"]["resource_loss"]["pruning_target"],
                           loss_type=config["training"]["losses"]["resource_loss"]["type"])
 
-    clip_loss = ClipLoss(
-        temperature=config["training"]["losses"]["contrastive_clip_loss"]["temperature"])
+    clip_loss = ClipLoss(structure=unet_structure,
+                         temperature=config["training"]["losses"]["contrastive_clip_loss"]["temperature"])
 
     # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
@@ -495,7 +495,8 @@ def main():
     train_transforms = transforms.Compose(
         [
             transforms.Resize(config.model.unet.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(config.model.unet.resolution) if config.data.dataloader.center_crop else transforms.RandomCrop(
+            transforms.CenterCrop(
+                config.model.unet.resolution) if config.data.dataloader.center_crop else transforms.RandomCrop(
                 config.model.unet.resolution),
             transforms.RandomHorizontalFlip() if config.data.dataloader.random_flip else transforms.Lambda(lambda x: x),
             transforms.ToTensor(),

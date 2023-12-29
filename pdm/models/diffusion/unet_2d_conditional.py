@@ -1324,25 +1324,6 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         if hasattr(module, "gradient_checkpointing"):
             module.gradient_checkpointing = value
 
-    # def get_structure(self):
-    #     if self.structure == [[], []]:
-    #         structure = [[], []]
-    #
-    #         # Down Blocks
-    #         for m in self.down_blocks:
-    #             # if hasattr(m, "get_gate_structure"):
-    #             assert hasattr(m, "get_gate_structure")
-    #             m_structure = m.get_gate_structure()
-    #             assert len(m_structure) == 2
-    #             structure[0] = structure[0] + m_structure[0]
-    #             structure[1] = structure[1] + m_structure[1]
-    #
-    #         for m in self.modules():
-    #             if hasattr(m, "get_gate_structure"):
-    #                 structure.append(m.get_gate_structure())
-    #         self.structure = structure
-    #     return structure
-
     def get_structure(self):
         structure = []
         for m in self.modules():

@@ -36,10 +36,10 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         depth_indices = []
         for elem in structure:
             if "width" in elem:
-                vq_embed_dim += elem["width"]
+                vq_embed_dim += sum(elem["width"])
             if "depth" in elem:
                 depth_indices.append(vq_embed_dim)
-                vq_embed_dim += elem["depth"]
+                vq_embed_dim += sum(elem["depth"])
 
         self.depth_indices = depth_indices
         self.depth_order = DEPTH_ORDER
