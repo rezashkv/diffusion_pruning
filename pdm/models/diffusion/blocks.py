@@ -6,10 +6,12 @@ import torch.nn.functional as F
 from diffusers.models import DualTransformer2DModel, Transformer2DModel
 from diffusers.models.activations import GEGLU
 from diffusers.models.resnet import ResnetBlock2D, Upsample2D, Downsample2D
+from diffusers.models.transformer_2d import Transformer2DModelOutput
 from torch import nn
 from diffusers.configuration_utils import register_to_config
 
 from pdm.models.hypernet.gates import BlockVirtualGate, LinearVirtualGate
+from pdm.models.hypernet.gates import DepthGate, WidthGate
 from diffusers.models.attention import BasicTransformerBlock, FeedForward
 from diffusers.models.unet_2d_blocks import (CrossAttnDownBlock2D, CrossAttnUpBlock2D, DownBlock2D, UpBlock2D,
                                              UNetMidBlock2DCrossAttn)
@@ -30,7 +32,8 @@ class GEGLUGated(GEGLU):
 
     def __init__(self, dim_in: int, dim_out: int):
         super().__init__(dim_in, dim_out)
-        self.gate = LinearVirtualGate(dim_out)
+        # self.gate = LinearVirtualGate(dim_out)
+        self.gate = WidthGate(dim_out)
 
     def forward(self, hidden_states, scale: float = 1.0):
         args = () if USE_PEFT_BACKEND else (scale,)
@@ -72,7 +75,7 @@ class FeedForwardWidthGated(FeedForward):
         self.net[0].gate.set_structure_value(gate_val)
 
     def get_gate_structure(self):
-        return {"width": self.net[0].gate.width}
+        return {"width": [self.net[0].gate.width]}
 
 
 class HeadGatedAttnProcessor2(AttnProcessor2_0):
@@ -170,7 +173,8 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
     def __init__(self, *args, **kwargs):
         # extract gate_flag from kwargs
         super().__init__(*args, **kwargs)
-        self.gate = BlockVirtualGate(self.norm1.num_groups)
+        # self.gate = BlockVirtualGate(self.norm1.num_groups)
+        self.gate = WidthGate(self.norm1.num_groups)
 
     def forward(self, input_tensor, temb, scale: float = 1.0):
         hidden_states = input_tensor
@@ -252,16 +256,22 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
     def set_virtual_gate(self, gate_val):
         self.gate.set_structure_value(gate_val)
 
+    # def get_gate_structure(self):
+    # return self.gate.width
+    # return [[self.gate.width]]
+
     def get_gate_structure(self):
-        return {"width": self.gate.width}
+        return {"width": [self.gate.width]}
 
 
 class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
     def __init__(self, *args, **kwargs):
         # extract gate_flag from kwargs
         super().__init__(*args, **kwargs)
-        self.gate = BlockVirtualGate(self.norm1.num_groups)
-        self.depth_gate = BlockVirtualGate(1)
+        # self.gate = BlockVirtualGate(self.norm1.num_groups)
+        # self.depth_gate = BlockVirtualGate(1)
+        self.gate = WidthGate(self.norm1.num_groups)
+        self.depth_gate = DepthGate(1)
 
     def forward(self, input_tensor, temb, scale: float = 1.0):
         hidden_states = input_tensor
@@ -346,8 +356,12 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         self.gate.set_structure_value(gate_val[:, :-1])
         self.depth_gate.set_structure_value(gate_val[:, -1:])
 
+    # def get_gate_structure(self):
+    #     # return self.gate.width + self.depth_gate.width
+    #     return [[self.gate.width], [self.depth_gate.width]]
+
     def get_gate_structure(self):
-        return {"depth": self.depth_gate.width, "width": self.gate.width}
+        return {"depth": [self.depth_gate.width], "width": [self.gate.width]}
 
 
 class BasicTransformerBlockWidthGated(BasicTransformerBlock):
@@ -373,14 +387,18 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
         super().__init__(dim, num_attention_heads, attention_head_dim, dropout, cross_attention_dim, activation_fn,
                          num_embeds_ada_norm, attention_bias, only_cross_attention, double_self_attention,
                          upcast_attention, norm_elementwise_affine, norm_type, final_dropout, attention_type)
+
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
-        gate1 = BlockVirtualGate(self.num_attention_heads)
+        # gate1 = BlockVirtualGate(self.num_attention_heads)
+        gate1 = WidthGate(self.num_attention_heads)
+
         if self.attn1 is not None:
             self.attn1.set_processor(HeadGatedAttnProcessor2())
             self.attn1.gate = gate1
 
-        gate2 = BlockVirtualGate(self.num_attention_heads)
+        # gate2 = BlockVirtualGate(self.num_attention_heads)
+        gate2 = WidthGate(self.num_attention_heads)
         if self.attn2 is not None:
             self.attn2.set_processor(HeadGatedAttnProcessor2())
             self.attn2.gate = gate2
@@ -479,6 +497,12 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
 
         return hidden_states
 
+    def get_gate_structure(self):
+        width = [self.attn1.gate.width, self.attn2.gate.width]
+        if isinstance(self.ff, FeedForwardWidthGated):
+            width.append(self.ff.get_gate_structure())
+        return {"width": width}
+
     def set_virtual_gate(self, gate_val):
         gate_1_val = gate_val[:, :self.attn1.gate.width]
         gate_2_val = gate_val[:, self.attn1.gate.width:self.attn1.gate.width + self.attn2.gate.width]
@@ -489,11 +513,10 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
             gate_3_val = gate_val[:, self.attn1.gate.width + self.attn2.gate.width:-1]
             self.ff.set_virtual_gate(gate_3_val)
 
-    def get_gate_structure(self):
-        width = self.attn1.gate.width + self.attn2.gate.width
-        if isinstance(self.ff, FeedForwardWidthGated):
-            width += self.ff.get_gate_structure()
-        return {"width": width}
+    # def get_gate_structure(self):
+    #     # return self.attn1.gate.width + self.attn2.gate.width + self.ff.get_gate_structure()
+    #     assert isinstance(self.ff.net[0], GEGLUGated), "currently implemented only for GEGLU"
+    #     return [[self.attn1.gate.width, self.attn2.gate.width, self.ff.net[0].gate.width]]
 
 
 class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
@@ -522,22 +545,24 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
 
-        gate1 = BlockVirtualGate(self.num_attention_heads)
+        # gate1 = BlockVirtualGate(self.num_attention_heads)
+        gate1 = WidthGate(self.num_attention_heads)
         if self.attn1 is not None:
             self.attn1.set_processor(HeadGatedAttnProcessor2())
             self.attn1.gate = gate1
-        gate2 = BlockVirtualGate(self.num_attention_heads)
+
+        # gate2 = BlockVirtualGate(self.num_attention_heads)
+        gate2 = WidthGate(self.num_attention_heads)
         if self.attn2 is not None:
             self.attn2.set_processor(HeadGatedAttnProcessor2())
             self.attn2.gate = gate2
-
         if gated_ff:
             self.ff = FeedForwardWidthGated(dim, dropout=dropout, activation_fn=activation_fn,
                                             final_dropout=final_dropout)
         else:
             self.ff = FeedForward(dim, dropout=dropout, activation_fn=activation_fn, final_dropout=final_dropout)
 
-        self.depth_gate = BlockVirtualGate(1)
+        self.depth_gate = DepthGate(1)
 
     def forward(
             self,
@@ -576,7 +601,7 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
         if self.use_ada_layer_norm_zero:
             attn_output = gate_msa.unsqueeze(1) * attn_output
 
-        attn_output = self.depth_gate(attn_output)
+        # attn_output = self.depth_gate(attn_output)
 
         hidden_states = attn_output + hidden_states
 
@@ -598,7 +623,7 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
                 **cross_attention_kwargs,
             )
 
-            attn_output = self.depth_gate(attn_output)
+            # attn_output = self.depth_gate(attn_output)
             hidden_states = attn_output + hidden_states
 
         # 4. Feed-forward
@@ -628,10 +653,18 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
         if self.use_ada_layer_norm_zero:
             ff_output = gate_mlp.unsqueeze(1) * ff_output
 
-        ff_output = self.depth_gate(ff_output)
+        # ff_output = self.depth_gate(ff_output)
         hidden_states = ff_output + hidden_states
 
+        # hidden_states = self.depth_gate(hidden_states)
         return hidden_states
+
+    def get_gate_structure(self):
+        width = [self.attn1.gate.width, self.attn2.gate.width]
+        if isinstance(self.ff, FeedForwardWidthGated):
+            width.append(self.ff.get_gate_structure())
+        depth = self.depth_gate.width
+        return {"width": width, "depth": [depth]}
 
     def set_virtual_gate(self, gate_val):
         gate_1_val = gate_val[:, :self.attn1.gate.width]
@@ -645,11 +678,19 @@ class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
 
         self.depth_gate.set_structure_value(gate_val[:, -1:])
 
-    def get_gate_structure(self):
-        width = self.attn1.gate.width + self.attn2.gate.width
-        if isinstance(self.ff, FeedForwardWidthGated):
-            width += self.ff.get_gate_structure()
-        return {"width": width, "depth": self.depth_gate.width}
+        # self.depth_gate.set_structure_value(gate_val[:, -1:])
+
+    # def get_gate_structure(self):
+    #     width = self.attn1.gate.width + self.attn2.gate.width
+    #     if isinstance(self.ff, FeedForwardWidthGated):
+    #         width += self.ff.get_gate_structure()
+    #     return {"width": width, "depth": self.depth_gate.width}
+    #
+    #     gate_3_val = gate_val[:, self.attn1.gate.width + self.attn2.gate.width:-1]
+    #     self.attn1.gate.set_structure_value(gate_1_val)
+    #     self.attn2.gate.set_structure_value(gate_2_val)
+    #     self.ff.set_virtual_gate(gate_3_val)
+    #     self.depth_gate.set_structure_value(gate_val[:, -1:])
 
 
 class Transformer2DModelWidthGated(Transformer2DModel):
@@ -711,6 +752,16 @@ class Transformer2DModelWidthGated(Transformer2DModel):
                 for _ in range(num_layers)
             ]
         )
+        # self.structure = [[]]
+
+    # def get_gate_structure(self):
+    #     # return self.attn1.gate.width + self.attn2.gate.width + self.ff.get_gate_structure()
+    #     # assert isinstance(self.ff.net[0], GEGLUGated), "currently implemented only for GEGLU"
+    #     if self.structure == [[]]:
+    #         for tb in self.transformer_blocks:
+    #             self.structure[0] = self.structure[0] + tb.get_gate_structure()[0]
+    #
+    #     return self.structure
 
 
 class Transformer2DModelWidthDepthGated(Transformer2DModel):
@@ -753,7 +804,7 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
 
         self.transformer_blocks = nn.ModuleList(
             [
-                BasicTransformerBlockWidthDepthGated(
+                BasicTransformerBlockWidthGated(
                     inner_dim,
                     num_attention_heads,
                     attention_head_dim,
@@ -772,6 +823,243 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
                 for _ in range(num_layers)
             ]
         )
+
+        # self.depth_gate = DepthGate(1)
+        # self.structure = [[], []]
+
+    # def get_gate_structure(self):
+    #     # return self.attn1.gate.width + self.attn2.gate.width + self.ff.get_gate_structure()
+    #     # assert isinstance(self.ff.net[0], GEGLUGated), "currently implemented only for GEGLU"
+    #
+    #     if self.structure == [[], []]:
+    #         for tb in self.transformer_blocks:
+    #             tb_structure = tb.get_gate_structure()
+    #             assert len(tb_structure) == 1
+    #             self.structure[0] = self.structure[0] + tb_structure[0]
+    #
+    #         # Depth gate
+    #         self.structure[1].append(1)
+    #
+    #     return self.structure
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        timestep: Optional[torch.LongTensor] = None,
+        added_cond_kwargs: Dict[str, torch.Tensor] = None,
+        class_labels: Optional[torch.LongTensor] = None,
+        cross_attention_kwargs: Dict[str, Any] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        return_dict: bool = True,
+    ):
+        """
+        The [`Transformer2DModel`] forward method.
+
+        Args:
+            hidden_states (`torch.LongTensor` of shape `(batch size, num latent pixels)` if discrete, `torch.FloatTensor` of shape `(batch size, channel, height, width)` if continuous):
+                Input `hidden_states`.
+            encoder_hidden_states ( `torch.FloatTensor` of shape `(batch size, sequence len, embed dims)`, *optional*):
+                Conditional embeddings for cross attention layer. If not given, cross-attention defaults to
+                self-attention.
+            timestep ( `torch.LongTensor`, *optional*):
+                Used to indicate denoising step. Optional timestep to be applied as an embedding in `AdaLayerNorm`.
+            class_labels ( `torch.LongTensor` of shape `(batch size, num classes)`, *optional*):
+                Used to indicate class labels conditioning. Optional class labels to be applied as an embedding in
+                `AdaLayerZeroNorm`.
+            cross_attention_kwargs ( `Dict[str, Any]`, *optional*):
+                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
+                `self.processor` in
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            attention_mask ( `torch.Tensor`, *optional*):
+                An attention mask of shape `(batch, key_tokens)` is applied to `encoder_hidden_states`. If `1` the mask
+                is kept, otherwise if `0` it is discarded. Mask will be converted into a bias, which adds large
+                negative values to the attention scores corresponding to "discard" tokens.
+            encoder_attention_mask ( `torch.Tensor`, *optional*):
+                Cross-attention mask applied to `encoder_hidden_states`. Two formats supported:
+
+                    * Mask `(batch, sequence_length)` True = keep, False = discard.
+                    * Bias `(batch, 1, sequence_length)` 0 = keep, -10000 = discard.
+
+                If `ndim == 2`: will be interpreted as a mask, then converted into a bias consistent with the format
+                above. This bias will be added to the cross-attention scores.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~models.unet_2d_condition.UNet2DConditionOutput`] instead of a plain
+                tuple.
+
+        Returns:
+            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
+            `tuple` where the first element is the sample tensor.
+        """
+        # ensure attention_mask is a bias, and give it a singleton query_tokens dimension.
+        #   we may have done this conversion already, e.g. if we came here via UNet2DConditionModel#forward.
+        #   we can tell by counting dims; if ndim == 2: it's a mask rather than a bias.
+        # expects mask of shape:
+        #   [batch, key_tokens]
+        # adds singleton query_tokens dimension:
+        #   [batch,                    1, key_tokens]
+        # this helps to broadcast it as a bias over attention scores, which will be in one of the following shapes:
+        #   [batch,  heads, query_tokens, key_tokens] (e.g. torch sdp attn)
+        #   [batch * heads, query_tokens, key_tokens] (e.g. xformers or classic attn)
+        if attention_mask is not None and attention_mask.ndim == 2:
+            # assume that mask is expressed as:
+            #   (1 = keep,      0 = discard)
+            # convert mask into a bias that can be added to attention scores:
+            #       (keep = +0,     discard = -10000.0)
+            attention_mask = (1 - attention_mask.to(hidden_states.dtype)) * -10000.0
+            attention_mask = attention_mask.unsqueeze(1)
+
+        # convert encoder_attention_mask to a bias the same way we do for attention_mask
+        if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
+            encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
+            encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
+
+        # Retrieve lora scale.
+        lora_scale = cross_attention_kwargs.get("scale", 1.0) if cross_attention_kwargs is not None else 1.0
+
+        # 1. Input
+        if self.is_input_continuous:
+            batch, _, height, width = hidden_states.shape
+            residual = hidden_states
+
+            hidden_states = self.norm(hidden_states)
+            if not self.use_linear_projection:
+                hidden_states = (
+                    self.proj_in(hidden_states, scale=lora_scale)
+                    if not USE_PEFT_BACKEND
+                    else self.proj_in(hidden_states)
+                )
+                inner_dim = hidden_states.shape[1]
+                hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * width, inner_dim)
+            else:
+                inner_dim = hidden_states.shape[1]
+                hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * width, inner_dim)
+                hidden_states = (
+                    self.proj_in(hidden_states, scale=lora_scale)
+                    if not USE_PEFT_BACKEND
+                    else self.proj_in(hidden_states)
+                )
+
+        elif self.is_input_vectorized:
+            hidden_states = self.latent_image_embedding(hidden_states)
+        elif self.is_input_patches:
+            height, width = hidden_states.shape[-2] // self.patch_size, hidden_states.shape[-1] // self.patch_size
+            hidden_states = self.pos_embed(hidden_states)
+
+            if self.adaln_single is not None:
+                if self.use_additional_conditions and added_cond_kwargs is None:
+                    raise ValueError(
+                        "`added_cond_kwargs` cannot be None when using additional conditions for `adaln_single`."
+                    )
+                batch_size = hidden_states.shape[0]
+                timestep, embedded_timestep = self.adaln_single(
+                    timestep, added_cond_kwargs, batch_size=batch_size, hidden_dtype=hidden_states.dtype
+                )
+
+        # 2. Blocks
+        if self.caption_projection is not None:
+            batch_size = hidden_states.shape[0]
+            encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+            encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
+
+        for block in self.transformer_blocks:
+            if self.training and self.gradient_checkpointing:
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    block,
+                    hidden_states,
+                    attention_mask,
+                    encoder_hidden_states,
+                    encoder_attention_mask,
+                    timestep,
+                    cross_attention_kwargs,
+                    class_labels,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states = block(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    timestep=timestep,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    class_labels=class_labels,
+                )
+            hidden_states = block.depth_gate(hidden_states)
+
+        # 3. Output
+        if self.is_input_continuous:
+            if not self.use_linear_projection:
+                hidden_states = hidden_states.reshape(batch, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
+                hidden_states = (
+                    self.proj_out(hidden_states, scale=lora_scale)
+                    if not USE_PEFT_BACKEND
+                    else self.proj_out(hidden_states)
+                )
+            else:
+                hidden_states = (
+                    self.proj_out(hidden_states, scale=lora_scale)
+                    if not USE_PEFT_BACKEND
+                    else self.proj_out(hidden_states)
+                )
+                hidden_states = hidden_states.reshape(batch, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
+
+            output = hidden_states + residual
+        elif self.is_input_vectorized:
+            hidden_states = self.norm_out(hidden_states)
+            logits = self.out(hidden_states)
+            # (batch, self.num_vector_embeds - 1, self.num_latent_pixels)
+            logits = logits.permute(0, 2, 1)
+
+            # log(p(x_0))
+            output = F.log_softmax(logits.double(), dim=1).float()
+
+        if self.is_input_patches:
+            if self.config.norm_type != "ada_norm_single":
+                conditioning = self.transformer_blocks[0].norm1.emb(
+                    timestep, class_labels, hidden_dtype=hidden_states.dtype
+                )
+                shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
+                hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+                hidden_states = self.proj_out_2(hidden_states)
+            elif self.config.norm_type == "ada_norm_single":
+                shift, scale = (self.scale_shift_table[None] + embedded_timestep[:, None]).chunk(2, dim=1)
+                hidden_states = self.norm_out(hidden_states)
+                # Modulation
+                hidden_states = hidden_states * (1 + scale) + shift
+                hidden_states = self.proj_out(hidden_states)
+                hidden_states = hidden_states.squeeze(1)
+
+            # unpatchify
+            if self.adaln_single is None:
+                height = width = int(hidden_states.shape[1] ** 0.5)
+            hidden_states = hidden_states.reshape(
+                shape=(-1, height, width, self.patch_size, self.patch_size, self.out_channels)
+            )
+            hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
+            output = hidden_states.reshape(
+                shape=(-1, self.out_channels, height * self.patch_size, width * self.patch_size)
+            )
+
+        if not return_dict:
+            return (output,)
+
+        return Transformer2DModelOutput(sample=output)
+
+    # TODO: Implement the forward pass
+    # def forward(self, x, context=None):
+    #     # note: if no context is given, cross-attention defaults to self-attention
+    #     b, c, h, w = x.shape
+    #     x_in = x
+    #     x = self.norm(x)
+    #     x = self.proj_in(x)
+    #     x = rearrange(x, 'b c h w -> b (h w) c')
+    #     for block in self.transformer_blocks:
+    #         x = block(x, context=context)
+    #     x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+    #     x = self.proj_out(x)
+    #     return x + x_in
 
 
 class DualTransformer2DModelWidthGated(DualTransformer2DModel):
@@ -858,6 +1146,67 @@ class DualTransformer2DModelWidthDepthGated(DualTransformer2DModel):
                 for _ in range(2)
             ]
         )
+
+    def forward(
+        self,
+        hidden_states,
+        encoder_hidden_states,
+        timestep=None,
+        attention_mask=None,
+        cross_attention_kwargs=None,
+        return_dict: bool = True,
+    ):
+        """
+        Args:
+            hidden_states ( When discrete, `torch.LongTensor` of shape `(batch size, num latent pixels)`.
+                When continuous, `torch.FloatTensor` of shape `(batch size, channel, height, width)`): Input
+                hidden_states.
+            encoder_hidden_states ( `torch.LongTensor` of shape `(batch size, encoder_hidden_states dim)`, *optional*):
+                Conditional embeddings for cross attention layer. If not given, cross-attention defaults to
+                self-attention.
+            timestep ( `torch.long`, *optional*):
+                Optional timestep to be applied as an embedding in AdaLayerNorm's. Used to indicate denoising step.
+            attention_mask (`torch.FloatTensor`, *optional*):
+                Optional attention mask to be applied in Attention.
+            cross_attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
+                `self.processor` in
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`models.unet_2d_condition.UNet2DConditionOutput`] instead of a plain tuple.
+
+        Returns:
+            [`~models.transformer_2d.Transformer2DModelOutput`] or `tuple`:
+            [`~models.transformer_2d.Transformer2DModelOutput`] if `return_dict` is True, otherwise a `tuple`. When
+            returning a tuple, the first element is the sample tensor.
+        """
+        input_states = hidden_states
+
+        encoded_states = []
+        tokens_start = 0
+        # attention_mask is not used yet
+        for i in range(2):
+            # for each of the two transformers, pass the corresponding condition tokens
+            condition_state = encoder_hidden_states[:, tokens_start : tokens_start + self.condition_lengths[i]]
+            transformer_index = self.transformer_index_for_condition[i]
+            encoded_state = self.transformers[transformer_index](
+                input_states,
+                encoder_hidden_states=condition_state,
+                timestep=timestep,
+                cross_attention_kwargs=cross_attention_kwargs,
+                return_dict=False,
+            )[0]
+            encoded_state = self.transformers[transformer_index].depth_gate(encoded_state)
+            encoded_states.append(encoded_state - input_states)
+            tokens_start += self.condition_lengths[i]
+
+        output_states = encoded_states[0] * self.mix_ratio + encoded_states[1] * (1 - self.mix_ratio)
+        output_states = output_states + input_states
+
+        if not return_dict:
+            return (output_states,)
+
+        return Transformer2DModelOutput(sample=output_states)
 
 
 class CrossAttnDownBlock2DWidthDepthGated(CrossAttnDownBlock2D):
@@ -1071,6 +1420,37 @@ class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
 
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
+        self.structure = [[], []]
+
+    # def set_virtual_gate(self, gate_val):
+    #     raise NotImplementedError
+    #
+    # def get_gate_structure(self):
+    #     if self.structure == [[], []]:
+    #         structure = [[], []]
+    #         for b in self.resnets:
+    #             assert hasattr(b, "get_gate_structure")
+    #             b_structure = b.get_gate_structure()
+    #             if len(b_structure) == 1:
+    #                 structure[0] = structure[0] + b_structure[0]
+    #
+    #             elif len(b_structure) == 2:
+    #                 structure[0] = structure[0] + b_structure[0]
+    #                 structure[1] = structure[1] + b_structure[1]
+    #
+    #         for b in self.attentions:
+    #             assert hasattr(b, "get_gate_structure")
+    #             b_structure = b.get_gate_structure()
+    #             if len(b_structure) == 1:
+    #                 structure[0] = structure[0] + b_structure[0]
+    #
+    #             elif len(b_structure) == 2:
+    #                 structure[0] = structure[0] + b_structure[0]
+    #                 structure[1] = structure[1] + b_structure[1]
+    #
+    #         self.structure = structure
+    #
+    #     return self.structure
 
 
 class CrossAttnUpBlock2DWidthDepthGated(CrossAttnUpBlock2D):
@@ -1397,6 +1777,20 @@ class DownBlock2DWidthHalfDepthGated(DownBlock2D):
             )
 
         self.resnets = nn.ModuleList(resnets)
+        self.structure = [[], []]
+
+    # def get_gate_structure(self):
+    #
+    #     if self.structure == [[], []]:
+    #         for tb in self.transformer_blocks:
+    #             tb_structure = tb.get_gate_structure()
+    #             assert len(tb_structure) == 1
+    #             self.structure[0] = self.structure[0] + tb_structure[0]
+    #
+    #         # Depth gate
+    #         self.structure[1].append(1)
+    #
+    #     return self.structure
 
 
 class UpBlock2DWidthDepthGated(UpBlock2D):

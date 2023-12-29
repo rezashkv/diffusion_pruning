@@ -5,8 +5,6 @@ model:
     revision: null
     resolution: 512
     use_ema: false
-    non_ema_revision: null
-    mixed_precision: null
     noise_offset: 0.0
     prediction_type: epsilon
     unet_down_blocks:
@@ -14,15 +12,14 @@ model:
       - CrossAttnDownBlock2DHalfGated
       - CrossAttnDownBlock2DHalfGated
       - DownBlock2DHalfGated
-    unet_mid_block:
-      - UNetMidBlock2DCrossAttnWidthGated
+
+    unet_mid_block: UNetMidBlock2DCrossAttnWidthGated
+      
     unet_up_blocks:
       - UpBlock2DHalfGated
       - CrossAttnUpBlock2DHalfGated
       - CrossAttnUpBlock2DHalfGated
       - CrossAttnUpBlock2DHalfGated
-
-    pruning_target: 0.8
 
   hypernet:
     hypernet_T: 0.4
@@ -35,19 +32,29 @@ model:
 
 
 data:
-  train_data_dir: "/fs/cml-datasets/improved_aesthetics_6plus/data/"
-  validation_data_dir: null
   dataset_name: null
   data_files: null
   dataset_config_name: null
+  data_dir: "/fs/vulcan-datasets/conceptual_captions"
+
+  train_data_dir: "training"
+  train_data_file: "Train_GCC-1.1.0-Train.tsv"
+  train_bad_images_path: "pdm/data/train_cc3m_bad_images.txt"
+  max_train_samples: 20000000
+
+  validation_data_dir: "validation"
+  validation_data_file: "Validation_GCC-1.1.0-Validation.tsv"
+  validation_bad_images_path: "pdm/data/validation_cc3m_bad_images.txt"
+  max_val_samples: null
+
   image_column: "image"
   caption_column: "caption"
-  max_train_samples: 2000000
   prompts:
     - "A happy dog in the park"
     - "Cyberpunk cityscape with towering skyscrapers, neon signs, and flying cars."
     - "A burger falling in pieces juicy, tasty, hot, promotional photo, hdr, cinematic, highly detailed"
     - "Bauhaus style Mandrill screaming towards full moon from concrete balcony of Santorini island hotel"
+  max_generated_samples: 16
   dataloader:
     dataloader_num_workers: 0
     train_batch_size: 8
@@ -56,26 +63,38 @@ data:
 
 
 training:
+  num_train_epochs: 100
+  max_train_steps: null
+  validation_epochs: 1
+  mixed_precision: null
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: false
+  local_rank: -1
+  num_inference_steps: 100
+  allow_tf32: false
+  enable_xformers_memory_efficient_attention: false
+
   losses:
     diffusion_loss:
       snr_gamma: null
 
     resource_loss:
-      resource_loss_type: log
-      resource_loss_weight: 1.0
+      type: log
+      weight: 1.0
+      pruning_target: 0.8
 
     quantization_loss:
-      q_loss_weight: 1.0
+      weight: 1.0
 
     contrastive_clip_loss:
-      contrastive_loss_temperature: 1.0
-      contrastive_loss_weight: 0.1
+      temperature: 1.0
+      weight: 0.1
 
   optim:
     hypernet_learning_rate: 0.01
     quantizer_learning_rate: 0.001
     scale_lr: false
-    lr_scheduler: "cosine_with_restarts"
+    lr_scheduler: "constant"
     lr_warmup_steps: 500
     use_8bit_adam: false
     adam_beta1: 0.9
@@ -90,21 +109,10 @@ training:
     hub_model_id: null
 
   logging:
-    cache_dir: "/fs/nexuss-scratch/rezashkv/.cache/huggingface/"
-    logging_dir: "/fs/nexus-scratch/rezashkv/research/logs/sd-pruning/"
-    output_dir: "/fs/nexus-scratch/rezashkv/research/logs/sd-pruning/"
+    logging_dir: "/fs/nexus-scratch/rezashkv/research/logs/"
     report_to: "wandb"
     checkpointing_steps: 1000
     checkpoints_total_limit: 1
     resume_from_checkpoint: "latest"
     tracker_project_name: "text2image-dynamic-pruning"
 
-  num_train_epochs: 100
-  max_train_steps: null
-  validation_epochs: 1
-  gradient_accumulation_steps: 1
-  gradient_checkpointing: false
-  local_rank: -1
-  num_inference_steps: 100
-  allow_tf32: false
-  enable_xformers_memory_efficient_attention: false
