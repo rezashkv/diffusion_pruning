@@ -88,9 +88,9 @@ More information on all the CLI arguments and the environment are available on y
         f.write(yaml + model_card)
 
 
-def generate_samples_from_prompts(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, args, config, accelerator,
+def generate_samples_from_prompts(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, config, accelerator,
                                   weight_dtype, epoch):
-    logger.info("Running validation... ")
+    logger.info("Generating samples from the given prompts... ")
 
     hyper_net.eval()
     quantizer.eval()
@@ -121,8 +121,8 @@ def generate_samples_from_prompts(hyper_net, quantizer, vae, text_encoder, token
     image_output_dir = os.path.join(config["training"]["logging"]["logging_dir"], "prompt_images", f"epoch_{epoch}")
     os.makedirs(image_output_dir, exist_ok=True)
     images = []
-    for step in range(0, len(config.data.prompts), config.data.validation_batch_size * accelerator.num_processes):
-        batch = config.data.prompts[step:step + config.data.validation_batch_size * accelerator.num_processes]
+    for step in range(0, len(config.data.prompts), config.data.dataloader.validation_batch_size * accelerator.num_processes):
+        batch = config.data.prompts[step:step + config.data.dataloader.validation_batch_size * accelerator.num_processes]
         with torch.autocast("cuda"):
             with accelerator.split_between_processes(batch) as batch:
                 gen_images = pipeline(batch, num_inference_steps=config.training.num_inference_steps,
@@ -157,7 +157,7 @@ def generate_samples_from_prompts(hyper_net, quantizer, vae, text_encoder, token
     return images
 
 
-def log_quantizer_embedding_samples(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, args, config, accelerator,
+def log_quantizer_embedding_samples(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, config, accelerator,
                                     weight_dtype, epoch):
     logger.info("Sampling from quantizer... ")
 
@@ -198,8 +198,8 @@ def log_quantizer_embedding_samples(hyper_net, quantizer, vae, text_encoder, tok
     else:
         n_e = pipeline.quantizer.n_e
     quantizer_embedding_gumbel_sigmoid = []
-    for step in range(0, n_e, config.data.validation_batch_size * accelerator.num_processes):
-        indices = torch.arange(step, step + config.data.validation_batch_size * accelerator.num_processes,
+    for step in range(0, n_e, config.data.dataloader.validation_batch_size * accelerator.num_processes):
+        indices = torch.arange(step, step + config.data.dataloader.validation_batch_size * accelerator.num_processes,
                                device=accelerator.device)
         with torch.autocast("cuda"):
             with accelerator.split_between_processes(indices) as indices:
