@@ -1,58 +1,70 @@
 #!/usr/bin/env python
+# coding=utf-8
+# Copyright 2023 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
 
+import argparse
 import logging
 import math
 import os
 import random
 import shutil
 import sys
+import datetime
+import pickle
+
 from pathlib import Path
-from packaging import version
-import requests
-import yaml
+from omegaconf import OmegaConf
 
 import PIL
-from PIL import ImageFile
-from tqdm.auto import tqdm
-
 import accelerate
+import numpy as np
+import pandas as pd
+import requests
+import torch
+import torch.nn.functional as F
+import torch.utils.checkpoint
+import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from accelerate.utils import ProjectConfiguration, set_seed
-
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn.functional as F
-import torch.utils.checkpoint
-from torchvision import transforms
-
-from huggingface_hub import create_repo, upload_folder
-
 from datasets import load_dataset, Dataset, concatenate_datasets
 from datasets.utils.logging import set_verbosity_error, set_verbosity_warning
-
-import transformers
+from huggingface_hub import create_repo, upload_folder
+from packaging import version
+from torchvision import transforms
+from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.utils import ContextManagers
+from pdm.utils.op_counter import (add_flops_counting_methods)
 
 import diffusers
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
+from pdm.models.diffusion import UNet2DConditionModelGated
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
-
-from pdm.models.diffusion import UNet2DConditionModelGated
 from pdm.models import HyperStructure
 from pdm.models import StructureVectorQuantizer
 from pdm.losses import ClipLoss, ResourceLoss
-from pdm.utils.op_counter import (add_flops_counting_methods)
+from PIL import ImageFile
 from pdm.utils.logging_utils import save_model_card, log_validation, log_quantizer_embedding_samples
 from pdm.utils.arg_utils import parse_args
 from pdm.utils.metric_utils import compute_snr
-
+from pdm.datasets.cc3m import load_cc3m_dataset
+from pdm.datasets.laion_aes import load_main_laion_dataset
 
 if is_wandb_available():
     import wandb
@@ -62,8 +74,6 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.22.0.dev0")
 
-PIL.Image.MAX_IMAGE_PIXELS = 933120000
-
 logger = get_logger(__name__)
 
 DATASET_NAME_MAPPING = {
@@ -72,8 +82,9 @@ DATASET_NAME_MAPPING = {
 
 
 def main():
-    torch.autograd.set_detect_anomaly(True)
+    # configs = OmegaConf.load(base_args.base_config_path)
     args = parse_args()
+    config = OmegaConf.load(args.base_config_path)
 
     if args.non_ema_revision is not None:
         deprecate(
@@ -84,39 +95,46 @@ def main():
                 " use `--variant=non_ema` instead."
             ),
         )
-    logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
-    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir,
-                                                      total_limit=args.checkpoints_total_limit)
+    now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 
-    # if validation_prompts is a file or a dir, load the prompts from there
-    if args.validation_prompts is not None:
-        if args.validation_prompts[0].endswith(".csv") or args.validation_prompts[0].endswith(".tsv"):
-            validation_data = pd.read_csv(args.validation_prompts[0], sep="\t", header=None,
-                                          names=[args.caption_column, args.image_column])
-            validation_data = validation_data[args.caption_column].values.astype(str).tolist()
-            args.validation_prompts = validation_data
-            del validation_data
+    if args.name != "":
+        nowname = now + f"_{args.name}"
+    else:
+        nowname = now
 
-        elif os.path.isfile(args.validation_prompts[0]):
-            with open(args.validation_prompts[0], "r") as f:
-                args.validation_prompts = [line.strip() for line in f.readlines()]
-        elif os.path.isdir(args.validation_prompts[0]):
-            prompts = []
-            for d in args.validation_prompts:
-                files = [os.path.join(d, caption_file) for caption_file in os.listdir(d) if f.endswith(".txt")]
-                for f in files:
-                    with open(f, "r") as f:
-                        prompts.extend([line.strip() for line in f.readlines()])
-            args.validation_prompts = prompts
+    config["training"]["logging"]["logging_dir"] = os.path.join(config["training"]["logging"]["logging_dir"],
+                                                                os.getcwd().split('/')[-2],
+                                                                args.base_config_path.split('/')[-1].split('.')[0],
+                                                                nowname)
+    logging_dir = config["training"]["logging"]["logging_dir"]
 
-    if args.num_validation_samples is not None:
-        args.validation_prompts = args.validation_prompts[:args.num_validation_samples]
+    accelerator_project_config = ProjectConfiguration(project_dir=logging_dir,
+                                                      logging_dir=logging_dir,
+                                                      total_limit=config["training"]["logging"][
+                                                          "checkpoints_total_limit"])
+
+    if os.path.isfile(config["data"]["prompts"][0]):
+        with open(config["data"]["prompts"][0], "r") as f:
+            config["data"]["prompts"] = [line.strip() for line in f.readlines()]
+    elif os.path.isdir(config["data"]["prompts"][0]):
+        validation_prompts_dir = config["data"]["prompts"][0]
+        prompts = []
+        for d in validation_prompts_dir:
+            files = [os.path.join(d, caption_file) for caption_file in os.listdir(d) if f.endswith(".txt")]
+            for f in files:
+                with open(f, "r") as f:
+                    prompts.extend([line.strip() for line in f.readlines()])
+
+        config["data"]["prompts"] = prompts
+
+    if config["data"]["max_generated_samples"] is not None:
+        config["data"]["prompts"] = config["data"]["prompts"][:config["data"]["max_generated_samples"]]
 
     accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
+        gradient_accumulation_steps=config["training"]["gradient_accumulation_steps"],
+        mixed_precision=config["training"]["mixed_precision"],
+        log_with=config["training"]["logging"]["report_to"],
         project_config=accelerator_project_config,
     )
 
@@ -142,16 +160,18 @@ def main():
 
     # Handle the repository creation
     if accelerator.is_main_process:
-        if args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
+        if config["training"]["logging"]["logging_dir"] is not None:
+            os.makedirs(config["training"]["logging"]["logging_dir"], exist_ok=True)
 
             # dump the args to a yaml file
-            with open(os.path.join(args.output_dir, "args.yaml"), "w") as f:
-                yaml.dump(vars(args), f)
+            logging.info("Project config")
+            print(OmegaConf.to_yaml(config))
+            OmegaConf.save(config, os.path.join(logging_dir, "config.yaml"))
 
-        if args.push_to_hub:
+        if config["training"]["hf_hub"]["push_to_hub"]:
             repo_id = create_repo(
-                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
+                repo_id=config["training"]["hf_hub"]["hub_model_id"] or Path(logging_dir).name, exist_ok=True,
+                token=config["training"]["hf_hub"]["hub_token"]
             ).repo_id
 
     # Load scheduler, tokenizer and models.
@@ -186,31 +206,49 @@ def main():
         vae = AutoencoderKL.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision
         )
+
     unet = UNet2DConditionModelGated.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision,
-        down_block_types=args.unet_down_blocks, up_block_types=args.unet_up_blocks
+        args.pretrained_model_name_or_path,
+        subfolder="unet",
+        revision=args.non_ema_revision,
+        down_block_types=config["model"]["unet"]["unet_down_blocks"],
+        mid_block_type=config["model"]["unet"]["unet_mid_block"],
+        up_block_types=config["model"]["unet"]["unet_up_blocks"]
     )
     unet_structure, unet_structure_widths = unet.get_structure()
-    hyper_net = HyperStructure(structure=unet_structure_widths, input_dim=text_encoder.config.hidden_size,
+    hyper_net = HyperStructure(input_dim=text_encoder.config.hidden_size,
                                seq_len=text_encoder.config.max_position_embeddings,
-                               T=args.hypernet_T, base=args.hypernet_base)
+                               structure=unet_structure_widths,
+                               T=config["model"]["hypernet"]["hypernet_T"],
+                               base=config["model"]["hypernet"]["hypernet_base"])
 
-    quantizer = StructureVectorQuantizer(n_e=args.num_arch_vq_codebook_embeddings, structure=unet_structure,
-                                         beta=args.arch_vq_beta, temperature=args.hypernet_T, base=args.hypernet_base)
+    quantizer = StructureVectorQuantizer(n_e=config["model"]["quantizer"]["num_arch_vq_codebook_embeddings"],
+                                         vq_embed_dim=sum(unet.get_structure()),
+                                         beta=config["model"]["quantizer"]["arch_vq_beta"],
+                                         temperature=config["model"]["hypernet"]["hypernet_T"],
+                                         base=config["model"]["hypernet"]["hypernet_base"])
 
-    r_loss = ResourceLoss(p=args.pruning_target, loss_type=args.resource_loss_type)
-    clip_loss = ClipLoss(temperature=args.contrastive_loss_temperature, structure=unet_structure)
+    r_loss = ResourceLoss(p=config["training"]["losses"]["resource_loss"]["pruning_target"],
+                          loss_type=config["training"]["losses"]["resource_loss"]["type"])
 
+    clip_loss = ClipLoss(
+        temperature=config["training"]["losses"]["contrastive_clip_loss"]["temperature"])
+
+    # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
 
     # Create EMA for the unet.
-    if args.use_ema:
+    if config["model"]["unet"]["use_ema"]:
         ema_unet = UNet2DConditionModelGated.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision,
-            down_block_types=args.unet_down_blocks, up_block_types=args.unet_up_blocks
+            args.pretrained_model_name_or_path,
+            subfolder="unet",
+            revision=args.revision,
+            down_block_types=config["model"]["unet"]["unet_down_blocks"],
+            up_block_types=config["model"]["unet"]["unet_up_blocks"]
         )
-        ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModelGated,
+        ema_unet = EMAModel(ema_unet.parameters(),
+                            model_cls=UNet2DConditionModelGated,
                             model_config=ema_unet.config)
 
     unet.eval()
@@ -218,16 +256,14 @@ def main():
     hyper_net.train()
     quantizer.train()
 
-    if args.enable_xformers_memory_efficient_attention:
+    if config["training"]["enable_xformers_memory_efficient_attention"]:
         if is_xformers_available():
             import xformers
 
             xformers_version = version.parse(xformers.__version__)
             if xformers_version == version.parse("0.0.16"):
                 logger.warn(
-                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training,"
-                    " please update xFormers to at least 0.0.17."
-                    " See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
+                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
                 )
             unet.enable_xformers_memory_efficient_attention()
         else:
@@ -289,24 +325,30 @@ def main():
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
-    if args.gradient_checkpointing:
+    if config["training"]["gradient_checkpointing"]:
         unet.enable_gradient_checkpointing()
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
-    if args.allow_tf32:
+    if config["training"]["allow_tf32"]:
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    if args.scale_lr:
-        args.hypernet_learning_rate = (
-                args.hypernet_learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+    if config["training"]["optim"]["scale_lr"]:
+        config["training"]["optim"]["hypernet_learning_rate"] = (
+                config["training"]["optim"]["hypernet_learning_rate"] *
+                config["training"]["optim"]["gradient_accumulation_steps"] *
+                config["data"]["dataloader"]["train_batch_size"] *
+                accelerator.num_processes
         )
-        args.quantizer_learning_rate = (
-                args.quantizer_learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+        config["training"]["optim"]["quantizer_learning_rate"] = (
+                config["training"]["optim"]["quantizer_learning_rate"] *
+                config["training"]["optim"]["gradient_accumulation_steps"] *
+                config["data"]["dataloader"]["train_batch_size"] *
+                accelerator.num_processes
         )
 
     # Initialize the optimizer
-    if args.use_8bit_adam:
+    if config["training"]["optim"]["use_8bit_adam"]:
         try:
             import bitsandbytes as bnb
         except ImportError:
@@ -323,123 +365,83 @@ def main():
 
     optimizer = optimizer_cls(
         [
-            {"params": hyper_net.parameters(), "lr": args.hypernet_learning_rate},
-            {"params": quantizer.parameters(), "lr": args.quantizer_learning_rate},
+            {"params": hyper_net.parameters(), "lr": config["training"]["optim"]["hypernet_learning_rate"]},
+            {"params": quantizer.parameters(), "lr": config["training"]["optim"]["quantizer_learning_rate"]},
         ],
-        lr=args.hypernet_learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
+        lr=config["training"]["optim"]["hypernet_learning_rate"],
+        betas=(config["training"]["optim"]["adam_beta1"], config["training"]["optim"]["adam_beta2"]),
+        weight_decay=config["training"]["optim"]["adam_weight_decay"],
+        eps=config["training"]["optim"]["adam_epsilon"],
     )
+
+    # ##################################################################################################################
+    # #################################################### Datasets ####################################################
 
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
+    dataset_name = getattr(config["data"], "dataset_name", None)
+    dataset_config_name = getattr(config["data"], "dataset_config_name", None)
+    data_files = getattr(config["data"], "data_files", None)
+    data_dir = getattr(config["data"], "data_dir", None)
+
+    train_data_dir = getattr(config["data"], "train_data_dir", None)
+    train_data_file = getattr(config["data"], "train_data_file", None)
+    train_bad_images_path = getattr(config["data"], "train_bad_images_path", None)
+    max_train_samples = getattr(config["data"], "max_train_samples", None)
+
+    validation_data_dir = getattr(config["data"], "validation_data_dir", None)
+    validation_data_file = getattr(config["data"], "validation_data_file", None)
+    validation_bad_images_path = getattr(config["data"], "validation_bad_images_path", None)
+    max_validation_samples = getattr(config["data"], "max_validation_samples", None)
+
     logger.info("Loading dataset...")
-    if args.dataset_name is not None:
+    if dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            data_files=args.data_files,
+            dataset_name,
+            dataset_config_name,
+            data_files=data_files,
             cache_dir=args.cache_dir,
-            data_dir=args.train_data_dir,
+            data_dir=train_data_dir,
             ignore_verifications=True
         )
     else:
-        if "aesthetics" in args.train_data_dir:
-            if args.data_files is None:
+        if "aesthetics" in data_dir:
+            if data_files is None:
                 # datafiles a list of 5-char strs from 00000 to 00200
-                args.data_files = [f"{i:05d}" for i in range(250)]
-
-            def load_dataset_dir(dataset_dir):
-                dataset = []
-                image_files = [f for f in os.listdir(dataset_dir) if f.endswith('.jpg')]
-                for image_file in image_files:
-                    image_path = os.path.join(dataset_dir, image_file)
-                    caption_file = image_file.replace('.jpg', '.txt')
-                    caption_path = os.path.join(dataset_dir, caption_file)
-                    with open(caption_path, 'r') as caption_file:
-                        caption = caption_file.read()
-                    example = {
-                        'image': image_path,
-                        'caption': str(caption),
-                    }
-                    dataset.append(example)
-                return dataset
-
-            def load_main_dataset(main_dataset_dir, train_dirs):
-                train_datasets = {}
-                for subdir in train_dirs:
-                    dataset_name = subdir
-                    dataset_dir = os.path.join(main_dataset_dir, subdir)
-                    dataset = load_dataset_dir(dataset_dir)
-                    train_datasets[dataset_name] = dataset
-
-                return train_datasets
-
-            train_data = load_main_dataset(args.train_data_dir, list(args.data_files))
+                data_files = [f"{i:05d}" for i in range(250)]
+            train_data = load_main_laion_dataset(data_dir, list(data_files))
 
             # Convert the loaded data into a Hugging Face Dataset
             tr_datasets = []
             for dataset_name, dataset in train_data.items():
                 tr_datasets.append(Dataset.from_list(dataset))
+            dataset = {'train': concatenate_datasets(tr_datasets), 'validation': None}
+            del tr_datasets
 
-            dataset = {'train': concatenate_datasets(tr_datasets)}
 
-        elif "captions" in args.train_data_dir:
-            captions = pd.read_csv(os.path.join(args.train_data_dir, "Train_GCC-training.tsv"),
-                                   sep="\t", header=None, names=["caption", "link"],
-                                   dtype={"caption": str, "link": str})
-            images = os.listdir(os.path.join(args.train_data_dir, "training"))
-
-            # Faster debugging
-            if args.max_train_samples is not None and args.max_train_samples < 1000:
-                images = images[:args.max_train_samples * 5]
-
-            images = [os.path.join(args.train_data_dir, "training", image) for image in images]
-            bad_images_path = args.bad_images_path
-            if bad_images_path is None:
-                bad_images_path = os.path.join(os.path.dirname(args.output_dir), "cc3m_bad_images.txt")
-            if os.path.exists(bad_images_path):
-                with open(os.path.join(bad_images_path), "r") as f:
-                    bad_images = f.readlines()
-                bad_images = [image.strip() for image in bad_images]
-                images = set(images) - set(bad_images)
-                images = list(images)
-
-            else:
-                # remove images that cant be opened by PIL
-                imgs = []
-                bad_images = []
-                for image in images:
-                    try:
-                        with PIL.Image.open(image) as img:
-                            imgs.append(img)
-                    except PIL.UnidentifiedImageError:
-                        bad_images.append(image)
-                        logger.info(
-                            f"Image file `{image}` is corrupt and can't be opened."
-                        )
-                images = imgs
-
-                # save the bad images to a file in the parent directory of output_dir
-                bad_images_path = os.path.join(os.path.dirname(args.output_dir), "cc3m_bad_images.txt")
-                with open(bad_images_path, "w") as f:
-                    f.write("\n".join(bad_images))
-
-            image_indices = [int(os.path.basename(image).split("_")[0]) for image in images]
-            captions = captions.iloc[image_indices].caption.values.tolist()
-            train_dataset = Dataset.from_dict({"image": images, "caption": captions})
-            del images, captions, image_indices, bad_images
-            dataset = {"train": train_dataset}
+        elif "conceptual_captions" in data_dir:
+            dataset = {"train": load_cc3m_dataset(data_dir,
+                                                  split="train",
+                                                  split_file=train_data_file,
+                                                  split_dir=train_data_dir,
+                                                  max_samples=max_train_samples,
+                                                  bad_images_path=train_bad_images_path)}
+            if validation_data_dir is not None:
+                dataset["validation"] = load_cc3m_dataset(data_dir,
+                                                          split="validation",
+                                                          split_file=validation_data_file,
+                                                          split_dir=validation_data_dir,
+                                                          max_samples=max_validation_samples,
+                                                          bad_images_path=validation_bad_images_path)
 
         else:
             data_files = {}
-            if args.train_data_dir is not None:
-                data_files["train"] = os.path.join(args.train_data_dir, "**")
+            if config.data.data_dir is not None:
+                data_files["train"] = os.path.join(config.data.data_dir, "**")
             dataset = load_dataset(
                 "imagefolder",
                 data_files=data_files,
@@ -452,22 +454,22 @@ def main():
     column_names = dataset["train"].column_names
 
     # 6. Get the column names for input/target.
-    dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
-    if args.image_column is None:
+    dataset_columns = DATASET_NAME_MAPPING.get(config.data.dataset_name, None)
+    if config.data.image_column is None:
         image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
     else:
-        image_column = args.image_column
+        image_column = config.data.image_column
         if image_column not in column_names:
             raise ValueError(
-                f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
+                f"--image_column' value '{config.data.image_column}' needs to be one of: {', '.join(column_names)}"
             )
-    if args.caption_column is None:
+    if config.data.caption_column is None:
         caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
     else:
-        caption_column = args.caption_column
+        caption_column = config.data.caption_column
         if caption_column not in column_names:
             raise ValueError(
-                f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
+                f"--caption_column' value '{config.data.caption_column}' needs to be one of: {', '.join(column_names)}"
             )
 
     # Preprocessing the datasets.
@@ -492,11 +494,12 @@ def main():
     # Preprocessing the datasets.
     train_transforms = transforms.Compose(
         [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
-            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
+            transforms.Resize(config.model.unet.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(config.model.unet.resolution) if config.data.dataloader.center_crop else transforms.RandomCrop(
+                config.model.unet.resolution),
+            transforms.RandomHorizontalFlip() if config.data.dataloader.random_flip else transforms.Lambda(lambda x: x),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ]
     )
 
@@ -515,10 +518,17 @@ def main():
         return examples
 
     with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+        if max_train_samples is not None:
+            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(config.data.max_train_samples))
         # Set the training transforms
         train_dataset = dataset["train"].with_transform(preprocess_train)
+
+        if max_validation_samples is not None:
+            dataset["validation"] = dataset["validation"].shuffle(seed=args.seed).select(
+                range(config.data.max_validation_samples))
+        # Set the validation transforms
+        validation_dataset = dataset["validation"].with_transform(preprocess_train)
+        del dataset
 
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
@@ -531,22 +541,22 @@ def main():
         train_dataset,
         shuffle=True,
         collate_fn=collate_fn,
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
+        batch_size=config["data"]["dataloader"]["train_batch_size"],
+        num_workers=config["data"]["dataloader"]["num_workers"],
     )
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / config.training.gradient_accumulation_steps)
+    if config.training.max_train_steps is None:
+        config.training.max_train_steps = config.training.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
     lr_scheduler = get_scheduler(
-        args.lr_scheduler,
+        config.training.optim.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
-        num_training_steps=args.max_train_steps * accelerator.num_processes,
+        num_warmup_steps=config.training.optim.lr_warmup_steps * accelerator.num_processes,
+        num_training_steps=config.training.max_train_steps * accelerator.num_processes,
     )
 
     # Prepare everything with our `accelerator`.
@@ -572,55 +582,54 @@ def main():
     vae.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / config.training.gradient_accumulation_steps)
     if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        config.training.max_train_steps = config.training.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+    config.training.num_train_epochs = math.ceil(config.training.max_train_steps / num_update_steps_per_epoch)
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
-        tracker_config.pop("validation_prompts")
         if args.wandb_run_name is None:
-            args.wandb_run_name = f"{args.dataset_name if args.dataset_name else args.train_data_dir.split('/')[-1]}-{args.max_train_samples}"
+            args.wandb_run_name = f"{config.data.dataset_name if config.data.dataset_name else config.data.data_dir.split('/')[-1]}-{config.data.max_train_samples}"
         accelerator.init_trackers(args.tracker_project_name, tracker_config,
                                   init_kwargs={"wandb": {"name": args.wandb_run_name}}
                                   )
     # Train!
-    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    total_batch_size = config.data.dataloader.train_batch_size * accelerator.num_processes * config.training.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(f"  Num Epochs = {config.training.num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {config.data.dataloader.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info(f"  Gradient Accumulation steps = {config.training.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {config.training.max_train_steps}")
     global_step = 0
     first_epoch = 0
 
     # Potentially load in the weights and states from a previous save
-    if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint != "latest":
-            path = os.path.basename(args.resume_from_checkpoint)
+    if config.training.logging.resume_from_checkpoint:
+        if config.training.logging.resume_from_checkpoint != "latest":
+            path = os.path.basename(config.training.logging.resume_from_checkpoint)
         else:
             # Get the most recent checkpoint
-            dirs = os.listdir(args.output_dir)
+            dirs = os.listdir(logging_dir)
             dirs = [d for d in dirs if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
             path = dirs[-1] if len(dirs) > 0 else None
 
         if path is None:
             accelerator.print(
-                f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
+                f"Checkpoint '{config.training.logging.resume_from_checkpoint}' does not exist. Starting a new training run."
             )
-            args.resume_from_checkpoint = None
+            config.training.logging.resume_from_checkpoint = None
             initial_global_step = 0
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
+            accelerator.load_state(os.path.join(logging_dir, path))
             global_step = int(path.split("-")[1])
 
             initial_global_step = global_step
@@ -630,14 +639,14 @@ def main():
         initial_global_step = 0
 
     progress_bar = tqdm(
-        range(0, args.max_train_steps),
+        range(0, config.training.max_train_steps),
         initial=initial_global_step,
         desc="Steps",
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
 
-    for epoch in range(first_epoch, args.num_train_epochs):
+    for epoch in range(first_epoch, config.training.num_train_epochs):
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             hyper_net.train()
@@ -650,13 +659,13 @@ def main():
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
-                if args.noise_offset:
+                if config.model.unet.noise_offset:
                     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                    noise += args.noise_offset * torch.randn(
+                    noise += config.model.unet.noise_offset * torch.randn(
                         (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
                     )
-                if args.input_perturbation:
-                    new_noise = noise + args.input_perturbation * torch.randn_like(noise)
+                if config.model.unet.input_perturbation:
+                    new_noise = noise + config.model.unet.input_perturbation * torch.randn_like(noise)
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
@@ -664,7 +673,7 @@ def main():
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
-                if args.input_perturbation:
+                if config.model.unet.input_perturbation:
                     noisy_latents = noise_scheduler.add_noise(latents, new_noise, timesteps)
                 else:
                     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
@@ -691,9 +700,9 @@ def main():
                 unet.set_structure(arch_vector_quantized)
 
                 # Get the target for loss depending on the prediction type
-                if args.prediction_type is not None:
+                if config.model.unet.prediction_type is not None:
                     # set prediction_type of scheduler if defined
-                    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+                    noise_scheduler.register_to_config(prediction_type=config.model.unet.prediction_type)
 
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
@@ -705,7 +714,7 @@ def main():
                 # Predict the noise residual and compute loss
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
-                if args.snr_gamma is None:
+                if config.training.losses.diffusion_loss.snr_gamma is None:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 else:
                     # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
@@ -716,7 +725,9 @@ def main():
                         # Velocity objective requires that we add one to SNR values before we divide by them.
                         snr = snr + 1
                     mse_loss_weights = (
-                            torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
+                            torch.stack(
+                                [snr, config.training.losses.diffusion_loss.snr_gamma * torch.ones_like(timesteps)],
+                                dim=1).min(dim=1)[0] / snr
                     )
 
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
@@ -728,18 +739,18 @@ def main():
                 resource_ratio = (curr_flops / unet.total_flops)
                 resource_loss = r_loss(resource_ratio)
 
-                loss += args.resource_loss_weight * resource_loss
-                loss += args.q_loss_weight * q_loss
-                loss += args.contrastive_loss_weight * contrastive_loss
+                loss += config.training.losses.resource_loss.weight * resource_loss
+                loss += config.training.losses.quantization_loss.weight * q_loss
+                loss += config.training.losses.contrastive_clip_loss.weight * contrastive_loss
 
                 # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
-                train_loss += avg_loss.item() / args.gradient_accumulation_steps
+                avg_loss = accelerator.gather(loss.repeat(config.training.train_batch_size)).mean()
+                train_loss += avg_loss.item() / config.training.gradient_accumulation_steps
 
                 # Back-propagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                    accelerator.clip_grad_norm_(unet.parameters(), config.training.optim.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -776,17 +787,18 @@ def main():
                 accelerator.log({"arch vector pairwise similarity": wandb.Image(arch_vector_)},
                                 step=global_step)
 
-                if global_step % args.checkpointing_steps == 0:
+                if global_step % config.training.logging.checkpointing_steps == 0:
                     if accelerator.is_main_process:
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(args.output_dir)
+                        if config.training.logging.checkpoints_total_limit is not None:
+                            checkpoints = os.listdir(logging_dir)
                             checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
                             checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
                             # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                            if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                            if len(checkpoints) >= config.training.logging.checkpoints_total_limit:
+                                num_to_remove = len(
+                                    checkpoints) - config.training.logging.checkpoints_total_limit.checkpoints_total_limit + 1
                                 removing_checkpoints = checkpoints[0:num_to_remove]
 
                                 logger.info(
@@ -795,15 +807,15 @@ def main():
                                 logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
 
                                 for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                    removing_checkpoint = os.path.join(logging_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
 
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        save_path = os.path.join(logging_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
 
                         # save architecture vector quantized
-                        torch.save(arch_vector_quantized, os.path.join(args.output_dir,
-                                                                       f"arch_vector_quantized.pt"))
+                        torch.save(arch_vector_quantized, os.path.join(logging_dir,
+                                                                       f"arch_vector_quantized-{global_step}.pt"))
 
                         logger.info(f"Saved state to {save_path}")
 
@@ -812,14 +824,14 @@ def main():
                     "resource_loss": resource_loss.detach().item()}
             progress_bar.set_postfix(**logs)
 
-            if global_step >= args.max_train_steps:
+            if global_step >= config.training.max_train_steps:
                 break
 
         if accelerator.is_main_process:
 
             # generate some validation images
-            if args.validation_prompts is not None and (epoch % args.validation_epochs == 0 or
-                                                        epoch == args.num_train_epochs - 1):
+            if config.data.prompts is not None and (epoch % config.training.validation_epochs == 0 or
+                                                    epoch == config.training.num_train_epochs - 1):
                 if args.use_ema:
                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                     ema_unet.store(unet.parameters())
@@ -831,7 +843,7 @@ def main():
                     text_encoder,
                     tokenizer,
                     unet,
-                    args,
+                    config,
                     accelerator,
                     weight_dtype,
                     global_step,
@@ -841,7 +853,7 @@ def main():
                     ema_unet.restore(unet.parameters())
 
             # log quantizer embeddings samples
-            if epoch % args.validation_epochs == 0 or epoch == args.num_train_epochs - 1:
+            if epoch % config.training.validation_epochs == 0 or epoch == config.training.num_train_epochs - 1:
                 if args.use_ema:
                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                     ema_unet.store(unet.parameters())
@@ -853,7 +865,7 @@ def main():
                     text_encoder,
                     tokenizer,
                     unet,
-                    args,
+                    config,
                     accelerator,
                     weight_dtype,
                     global_step,
@@ -867,10 +879,10 @@ def main():
 
     if accelerator.is_main_process:
         if args.push_to_hub:
-            save_model_card(args, repo_id, val_images, repo_folder=args.output_dir)
+            save_model_card(config, repo_id, val_images, repo_folder=args.output_dir)
             upload_folder(
                 repo_id=repo_id,
-                folder_path=args.output_dir,
+                folder_path=logging_dir,
                 commit_message="End of training",
                 ignore_patterns=["step_*", "epoch_*"],
             )
@@ -879,4 +891,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("--base_config_path", type=str, required=True)
+    # args = parser.parse_args()
+    # main(args)
     main()

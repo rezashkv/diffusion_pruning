@@ -50,9 +50,14 @@ from diffusers.models.unet_2d_blocks import (
     KCrossAttnUpBlock2D, UNetMidBlock2D
 )
 
-from .blocks import (CrossAttnDownBlock2DWidthDepthGated, CrossAttnUpBlock2DWidthDepthGated, CrossAttnUpBlock2DWidthHalfDepthGated,
-                     CrossAttnDownBlock2DWidthHalfDepthGated, DownBlock2DWidthDepthGated, UpBlock2DWidthDepthGated,
-                     DownBlock2DWidthHalfDepthGated, UpBlock2DWidthHalfDepthGated, UNetMidBlock2DCrossAttnWidthGated)
+from .blocks import (CrossAttnDownBlock2DWidthDepthGated, CrossAttnUpBlock2DWidthDepthGated,
+                     CrossAttnUpBlock2DWidthHalfDepthGated, CrossAttnDownBlock2DWidthHalfDepthGated,
+                     DownBlock2DWidthDepthGated, UpBlock2DWidthDepthGated, DownBlock2DWidthHalfDepthGated,
+                     UpBlock2DWidthHalfDepthGated, UNetMidBlock2DCrossAttnWidthGated)
+
+# from pdm.models.diffusion.blocks import (CrossAttnDownBlock2DWidthDepthGated, CrossAttnUpBlock2DWidthDepthGated, CrossAttnUpBlock2DWidthHalfDepthGated,
+#                                          CrossAttnDownBlock2DWidthHalfDepthGated, DownBlock2DWidthDepthGated, UpBlock2DWidthDepthGated,
+#                                          DownBlock2DWidthHalfDepthGated, UpBlock2DWidthHalfDepthGated, UNetMidBlock2DCrossAttnWidthGated)
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -1173,6 +1178,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
             )
 
         self.total_flops = total_flops
+        self.structure = [[], []]
 
     @property
     def attn_processors(self) -> Dict[str, AttentionProcessor]:
@@ -1318,6 +1324,25 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         if hasattr(module, "gradient_checkpointing"):
             module.gradient_checkpointing = value
 
+    # def get_structure(self):
+    #     if self.structure == [[], []]:
+    #         structure = [[], []]
+    #
+    #         # Down Blocks
+    #         for m in self.down_blocks:
+    #             # if hasattr(m, "get_gate_structure"):
+    #             assert hasattr(m, "get_gate_structure")
+    #             m_structure = m.get_gate_structure()
+    #             assert len(m_structure) == 2
+    #             structure[0] = structure[0] + m_structure[0]
+    #             structure[1] = structure[1] + m_structure[1]
+    #
+    #         for m in self.modules():
+    #             if hasattr(m, "get_gate_structure"):
+    #                 structure.append(m.get_gate_structure())
+    #         self.structure = structure
+    #     return structure
+
     def get_structure(self):
         structure = []
         for m in self.modules():
@@ -1326,25 +1351,18 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         self.structure = structure
         structure_size = []
         for elem in self.structure:
-            w = 0
             if "width" in elem:
-                w += elem["width"]
+                for w in elem["width"]:
+                    structure_size.append(w)
             if "depth" in elem:
-                w += elem["depth"]
-            structure_size.append(w)
+                structure_size.append(elem["depth"][0])
         return structure, structure_size
 
     def set_structure(self, arch_vector):
         start = 0
         for m in self.modules():
             if hasattr(m, "set_virtual_gate"):
-                g = m.get_gate_structure()
-                w = 0
-                if "width" in g:
-                    w += g["width"]
-                if "depth" in g:
-                    w += g["depth"]
-                end = start + w
+                end = start + m.get_gate_structure()
                 m.set_virtual_gate(arch_vector[:, start:end])
                 start = end
 
