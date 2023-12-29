@@ -15,6 +15,8 @@
 
 import argparse
 import logging
+from typing import Dict
+
 import math
 import os
 import random
@@ -24,7 +26,7 @@ import datetime
 import pickle
 
 from pathlib import Path
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig
 
 import PIL
 import accelerate
@@ -60,7 +62,7 @@ from pdm.models import HyperStructure
 from pdm.models import StructureVectorQuantizer
 from pdm.losses import ClipLoss, ResourceLoss
 from PIL import ImageFile
-from pdm.utils.logging_utils import save_model_card, log_validation, log_quantizer_embedding_samples
+from pdm.utils.logging_utils import save_model_card, generate_samples_from_prompts, log_quantizer_embedding_samples
 from pdm.utils.arg_utils import parse_args
 from pdm.utils.metric_utils import compute_snr
 from pdm.datasets.cc3m import load_cc3m_dataset
@@ -82,11 +84,14 @@ DATASET_NAME_MAPPING = {
 
 
 def main():
-    # configs = OmegaConf.load(base_args.base_config_path)
+    torch.autograd.set_detect_anomaly(True)
+    # configs = OmegaConf.load(base_config.base_config_path)
     args = parse_args()
     config = OmegaConf.load(args.base_config_path)
+    # add args to config
+    config.update(vars(args))
 
-    if args.non_ema_revision is not None:
+    if config.non_ema_revision is not None:
         deprecate(
             "non_ema_revision!=None",
             "0.15.0",
@@ -98,14 +103,14 @@ def main():
 
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 
-    if args.name != "":
-        nowname = now + f"_{args.name}"
+    if config.name != "":
+        nowname = now + f"_{config.name}"
     else:
         nowname = now
 
     config["training"]["logging"]["logging_dir"] = os.path.join(config["training"]["logging"]["logging_dir"],
                                                                 os.getcwd().split('/')[-2],
-                                                                args.base_config_path.split('/')[-1].split('.')[0],
+                                                                config.base_config_path.split('/')[-1].split('.')[0],
                                                                 nowname)
     logging_dir = config["training"]["logging"]["logging_dir"]
 
@@ -155,8 +160,8 @@ def main():
         diffusers.utils.logging.set_verbosity_error()
 
     # If passed along, set the training seed now.
-    if args.seed is not None:
-        set_seed(args.seed)
+    if config.seed is not None:
+        set_seed(config.seed)
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -175,9 +180,9 @@ def main():
             ).repo_id
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = DDIMScheduler.from_pretrained(config.pretrained_model_name_or_path, subfolder="scheduler")
     tokenizer = CLIPTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
+        config.pretrained_model_name_or_path, subfolder="tokenizer", revision=config.revision
     )
 
     def deepspeed_zero_init_disabled_context_manager():
@@ -201,16 +206,16 @@ def main():
     # across multiple gpus and only UNet2DConditionModel will get ZeRO sharded.
     with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
         text_encoder = CLIPTextModel.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+            config.pretrained_model_name_or_path, subfolder="text_encoder", revision=config.revision
         )
         vae = AutoencoderKL.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision
+            config.pretrained_model_name_or_path, subfolder="vae", revision=config.revision
         )
 
     unet = UNet2DConditionModelGated.from_pretrained(
-        args.pretrained_model_name_or_path,
+        config.pretrained_model_name_or_path,
         subfolder="unet",
-        revision=args.non_ema_revision,
+        revision=config.non_ema_revision,
         down_block_types=config["model"]["unet"]["unet_down_blocks"],
         mid_block_type=config["model"]["unet"]["unet_mid_block"],
         up_block_types=config["model"]["unet"]["unet_up_blocks"]
@@ -241,9 +246,9 @@ def main():
     # Create EMA for the unet.
     if config["model"]["unet"]["use_ema"]:
         ema_unet = UNet2DConditionModelGated.from_pretrained(
-            args.pretrained_model_name_or_path,
+            config.pretrained_model_name_or_path,
             subfolder="unet",
-            revision=args.revision,
+            revision=config.revision,
             down_block_types=config["model"]["unet"]["unet_down_blocks"],
             up_block_types=config["model"]["unet"]["unet_up_blocks"]
         )
@@ -274,7 +279,7 @@ def main():
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
-                if args.use_ema:
+                if config.use_ema:
                     ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
 
                 for i, model in enumerate(models):
@@ -292,7 +297,7 @@ def main():
                     weights.pop()
 
         def load_model_hook(models, input_dir):
-            if args.use_ema:
+            if config.use_ema:
                 load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel)
                 ema_unet.load_state_dict(load_model.state_dict())
                 ema_unet.to(accelerator.device)
@@ -404,7 +409,7 @@ def main():
             dataset_name,
             dataset_config_name,
             data_files=data_files,
-            cache_dir=args.cache_dir,
+            cache_dir=config.cache_dir,
             data_dir=train_data_dir,
             ignore_verifications=True
         )
@@ -421,7 +426,6 @@ def main():
                 tr_datasets.append(Dataset.from_list(dataset))
             dataset = {'train': concatenate_datasets(tr_datasets), 'validation': None}
             del tr_datasets
-
 
         elif "conceptual_captions" in data_dir:
             dataset = {"train": load_cc3m_dataset(data_dir,
@@ -445,7 +449,7 @@ def main():
             dataset = load_dataset(
                 "imagefolder",
                 data_files=data_files,
-                cache_dir=args.cache_dir,
+                cache_dir=config.cache_dir,
             )
             # See more about loading custom images at
             # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
@@ -520,12 +524,12 @@ def main():
 
     with accelerator.main_process_first():
         if max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(config.data.max_train_samples))
+            dataset["train"] = dataset["train"].shuffle(seed=config.seed).select(range(config.data.max_train_samples))
         # Set the training transforms
         train_dataset = dataset["train"].with_transform(preprocess_train)
 
         if max_validation_samples is not None:
-            dataset["validation"] = dataset["validation"].shuffle(seed=args.seed).select(
+            dataset["validation"] = dataset["validation"].shuffle(seed=config.seed).select(
                 range(config.data.max_validation_samples))
         # Set the validation transforms
         validation_dataset = dataset["validation"].with_transform(preprocess_train)
@@ -543,7 +547,7 @@ def main():
         shuffle=True,
         collate_fn=collate_fn,
         batch_size=config["data"]["dataloader"]["train_batch_size"],
-        num_workers=config["data"]["dataloader"]["num_workers"],
+        num_workers=config["data"]["dataloader"]["dataloader_num_workers"],
     )
 
     # Scheduler and math around the number of training steps.
@@ -565,7 +569,7 @@ def main():
         unet, optimizer, train_dataloader, lr_scheduler, hyper_net, quantizer
     )
 
-    if args.use_ema:
+    if config.use_ema:
         ema_unet.to(accelerator.device)
 
     # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
@@ -573,10 +577,10 @@ def main():
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
-        args.mixed_precision = accelerator.mixed_precision
+        config.mixed_precision = accelerator.mixed_precision
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
-        args.mixed_precision = accelerator.mixed_precision
+        config.mixed_precision = accelerator.mixed_precision
 
     # Move text_encode and vae to gpu and cast to weight_dtype
     text_encoder.to(accelerator.device, dtype=weight_dtype)
@@ -592,11 +596,25 @@ def main():
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        tracker_config = dict(vars(args))
-        if args.wandb_run_name is None:
-            args.wandb_run_name = f"{config.data.dataset_name if config.data.dataset_name else config.data.data_dir.split('/')[-1]}-{config.data.max_train_samples}"
-        accelerator.init_trackers(args.tracker_project_name, tracker_config,
-                                  init_kwargs={"wandb": {"name": args.wandb_run_name}}
+        def cfg2dict(cfg: DictConfig) -> Dict:
+            """
+            Recursively convert OmegaConf to vanilla dict
+            :param cfg:
+            :return:
+            """
+            cfg_dict = {}
+            for k, v in cfg.items():
+                if type(v) == DictConfig:
+                    cfg_dict[k] = cfg2dict(v)
+                else:
+                    cfg_dict[k] = v
+            return cfg_dict
+
+        tracker_config = cfg2dict(config)
+        if config.wandb_run_name is None:
+            config.wandb_run_name = f"{config.data.dataset_name if config.data.dataset_name else config.data.data_dir.split('/')[-1]}-{config.data.max_train_samples}"
+        accelerator.init_trackers(config.tracker_project_name, tracker_config,
+                                  init_kwargs={"wandb": {"name": config.wandb_run_name}}
                                   )
     # Train!
     total_batch_size = config.data.dataloader.train_batch_size * accelerator.num_processes * config.training.gradient_accumulation_steps
@@ -745,7 +763,7 @@ def main():
                 loss += config.training.losses.contrastive_clip_loss.weight * contrastive_loss
 
                 # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(config.training.train_batch_size)).mean()
+                avg_loss = accelerator.gather(loss.repeat(config.data.dataloader.train_batch_size)).mean()
                 train_loss += avg_loss.item() / config.training.gradient_accumulation_steps
 
                 # Back-propagate
@@ -758,7 +776,7 @@ def main():
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
-                if args.use_ema:
+                if config.use_ema:
                     ema_unet.step(unet.parameters())
                 progress_bar.update(1)
                 global_step += 1
@@ -833,11 +851,11 @@ def main():
             # generate some validation images
             if config.data.prompts is not None and (epoch % config.training.validation_epochs == 0 or
                                                     epoch == config.training.num_train_epochs - 1):
-                if args.use_ema:
+                if config.use_ema:
                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                     ema_unet.store(unet.parameters())
                     ema_unet.copy_to(unet.parameters())
-                val_images = log_validation(
+                val_images = generate_samples_from_prompts(
                     hyper_net,
                     quantizer,
                     vae,
@@ -849,13 +867,13 @@ def main():
                     weight_dtype,
                     global_step,
                 )
-                if args.use_ema:
+                if config.use_ema:
                     # Switch back to the original UNet parameters.
                     ema_unet.restore(unet.parameters())
 
             # log quantizer embeddings samples
             if epoch % config.training.validation_epochs == 0 or epoch == config.training.num_train_epochs - 1:
-                if args.use_ema:
+                if config.use_ema:
                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                     ema_unet.store(unet.parameters())
                     ema_unet.copy_to(unet.parameters())
@@ -871,7 +889,7 @@ def main():
                     weight_dtype,
                     global_step,
                 )
-                if args.use_ema:
+                if config.use_ema:
                     # Switch back to the original UNet parameters.
                     ema_unet.restore(unet.parameters())
 
@@ -879,8 +897,8 @@ def main():
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
-        if args.push_to_hub:
-            save_model_card(config, repo_id, val_images, repo_folder=args.output_dir)
+        if config.push_to_hub:
+            save_model_card(config, repo_id, val_images, repo_folder=config.output_dir)
             upload_folder(
                 repo_id=repo_id,
                 folder_path=logging_dir,

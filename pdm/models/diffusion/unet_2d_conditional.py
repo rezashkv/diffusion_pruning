@@ -1343,7 +1343,11 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         start = 0
         for m in self.modules():
             if hasattr(m, "set_virtual_gate"):
-                end = start + m.get_gate_structure()
+                m_structure = m.get_gate_structure()
+                width = sum(m_structure["width"])
+                if "depth" in m_structure:
+                    width += sum(m_structure["depth"])
+                end = start + width
                 m.set_virtual_gate(arch_vector[:, start:end])
                 start = end
 

@@ -79,6 +79,9 @@ def parse_args():
         default=None, 
         help="The `run_name` argument passed to Accelerator.init_trackers"
     )
+    parser.add_argument(
+        "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
+    )
     parser.add_argument("--push_to_hub", action="store_true",
                         help="Whether or not to push the model to the Hub.")
     args = parser.parse_args()

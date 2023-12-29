@@ -38,15 +38,12 @@ class ClipLoss(nn.Module):
         # corresponding_width_indices is a list of tuples, each tuple contains the start and end index of a layer.
         # multiply the slice of the arch_vectors defined by the start and end index of a layer with the corresponding
         # depth element of the arch_vectors.
-        for i, (start, end) in enumerate(self.depth_corresponding_width_indices):
-            arch_vectors[:, start:end] = (arch_vectors[:, start:end].clone() *
-                                          arch_vectors[:, self.depth_indices[i]:self.depth_indices[i] + 1].clone())
-
-        # delete the columns of the arch_vectors that correspond to elements in self.depth_indices.
-        # arch_vectors_ = arch_vectors[:, self.width_indices_tensor]
-
-        # multiply the arch_vectors with the template
-        arch_vectors = arch_vectors.clone() * torch.sqrt(self.template).detach()
+        # for i, (start, end) in enumerate(self.depth_corresponding_width_indices):
+        #     arch_vectors[:, start:end] = (arch_vectors[:, start:end] *
+        #                                   arch_vectors[:, self.depth_indices[i]:self.depth_indices[i] + 1])
+        #
+        # # multiply the arch_vectors with the template
+        # arch_vectors = arch_vectors.clone() * torch.sqrt(self.template).detach()
 
         arch_vectors_similarity = F.softmax((arch_vectors @ arch_vectors.T) / self.temperature, dim=-1)
         texts_similarity = F.softmax((prompt_embeddings @ prompt_embeddings.T) / self.temperature, dim=-1)

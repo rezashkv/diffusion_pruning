@@ -40,7 +40,7 @@ data:
   train_data_dir: "training"
   train_data_file: "Train_GCC-training.tsv"
   train_bad_images_path: "/fs/nexus-scratch/rezashkv/research/projects/diffusion_pruning/data/train_cc3m_bad_images.txt"
-  max_train_samples: 20000000
+  max_train_samples: 500
 
   validation_data_dir: "validation"
   validation_data_file: "Validation_GCC-1.1.0-Validation.tsv"

@@ -9,28 +9,27 @@ from diffusers.utils import is_wandb_available, make_image_grid
 if is_wandb_available():
     import wandb
 
-
 logger = get_logger(__name__)
 
 
 def save_model_card(
-        args,
+        config,
         repo_id: str,
         images=None,
         repo_folder=None,
 ):
     img_str = ""
     if len(images) > 0:
-        image_grid = make_image_grid(images, 1, len(args.validation_prompts))
+        image_grid = make_image_grid(images, 1, len(config.data.prompts))
         image_grid.save(os.path.join(repo_folder, "val_imgs_grid.png"))
         img_str += "![val_imgs_grid](./val_imgs_grid.png)\n"
 
     yaml = f"""
 ---
 license: creativeml-openrail-m
-base_model: {args.pretrained_model_name_or_path}
+base_model: {config.pretrained_model_name_or_path}
 datasets:
-- {args.dataset_name}
+- {config.data.dataset_name}
 tags:
 - stable-diffusion
 - stable-diffusion-diffusers
@@ -42,7 +41,7 @@ inference: true
     model_card = f"""
 # Text-to-image finetuning - {repo_id}
 
-This pipeline was pruned from **{args.pretrained_model_name_or_path}** on the **{args.dataset_name}** dataset. Below are some example images generated with the finetuned pipeline using the following prompts: {args.validation_prompts}: \n
+This pipeline was pruned from **{config.pretrained_model_name_or_path}** on the **{config.data.dataset_name}** dataset. Below are some example images generated with the finetuned pipeline using the following prompts: {config.data.prompts}: \n
 {img_str}
 
 ## Pipeline usage
@@ -54,7 +53,7 @@ from diffusers import DiffusionPipeline
 import torch
 
 pipeline = DiffusionPipeline.from_pretrained("{repo_id}", torch_dtype=torch.float16)
-prompt = "{args.validation_prompts[0]}"
+prompt = "{config.data.prompts[0]}"
 image = pipeline(prompt).images[0]
 image.save("my_image.png")
 ```
@@ -63,13 +62,13 @@ image.save("my_image.png")
 
 These are the key hyperparameters used during training:
 
-* Epochs: {args.num_train_epochs}
-* Hypernet Learning rate: {args.hypernet_learning_rate}
-* Quantizer Learning rate: {args.quantizer_learning_rate}
-* Batch size: {args.train_batch_size}
-* Gradient accumulation steps: {args.gradient_accumulation_steps}
-* Image resolution: {args.resolution}
-* Mixed-precision: {args.mixed_precision}
+* Epochs: {config.training.num_train_epochs}
+* Hypernet Learning rate: {config.training.optim.hypernet_learning_rate}
+* Quantizer Learning rate: {config.training.optim.quantizer_learning_rate}
+* Batch size: {config.data.dataloader.train_batch_size}
+* Gradient accumulation steps: {config.training.gradient_accumulation_steps}
+* Image resolution: {config.model.unet.resolution}
+* Mixed-precision: {config.mixed_precision}
 
 """
     wandb_info = ""
@@ -89,19 +88,20 @@ More information on all the CLI arguments and the environment are available on y
         f.write(yaml + model_card)
 
 
-def log_validation(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, epoch):
+def generate_samples_from_prompts(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, args, config, accelerator,
+                                  weight_dtype, epoch):
     logger.info("Running validation... ")
 
     hyper_net.eval()
     quantizer.eval()
     pipeline = StableDiffusionPruningPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
+        config.pretrained_model_name_or_path,
         vae=accelerator.unwrap_model(vae),
         text_encoder=accelerator.unwrap_model(text_encoder),
         tokenizer=tokenizer,
         unet=accelerator.unwrap_model(unet),
         safety_checker=None,
-        revision=args.revision,
+        revision=config.revision,
         torch_dtype=weight_dtype,
         hyper_net=hyper_net,
         quantizer=quantizer,
@@ -110,22 +110,23 @@ def log_validation(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, arg
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
-    if args.enable_xformers_memory_efficient_attention:
+    if config.enable_xformers_memory_efficient_attention:
         pipeline.enable_xformers_memory_efficient_attention()
 
-    if args.seed is None:
+    if config.seed is None:
         generator = None
     else:
-        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+        generator = torch.Generator(device=accelerator.device).manual_seed(config.seed)
 
-    image_output_dir = os.path.join(args.output_dir, "validation_images", f"epoch_{epoch}")
+    image_output_dir = os.path.join(config["training"]["logging"]["logging_dir"], "prompt_images", f"epoch_{epoch}")
     os.makedirs(image_output_dir, exist_ok=True)
     images = []
-    for step in range(0, len(args.validation_prompts), args.validation_batch_size * accelerator.num_processes):
-        batch = args.validation_prompts[step:step + args.validation_batch_size * accelerator.num_processes]
+    for step in range(0, len(config.data.prompts), config.data.validation_batch_size * accelerator.num_processes):
+        batch = config.data.prompts[step:step + config.data.validation_batch_size * accelerator.num_processes]
         with torch.autocast("cuda"):
             with accelerator.split_between_processes(batch) as batch:
-                gen_images = pipeline(batch, num_inference_steps=args.num_inference_steps, generator=generator).images
+                gen_images = pipeline(batch, num_inference_steps=config.training.num_inference_steps,
+                                      generator=generator).images
                 gen_images = accelerator.gather(gen_images)
                 images += gen_images
                 for i, image in enumerate(gen_images):
@@ -133,7 +134,6 @@ def log_validation(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, arg
                         image.save(os.path.join(image_output_dir, f"{batch[i]}.png"))
                     except Exception as e:
                         logger.error(f"Error saving image {batch[i]}: {e}")
-
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
@@ -143,7 +143,7 @@ def log_validation(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, arg
             tracker.log(
                 {
                     "validation": [
-                        wandb.Image(image, caption=f"{i}: {args.validation_prompts[i]}")
+                        wandb.Image(image, caption=f"{i}: {config.data.prompts[i]}")
                         for i, image in enumerate(images)
                     ]
                 }
@@ -157,20 +157,20 @@ def log_validation(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, arg
     return images
 
 
-def log_quantizer_embedding_samples(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, args, accelerator,
+def log_quantizer_embedding_samples(hyper_net, quantizer, vae, text_encoder, tokenizer, unet, args, config, accelerator,
                                     weight_dtype, epoch):
     logger.info("Sampling from quantizer... ")
 
     hyper_net.eval()
     quantizer.eval()
     pipeline = StableDiffusionPruningPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
+        config.pretrained_model_name_or_path,
         vae=accelerator.unwrap_model(vae),
         text_encoder=accelerator.unwrap_model(text_encoder),
         tokenizer=tokenizer,
         unet=accelerator.unwrap_model(unet),
         safety_checker=None,
-        revision=args.revision,
+        revision=config.revision,
         torch_dtype=weight_dtype,
         hyper_net=hyper_net,
         quantizer=quantizer,
@@ -179,15 +179,16 @@ def log_quantizer_embedding_samples(hyper_net, quantizer, vae, text_encoder, tok
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
-    if args.enable_xformers_memory_efficient_attention:
+    if config.enable_xformers_memory_efficient_attention:
         pipeline.enable_xformers_memory_efficient_attention()
 
-    if args.seed is None:
+    if config.seed is None:
         generator = None
     else:
-        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+        generator = torch.Generator(device=accelerator.device).manual_seed(config.seed)
 
-    image_output_dir = os.path.join(args.output_dir, "quantizer_embedding_images", f"epoch_{epoch}")
+    image_output_dir = os.path.join(config["training"]["logging"]["logging_dir"], "quantizer_embedding_images",
+                                    f"epoch_{epoch}")
     os.makedirs(image_output_dir, exist_ok=True)
 
     images = []
@@ -197,13 +198,13 @@ def log_quantizer_embedding_samples(hyper_net, quantizer, vae, text_encoder, tok
     else:
         n_e = pipeline.quantizer.n_e
     quantizer_embedding_gumbel_sigmoid = []
-    for step in range(0, n_e, args.validation_batch_size * accelerator.num_processes):
-        indices = torch.arange(step, step + args.validation_batch_size * accelerator.num_processes,
+    for step in range(0, n_e, config.data.validation_batch_size * accelerator.num_processes):
+        indices = torch.arange(step, step + config.data.validation_batch_size * accelerator.num_processes,
                                device=accelerator.device)
         with torch.autocast("cuda"):
             with accelerator.split_between_processes(indices) as indices:
                 gen_images, quantizer_embed_gs = pipeline.quantizer_samples(indices=indices,
-                                                                            num_inference_steps=args.num_inference_steps,
+                                                                            num_inference_steps=config.training.num_inference_steps,
                                                                             generator=generator)
                 gen_images = gen_images.images
                 gen_images = accelerator.gather(gen_images)

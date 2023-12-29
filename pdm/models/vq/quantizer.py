@@ -130,11 +130,11 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         if self.sane_index_shape:
             min_encoding_indices = min_encoding_indices.reshape(z_q.shape[0])
 
-        z_q_depth = z_q[:, self.depth_indices]
-        z_q_depth = importance_gumble_softmax_sample(z_q_depth, temperature=self.temperature, offset=self.base)
+        z_q_depth = z_q[:, self.depth_indices].clone()
+        z_q_depth = importance_gumble_softmax_sample(z_q_depth.clone(), temperature=self.temperature, offset=self.base)
 
         z_q = gumbel_softmax_sample(z_q, temperature=self.temperature, offset=self.base)
-        # z_q[:, self.depth_order] = z_q_depth
+        z_q[:, self.depth_order] = z_q_depth.clone()
 
         if not self.training:
             z_q = hard_concrete(z_q)
