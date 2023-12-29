@@ -21,9 +21,9 @@ def importance_gumble_softmax_sample(logits, temperature, offset=0):
     x = torch.cumsum(x, dim=1)
     x = torch.flip(x, dims=[1])
 
-    eps = 1e-8
+    eps = 1e-4
     # inverse sigmoid function. add eps to avoid numerical instability.
-    x = torch.log(x - eps) - torch.log1p(-x)
+    x = torch.log(x - eps) - torch.log1p(-(x - eps))
 
     gumbel_sample = sample_gumbel(x.size())
     if logits.is_cuda:

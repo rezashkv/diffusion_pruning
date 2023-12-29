@@ -130,11 +130,17 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         if self.sane_index_shape:
             min_encoding_indices = min_encoding_indices.reshape(z_q.shape[0])
 
-        z_q_depth = z_q[:, self.depth_indices].clone()
-        z_q_depth = importance_gumble_softmax_sample(z_q_depth.clone(), temperature=self.temperature, offset=self.base)
+        z_q_cloned = z_q.clone()
+        z_q_depth = z_q_cloned[:, self.depth_indices]
+        z_q_depth = importance_gumble_softmax_sample(z_q_depth, temperature=self.temperature, offset=self.base)
 
-        z_q = gumbel_softmax_sample(z_q, temperature=self.temperature, offset=self.base)
-        z_q[:, self.depth_order] = z_q_depth.clone()
+        width_indices = [i for i in range(z_q.shape[1]) if i not in self.depth_indices]
+        z_q_width = z_q_cloned[:, width_indices]
+        z_q_width = gumbel_softmax_sample(z_q_width, temperature=self.temperature, offset=self.base)
+
+        z_q = torch.ones_like(z_q_cloned, dtype=torch.float32, device=z_q_cloned.device)
+        z_q[:, self.depth_order] = z_q_depth
+        z_q[:, width_indices] = z_q_width
 
         if not self.training:
             z_q = hard_concrete(z_q)

@@ -38,14 +38,14 @@ class ClipLoss(nn.Module):
         # corresponding_width_indices is a list of tuples, each tuple contains the start and end index of a layer.
         # multiply the slice of the arch_vectors defined by the start and end index of a layer with the corresponding
         # depth element of the arch_vectors.
-        # for i, (start, end) in enumerate(self.depth_corresponding_width_indices):
-        #     arch_vectors[:, start:end] = (arch_vectors[:, start:end] *
-        #                                   arch_vectors[:, self.depth_indices[i]:self.depth_indices[i] + 1])
-        #
-        # # multiply the arch_vectors with the template
-        # arch_vectors = arch_vectors.clone() * torch.sqrt(self.template).detach()
+        arch_vectors_clone = arch_vectors.clone()
+        for i, (start, end) in enumerate(self.depth_corresponding_width_indices):
+            arch_vectors_clone[:, start:end] = (arch_vectors[:, start:end] * arch_vectors[:, self.depth_indices[i]:self.depth_indices[i] + 1])
 
-        arch_vectors_similarity = F.softmax((arch_vectors @ arch_vectors.T) / self.temperature, dim=-1)
+        # multiply the arch_vectors with the template
+        arch_vectors_ = arch_vectors_clone * torch.sqrt(self.template).detach()
+
+        arch_vectors_similarity = F.softmax((arch_vectors_ @ arch_vectors_.T) / self.temperature, dim=-1)
         texts_similarity = F.softmax((prompt_embeddings @ prompt_embeddings.T) / self.temperature, dim=-1)
         loss = F.cross_entropy(arch_vectors_similarity.T, texts_similarity.T, reduction='mean')
         return loss.mean()
