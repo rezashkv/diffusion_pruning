@@ -45,7 +45,7 @@ data:
   validation_data_dir: "validation"
   validation_data_file: "Validation_GCC-1.1.0-Validation.tsv"
   validation_bad_images_path: "/fs/nexus-scratch/rezashkv/research/projects/diffusion_pruning/data/validation_cc3m_bad_images.txt"
-  max_val_samples: null
+  max_validation_samples: null
 
   image_column: "image"
   caption_column: "caption"

@@ -13,7 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 
-import argparse
 import logging
 from typing import Dict
 
@@ -23,7 +22,6 @@ import random
 import shutil
 import sys
 import datetime
-import pickle
 
 from pathlib import Path
 from omegaconf import OmegaConf, DictConfig
@@ -31,7 +29,6 @@ from omegaconf import OmegaConf, DictConfig
 import PIL
 import accelerate
 import numpy as np
-import pandas as pd
 import requests
 import torch
 import torch.nn.functional as F
@@ -67,6 +64,7 @@ from pdm.utils.arg_utils import parse_args
 from pdm.utils.metric_utils import compute_snr
 from pdm.datasets.cc3m import load_cc3m_dataset
 from pdm.datasets.laion_aes import load_main_laion_dataset
+from pdm.training.validation import validation
 
 if is_wandb_available():
     import wandb
@@ -550,6 +548,15 @@ def main():
         num_workers=config["data"]["dataloader"]["dataloader_num_workers"],
     )
 
+    if validation_dataset is not None:
+        validation_dataloader = torch.utils.data.DataLoader(
+            validation_dataset,
+            shuffle=False,
+            collate_fn=collate_fn,
+            batch_size=config["data"]["dataloader"]["validation_batch_size"] * accelerator.num_processes,
+            num_workers=config["data"]["dataloader"]["dataloader_num_workers"],
+        )
+
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / config.training.gradient_accumulation_steps)
@@ -617,7 +624,8 @@ def main():
                                   init_kwargs={"wandb": {"name": config.wandb_run_name}}
                                   )
     # Train!
-    total_batch_size = config.data.dataloader.train_batch_size * accelerator.num_processes * config.training.gradient_accumulation_steps
+    total_batch_size = (config.data.dataloader.train_batch_size * accelerator.num_processes *
+                        config.training.gradient_accumulation_steps)
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
@@ -845,6 +853,10 @@ def main():
 
             if global_step >= config.training.max_train_steps:
                 break
+
+        if validation_dataset is not None:
+            validation(validation_dataloader, hyper_net, quantizer, unet, vae, text_encoder, noise_scheduler, config, accelerator,
+                   global_step, weight_dtype)
 
         if accelerator.is_main_process:
 
