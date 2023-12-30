@@ -88,6 +88,7 @@ def get_down_block(
         attention_head_dim=None,
         downsample_type=None,
         dropout=0.0,
+        gated_ff=False
 ):
     # If attn head dim is not defined, we default it to the number of heads
     if attention_head_dim is None:
@@ -244,6 +245,7 @@ def get_down_block(
             upcast_attention=upcast_attention,
             resnet_time_scale_shift=resnet_time_scale_shift,
             attention_type=attention_type,
+            gated_ff=gated_ff
         )
     elif down_block_type == "SimpleCrossAttnDownBlock2D":
         if cross_attention_dim is None:
@@ -373,6 +375,7 @@ def get_up_block(
         attention_head_dim=None,
         upsample_type=None,
         dropout=0.0,
+        gated_ff=False
 ):
     # If attn head dim is not defined, we default it to the number of heads
     if attention_head_dim is None:
@@ -512,6 +515,7 @@ def get_up_block(
             upcast_attention=upcast_attention,
             resnet_time_scale_shift=resnet_time_scale_shift,
             attention_type=attention_type,
+            gated_ff=gated_ff
         )
     elif up_block_type == "SimpleCrossAttnUpBlock2D":
         if cross_attention_dim is None:
@@ -786,6 +790,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
             cross_attention_norm: Optional[str] = None,
             addition_embed_type_num_heads=64,
             total_flops=None,
+            gated_ff: bool = False
     ):
         super().__init__()
 
@@ -1037,6 +1042,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
                 cross_attention_norm=cross_attention_norm,
                 attention_head_dim=attention_head_dim[i] if attention_head_dim[i] is not None else output_channel,
                 dropout=dropout,
+                gated_ff=gated_ff
             )
             self.down_blocks.append(down_block)
 
@@ -1058,6 +1064,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
                 use_linear_projection=use_linear_projection,
                 upcast_attention=upcast_attention,
                 attention_type=attention_type,
+                gated_ff=gated_ff
             )
         elif mid_block_type == "UNetMidBlock2DSimpleCrossAttn":
             self.mid_block = UNetMidBlock2DSimpleCrossAttn(
@@ -1178,7 +1185,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
             )
 
         self.total_flops = total_flops
-        self.structure = [[], []]
+        self.structure = {'width': [], 'depth': []}
 
     @property
     def attn_processors(self) -> Dict[str, AttentionProcessor]:
@@ -1325,19 +1332,51 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
             module.gradient_checkpointing = value
 
     def get_structure(self):
-        structure = []
-        for m in self.modules():
-            if hasattr(m, "get_gate_structure"):
-                structure.append(m.get_gate_structure())
-        self.structure = structure
-        structure_size = []
-        for elem in self.structure:
-            if "width" in elem:
-                for w in elem["width"]:
-                    structure_size.append(w)
-            if "depth" in elem:
-                structure_size.append(elem["depth"][0])
-        return structure, structure_size
+        if len(self.structure['width']) == 0:
+            structure = {'width': [], 'depth': []}
+
+            # Down Blocks
+            for m in self.down_blocks:
+                assert hasattr(m, "get_gate_structure")
+                m_structure = m.get_gate_structure()
+                assert len(m_structure) == 2
+                assert len(m_structure['width']) == len(m_structure['depth'])
+                structure['width'] = structure['width'] + m_structure['width']
+                structure['depth'] = structure['depth'] + m_structure['depth']
+            
+            assert hasattr(self.mid_block, "get_gate_structure")
+            mid_structure = self.mid_block.get_gate_structure()
+            assert len(mid_structure) == 2
+            assert len(mid_structure['width']) == len(mid_structure['depth'])
+            structure['width'] = structure['width'] + mid_structure['width']
+            structure['depth'] = structure['depth'] + mid_structure['depth']
+
+            # Up Blocks
+            for m in self.up_blocks:
+                assert hasattr(m, "get_gate_structure")
+                m_structure = m.get_gate_structure()
+                assert len(m_structure) == 2
+                assert len(m_structure['width']) == len(m_structure['depth'])
+                structure['width'] = structure['width'] + m_structure['width']
+                structure['depth'] = structure['depth'] + m_structure['depth']
+
+            self.structure = structure
+        return structure
+
+    # def get_structure(self):
+    #     structure = []
+    #     for m in self.modules():
+    #         if hasattr(m, "get_gate_structure"):
+    #             structure.append(m.get_gate_structure())
+    #     self.structure = structure
+    #     structure_size = []
+    #     for elem in self.structure:
+    #         if "width" in elem:
+    #             for w in elem["width"]:
+    #                 structure_size.append(w)
+    #         if "depth" in elem:
+    #             structure_size.append(elem["depth"][0])
+    #     return structure, structure_size
 
     def set_structure(self, arch_vector):
         start = 0

@@ -21,14 +21,19 @@ model:
       - CrossAttnUpBlock2DHalfGated
       - CrossAttnUpBlock2DHalfGated
 
+    gated_ff: false
+
   hypernet:
     hypernet_T: 0.4
     hypernet_base: 3.0
     hypernet_sparsity: 0
+    weight_norm: true
+    inner_dim: 1024
 
   quantizer:
     num_arch_vq_codebook_embeddings: 256
     arch_vq_beta: 0.25
+    depth_order: [-1, -2, -3, -4, -5, 0, 1, 2, -6, -7, 3, 4]
 
 
 data:
@@ -39,12 +44,13 @@ data:
 
   train_data_dir: "training"
   train_data_file: "Train_GCC-training.tsv"
-  train_bad_images_path: "/fs/nexus-scratch/rezashkv/research/projects/diffusion_pruning/data/train_cc3m_bad_images.txt"
+  train_bad_images_path: "./data/train_cc3m_bad_images.txt"
   max_train_samples: 500
 
   validation_data_dir: "validation"
   validation_data_file: "Validation_GCC-1.1.0-Validation.tsv"
-  validation_bad_images_path: "/fs/nexus-scratch/rezashkv/research/projects/diffusion_pruning/data/validation_cc3m_bad_images.txt"
+  # validation_bad_images_path: "/fs/nexus-scratch/rezashkv/research/projects/diffusion_pruning/data/validation_cc3m_bad_images.txt"
+  validation_bad_images_path: "./data/train_cc3m_bad_images.txt"
   max_validation_samples: 100
 
   image_column: "image"
@@ -110,10 +116,9 @@ training:
     hub_model_id: null
 
   logging:
-    logging_dir: "/fs/nexus-scratch/rezashkv/research/logs/"
+    logging_dir: "/fs/cbcb-scratch/aliganj/results"
     report_to: "wandb"
     checkpointing_steps: 1000
     checkpoints_total_limit: 1
     resume_from_checkpoint: "latest"
     tracker_project_name: "text2image-dynamic-pruning"
-

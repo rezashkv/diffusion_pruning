@@ -7,7 +7,8 @@ from torch import nn
 from pdm.utils.estimation_utils import gumbel_softmax_sample, hard_concrete, importance_gumble_softmax_sample
 from diffusers import ModelMixin
 
-DEPTH_ORDER = [-1, -2, -3, -4, -5, 0, 1, 2, -6, -7, 3, 4]
+# DEPTH_ORDER = [-1, -2, -3, -4, -5, 0, 1, 2, -6, -7, 3, 4]
+
 
 class StructureVectorQuantizer(ModelMixin, ConfigMixin):
     """
@@ -22,28 +23,34 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
     def __init__(
             self,
             n_e: int,
-            structure: list[dict],
+            # structure: list[dict],
+            structure: dict,
             beta: float = 0.25,
             remap=None,
             unknown_index: str = "random",
             sane_index_shape: bool = False,
             temperature: float = 0.4,
             base: int = 2,
+            depth_order: list = []
     ):
         super().__init__()
 
         vq_embed_dim = 0
         depth_indices = []
-        for elem in structure:
-            if "width" in elem:
-                vq_embed_dim += sum(elem["width"])
-            if "depth" in elem:
-                depth_indices.append(vq_embed_dim)
-                vq_embed_dim += sum(elem["depth"])
+        # for elem in structure:
+        #     if "width" in elem:
+        #         vq_embed_dim += sum(elem["width"])
+        #     if "depth" in elem:
+        #         depth_indices.append(vq_embed_dim)
+        #         vq_embed_dim += sum(elem["depth"])
+
+        vq_embed_dim += sum(structure["width"])
+        depth_indices.append(vq_embed_dim)
+        vq_embed_dim += sum(structure["depth"])
 
         self.depth_indices = depth_indices
-        self.depth_order = DEPTH_ORDER
-        depth_order = [i % len(depth_indices) for i in DEPTH_ORDER]
+        self.depth_order = depth_order
+        depth_order = [i % len(depth_indices) for i in depth_order]
         for i in range(len(depth_indices)):
             if i not in depth_order:
                 self.depth_order.append(i)
