@@ -25,10 +25,9 @@ class SimpleGate(nn.Module):
 
 class HyperStructure(ModelMixin, ConfigMixin):
     @register_to_config
-    def __init__(self, structure, input_dim=1024, seq_len=77, T=0.4, sparsity=0, base=2, wn_flag=True):
+    def __init__(self, structure, input_dim=1024, seq_len=77, sparsity=0, wn_flag=True):
         super(HyperStructure, self).__init__()
 
-        self.T = T
         self.structure = structure
         self.input_dim = input_dim
 
@@ -50,7 +49,6 @@ class HyperStructure(ModelMixin, ConfigMixin):
                                 in range(len(structure))]
 
         self.mh_fc = torch.nn.ModuleList(self.linear_list)
-        self.base = base
 
         self.iteration = 0
 

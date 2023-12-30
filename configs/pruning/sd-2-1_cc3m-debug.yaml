@@ -22,11 +22,11 @@ model:
       - CrossAttnUpBlock2DHalfGated
 
   hypernet:
-    hypernet_T: 0.4
-    hypernet_base: 3.0
     hypernet_sparsity: 0
 
   quantizer:
+    quantizer_T: 0.4
+    quantizer_base: 3.0
     num_arch_vq_codebook_embeddings: 256
     arch_vq_beta: 0.25
 

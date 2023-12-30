@@ -83,7 +83,6 @@ DATASET_NAME_MAPPING = {
 
 def main():
     torch.autograd.set_detect_anomaly(True)
-    # configs = OmegaConf.load(base_config.base_config_path)
     args = parse_args()
     config = OmegaConf.load(args.base_config_path)
     # add args to config
@@ -221,15 +220,13 @@ def main():
     unet_structure, unet_structure_widths = unet.get_structure()
     hyper_net = HyperStructure(input_dim=text_encoder.config.hidden_size,
                                seq_len=text_encoder.config.max_position_embeddings,
-                               structure=unet_structure_widths,
-                               T=config["model"]["hypernet"]["hypernet_T"],
-                               base=config["model"]["hypernet"]["hypernet_base"])
+                               structure=unet_structure_widths)
 
     quantizer = StructureVectorQuantizer(n_e=config["model"]["quantizer"]["num_arch_vq_codebook_embeddings"],
                                          structure=unet_structure,
                                          beta=config["model"]["quantizer"]["arch_vq_beta"],
-                                         temperature=config["model"]["hypernet"]["hypernet_T"],
-                                         base=config["model"]["hypernet"]["hypernet_base"])
+                                         temperature=config["model"]["quantizer"]["quantizer_T"],
+                                         base=config["model"]["quantizer"]["quantizer_base"])
 
     r_loss = ResourceLoss(p=config["training"]["losses"]["resource_loss"]["pruning_target"],
                           loss_type=config["training"]["losses"]["resource_loss"]["type"])
@@ -860,7 +857,7 @@ def main():
 
         if accelerator.is_main_process:
 
-            # generate some validation images
+            # generate some images from prompts
             if config.data.prompts is not None and (epoch % config.training.validation_epochs == 0 or
                                                     epoch == config.training.num_train_epochs - 1):
                 if config.use_ema:

@@ -2,8 +2,11 @@ import os
 import pickle
 import PIL
 import pandas as pd
+from PIL import ImageFile
 from accelerate.logging import get_logger
 from datasets import Dataset
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 logger = get_logger(__name__)
 
