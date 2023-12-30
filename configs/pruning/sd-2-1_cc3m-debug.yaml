@@ -45,13 +45,13 @@ data:
   train_data_dir: "training"
   train_data_file: "Train_GCC-training.tsv"
   train_bad_images_path: "./data/train_cc3m_bad_images.txt"
-  max_train_samples: 500
+  max_train_samples: null
 
   validation_data_dir: "validation"
   validation_data_file: "Validation_GCC-1.1.0-Validation.tsv"
   # validation_bad_images_path: "/fs/nexus-scratch/rezashkv/research/projects/diffusion_pruning/data/validation_cc3m_bad_images.txt"
-  validation_bad_images_path: "./data/train_cc3m_bad_images.txt"
-  max_validation_samples: 100
+  validation_bad_images_path: "./data/validation_cc3m_bad_images.txt"
+  max_validation_samples: null
 
   image_column: "image"
   caption_column: "caption"

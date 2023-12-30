@@ -7,31 +7,34 @@ class ClipLoss(nn.Module):
     def __init__(self, structure, temperature=2.0):
         super().__init__()
         self.temperature = temperature
+
         self.structure = structure
+        self.width_list = [w for sub_width_list in self.structure['width'] for w in sub_width_list]
+        self.depth_list = [d for sub_depth_list in self.structure['depth'] for d in sub_depth_list]
 
-        template = []
-        depth_indices = []
-        depth_corresponding_width_indices = []
-        dim = 0
+        # template = []
+        # depth_indices = []
+        # depth_corresponding_width_indices = []
+        # dim = 0
 
-        for elem in self.structure:
-            if "width" in elem:
-                elem["width"] = sum(elem["width"])
-                dim += elem["width"]
-                template.append(elem["width"])
-            if "depth" in elem:
-                elem["depth"] = sum(elem["depth"])
-                template.append(elem["depth"])
-                depth_indices.append(dim)
-                depth_corresponding_width_indices.append((dim - elem["width"], dim))
-                dim += elem["depth"]
+        # for elem in self.structure:
+        #     if "width" in elem:
+        #         elem["width"] = sum(elem["width"])
+        #         dim += elem["width"]
+        #         template.append(elem["width"])
+        #     if "depth" in elem:
+        #         elem["depth"] = sum(elem["depth"])
+        #         template.append(elem["depth"])
+        #         depth_indices.append(dim)
+        #         depth_corresponding_width_indices.append((dim - elem["width"], dim))
+        #         dim += elem["depth"]
 
-        self.depth_indices = depth_indices
-        self.depth_corresponding_width_indices = depth_corresponding_width_indices
-        self.width_indices_tensor = torch.tensor([i for i in range(dim) if i not in depth_indices])
+        # self.depth_indices = depth_indices
+        # self.depth_corresponding_width_indices = depth_corresponding_width_indices
+        # self.width_indices_tensor = torch.tensor([i for i in range(dim) if i not in depth_indices])
 
-        self.template = 1.0 / torch.tensor([elem for elem in template for _ in range(elem)],
-                                           dtype=torch.float32).requires_grad_(False)
+        # self.template = 1.0 / torch.tensor([elem for elem in template for _ in range(elem)],
+        #                                    dtype=torch.float32).requires_grad_(False)
 
     def forward(self, prompt_embeddings, arch_vectors):
         self.template = self.template.to(prompt_embeddings.device)
