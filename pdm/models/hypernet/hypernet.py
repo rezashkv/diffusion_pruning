@@ -25,13 +25,17 @@ class SimpleGate(nn.Module):
 
 class HyperStructure(ModelMixin, ConfigMixin):
     @register_to_config
-    def __init__(self, structure, input_dim=1024, seq_len=77, sparsity=0, wn_flag=True):
+    def __init__(self, structure, input_dim=1024, inner_dim=1024, seq_len=77, sparsity=0, wn_flag=True):
         super(HyperStructure, self).__init__()
 
         self.structure = structure
         self.input_dim = input_dim
 
-        gru_hidden_dim = 2 * self.input_dim
+        self.width_list = [w for sub_width_list in self.structure['width'] for w in sub_width_list]
+        self.depth_list = [d for sub_depth_list in self.structure['depth'] for d in sub_depth_list]
+
+        # gru_hidden_dim = 2 * self.input_dim
+        gru_hidden_dim = inner_dim
 
         self.Bi_GRU = nn.GRU(self.input_dim, gru_hidden_dim, bidirectional=True)
 
@@ -42,11 +46,14 @@ class HyperStructure(ModelMixin, ConfigMixin):
         self.sparsity = [sparsity] * len(structure)
 
         if wn_flag:
-            self.linear_list = [weight_norm(nn.Linear(2 * gru_hidden_dim, structure[i], bias=False))
-                                for i in range(len(structure))]
+            self.linear_list = [weight_norm(nn.Linear(2 * gru_hidden_dim, self.width_list[i], bias=False))
+                                for i in range(len(self.width_list))]
+            self.linear_list.append(weight_norm(nn.Linear(2 * gru_hidden_dim, sum(self.depth_list), bias=False)))
+
         else:
-            self.linear_list = [nn.Linear(2 * gru_hidden_dim, structure[i], bias=False) for i
-                                in range(len(structure))]
+            self.linear_list = [nn.Linear(2 * gru_hidden_dim, self.width_list[i], bias=False) for i
+                                in range(len(self.width_list))]
+            self.linear_list.append(nn.Linear(2 * gru_hidden_dim, sum(self.depth_list), bias=False))
 
         self.mh_fc = torch.nn.ModuleList(self.linear_list)
 
@@ -63,8 +70,8 @@ class HyperStructure(ModelMixin, ConfigMixin):
             x = x.cuda()
             self.h0 = self.h0.cuda()
         outputs, hn = self.Bi_GRU(x, self.h0)
-        outputs = outputs.sum(dim=1).unsqueeze(1).expand(outputs.size(0), len(self.structure), outputs.size(2))
-        outputs = [F.relu(self.bn1(outputs[:, i, :])) for i in range(len(self.structure))]
+        outputs = outputs.sum(dim=1).unsqueeze(1).expand(outputs.size(0), len(self.mh_fc), outputs.size(2))
+        outputs = [F.relu(self.bn1(outputs[:, i, :])) for i in range(len(self.mh_fc))]
         outputs = [self.mh_fc[i](outputs[i]) for i in range(len(self.mh_fc))]
 
         out = torch.cat(outputs, dim=1)

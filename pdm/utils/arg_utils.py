@@ -84,6 +84,10 @@ def parse_args():
     )
     parser.add_argument("--push_to_hub", action="store_true",
                         help="Whether or not to push the model to the Hub.")
+    parser.add_argument("--local_rank", type=int, default=-1,
+                        help="For distributed training: local_rank")
+
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:

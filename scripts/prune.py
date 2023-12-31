@@ -140,16 +140,20 @@ def main():
         mid_block_type=config.model.unet.unet_mid_block,
         up_block_types=config.model.unet.unet_up_blocks,
     )
-    unet_structure, unet_structure_widths = unet.get_structure()
+    # unet_structure, unet_structure_widths = unet.get_structure()
+    unet_structure = unet.get_structure()
     hyper_net = HyperStructure(input_dim=text_encoder.config.hidden_size,
                                seq_len=text_encoder.config.max_position_embeddings,
-                               structure=unet_structure_widths)
+                               structure=unet_structure,
+                               wn_flag=config.model.hypernet.weight_norm,
+                               inner_dim=config.model.hypernet.inner_dim)
 
     quantizer = StructureVectorQuantizer(n_e=config.model.quantizer.num_arch_vq_codebook_embeddings,
                                          structure=unet_structure,
                                          beta=config.model.quantizer.arch_vq_beta,
                                          temperature=config.model.quantizer.quantizer_T,
-                                         base=config.model.quantizer.quantizer_base)
+                                         base=config.model.quantizer.quantizer_base,
+                                         depth_order=config.model.quantizer.depth_order)
 
     r_loss = ResourceLoss(p=config.training.losses.resource_loss.pruning_target,
                           loss_type=config.training.losses.resource_loss.type)

@@ -7,7 +7,9 @@ from torch import nn
 from pdm.utils.estimation_utils import gumbel_softmax_sample, hard_concrete, importance_gumble_softmax_sample
 from diffusers import ModelMixin
 
-DEPTH_ORDER = [-1, -2, -3, -4, -5, 0, 1, 2, -6, -7, 3, 4]
+
+# DEPTH_ORDER = [-1, -2, -3, -4, -5, 0, 1, 2, -6, -7, 3, 4]
+
 
 class StructureVectorQuantizer(ModelMixin, ConfigMixin):
     """
@@ -22,36 +24,40 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
     def __init__(
             self,
             n_e: int,
-            structure: list[dict],
+            # structure: list[dict],
+            structure: dict,
             beta: float = 0.25,
             remap=None,
             unknown_index: str = "random",
             sane_index_shape: bool = False,
             temperature: float = 0.4,
             base: int = 2,
+            depth_order: list = []
     ):
         super().__init__()
 
         vq_embed_dim = 0
         depth_indices = []
-        for elem in structure:
-            if "width" in elem:
-                vq_embed_dim += sum(elem["width"])
-            if "depth" in elem:
+        for w_config, d_config in zip(structure['width'], structure['depth']):
+            vq_embed_dim += sum(w_config)
+            if d_config == [1]:
                 depth_indices.append(vq_embed_dim)
-                vq_embed_dim += sum(elem["depth"])
-
-        self.depth_indices = depth_indices
-        self.depth_order = DEPTH_ORDER
-        depth_order = [i % len(depth_indices) for i in DEPTH_ORDER]
-        for i in range(len(depth_indices)):
-            if i not in depth_order:
-                self.depth_order.append(i)
+                vq_embed_dim += 1
 
         self.n_e = n_e
         self.vq_embed_dim = vq_embed_dim
         self.beta = beta
+
+
         self.structure = structure
+        self.width_list = [w for sub_width_list in self.structure['width'] for w in sub_width_list]
+        self.depth_list = [d for sub_depth_list in self.structure['depth'] for d in sub_depth_list]
+
+        self.depth_order = depth_order
+        depth_order = [i % len(depth_indices) for i in depth_order]
+        for i in range(sum(self.depth_list)):
+            if i not in depth_order:
+                self.depth_order.append(i)
 
         self.embedding = nn.Embedding(self.n_e, self.vq_embed_dim)
         nn.init.orthogonal_(self.embedding.weight)
@@ -66,7 +72,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
                 self.unknown_index = self.re_embed
                 self.re_embed = self.re_embed + 1
             print(
-                f"Remapping {self.n_e} indices to {self.re_embed} indices. "
+                f"Remapping {self.n_e} indices to {self.re_embed} indices."
                 f"Using {self.unknown_index} for unknown indices."
             )
         else:
@@ -130,22 +136,33 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         if self.sane_index_shape:
             min_encoding_indices = min_encoding_indices.reshape(z_q.shape[0])
 
-        z_q_cloned = z_q.clone()
-        z_q_depth = z_q_cloned[:, self.depth_indices]
-        z_q_depth = importance_gumble_softmax_sample(z_q_depth, temperature=self.temperature, offset=self.base)
+        # z_q_cloned = z_q.clone()
+        # z_q_depth = z_q_cloned[:, self.depth_indices]
+        num_width = sum(self.width_list)
+        z_q_width = z_q[:, :num_width]
+        z_q_depth = z_q[:, num_width:]
 
-        width_indices = [i for i in range(z_q.shape[1]) if i not in self.depth_indices]
-        z_q_width = z_q_cloned[:, width_indices]
-        z_q_width = gumbel_softmax_sample(z_q_width, temperature=self.temperature, offset=self.base)
+        z_q_depth_b = importance_gumble_softmax_sample(z_q_depth, temperature=self.temperature, offset=self.base)[:,
+                      self.depth_order]
 
-        z_q = torch.ones_like(z_q_cloned, dtype=torch.float32, device=z_q_cloned.device)
-        z_q[:, self.depth_order] = z_q_depth
-        z_q[:, width_indices] = z_q_width
+        # width_indices = [i for i in range(z_q.shape[1]) if i not in self.depth_indices]
+        # z_q_width = z_q_cloned[:, width_indices]
+        # z_q_width = gumbel_softmax_sample(z_q_width, temperature=self.temperature, offset=self.base)
+
+        z_q_width_b = gumbel_softmax_sample(z_q_width, temperature=self.temperature, offset=self.base)
+
+        # z_q = torch.ones_like(z_q_cloned, dtype=torch.float32, device=z_q_cloned.device)
+        # z_q[:, self.depth_order] = z_q_depth
+        # z_q[:, width_indices] = z_q_width
+
+        z_q_out = torch.cat([z_q_width_b, z_q_depth_b], dim=1)
 
         if not self.training:
-            z_q = hard_concrete(z_q)
+            # z_q = hard_concrete(z_q)
+            z_q_out = hard_concrete(z_q_out)
 
-        return z_q, loss, (perplexity, min_encodings, min_encoding_indices)
+        # return z_q, loss, (perplexity, min_encodings, min_encoding_indices)
+        return z_q_out, loss, (perplexity, min_encodings, min_encoding_indices)
 
     def get_codebook_entry(self, indices: torch.LongTensor, shape: Tuple[int, ...] = None) -> torch.FloatTensor:
         # shape specifying (batch, dim)
@@ -164,16 +181,22 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
         return z_q
 
-    def get_codebook_entry_gumbel_sigmoid(self, indices: torch.LongTensor, shape: Tuple[int, ...] = None) -> torch.FloatTensor:
+    def get_codebook_entry_gumbel_sigmoid(self, indices: torch.LongTensor,
+                                          shape: Tuple[int, ...] = None) -> torch.FloatTensor:
         z_q = self.get_codebook_entry(indices, shape)
 
-        z_q_depth = z_q[:, self.depth_indices]
-        z_q_depth = importance_gumble_softmax_sample(z_q_depth, temperature=self.temperature, offset=self.base)
+        num_width = sum(self.width_list)
+        z_q_width = z_q[:, :num_width]
+        z_q_depth = z_q[:, num_width:]
 
-        z_q = gumbel_softmax_sample(z_q, temperature=self.temperature, offset=self.base)
-        z_q[:, self.depth_order] = z_q_depth
+        z_q_depth_b = importance_gumble_softmax_sample(z_q_depth, temperature=self.temperature, offset=self.base)[:,
+                      self.depth_order]
 
-        return z_q
+        z_q_width_b = gumbel_softmax_sample(z_q_width, temperature=self.temperature, offset=self.base)
+
+        z_q_out = torch.cat([z_q_width_b, z_q_depth_b], dim=1)
+
+        return z_q_out
 
     def print_param_stats(self):
         for name, param in self.named_parameters():
