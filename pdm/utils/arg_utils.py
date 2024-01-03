@@ -11,6 +11,13 @@ def parse_args():
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
+        "--clip_model_name_or_path",
+        type=str,
+        default="laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
+        required=False,
+        help="Path to pretrained clip model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
         "--base_config_path",
         type=str,
         required=True,

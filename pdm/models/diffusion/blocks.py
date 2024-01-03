@@ -408,7 +408,7 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
             self.ff = FeedForward(dim, dropout=dropout, activation_fn=activation_fn, final_dropout=final_dropout)
 
         self.structure = {'width': [], 'depth': []}
-        
+
     def forward(
             self,
             hidden_states: torch.FloatTensor,
@@ -816,16 +816,16 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
         self.structure = {'width': [], 'depth': []}
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        timestep: Optional[torch.LongTensor] = None,
-        added_cond_kwargs: Dict[str, torch.Tensor] = None,
-        class_labels: Optional[torch.LongTensor] = None,
-        cross_attention_kwargs: Dict[str, Any] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
-        return_dict: bool = True,
+            self,
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            timestep: Optional[torch.LongTensor] = None,
+            added_cond_kwargs: Dict[str, torch.Tensor] = None,
+            class_labels: Optional[torch.LongTensor] = None,
+            cross_attention_kwargs: Dict[str, Any] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            encoder_attention_mask: Optional[torch.Tensor] = None,
+            return_dict: bool = True,
     ):
         """
         The [`Transformer2DModel`] forward method.
@@ -1117,13 +1117,13 @@ class DualTransformer2DModelWidthDepthGated(DualTransformer2DModel):
         )
 
     def forward(
-        self,
-        hidden_states,
-        encoder_hidden_states,
-        timestep=None,
-        attention_mask=None,
-        cross_attention_kwargs=None,
-        return_dict: bool = True,
+            self,
+            hidden_states,
+            encoder_hidden_states,
+            timestep=None,
+            attention_mask=None,
+            cross_attention_kwargs=None,
+            return_dict: bool = True,
     ):
         """
         Args:
@@ -1156,7 +1156,7 @@ class DualTransformer2DModelWidthDepthGated(DualTransformer2DModel):
         # attention_mask is not used yet
         for i in range(2):
             # for each of the two transformers, pass the corresponding condition tokens
-            condition_state = encoder_hidden_states[:, tokens_start : tokens_start + self.condition_lengths[i]]
+            condition_state = encoder_hidden_states[:, tokens_start: tokens_start + self.condition_lengths[i]]
             transformer_index = self.transformer_index_for_condition[i]
             encoded_state = self.transformers[transformer_index](
                 input_states,
@@ -1404,11 +1404,11 @@ class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
                 structure['depth'].append(b_structure['depth'])
                 # if len(b_structure) == 1:
                 #     structure['width'] = structure['width'] + b_structure['width']
-                
+
                 # elif len(b_structure) == 2:
                 #     structure['width'] = structure['width'] + b_structure['width']
                 #     structure['depth'] = structure['depth'] + b_structure['depth']
-            
+
             for b in self.attentions:
                 assert hasattr(b, "get_gate_structure")
                 b_structure = b.get_gate_structure()
@@ -1416,12 +1416,12 @@ class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
                 structure['depth'].append(b_structure['depth'])
                 # if len(b_structure) == 1:
                 #     structure['width'] = structure['width'] + b_structure['width']
-                
+
                 # elif len(b_structure) == 2:
                 #     structure['width'] = structure['width'] + b_structure['width']
                 #     structure['depth'] = structure['depth'] + b_structure['depth']
 
-            self.structure = structure  
+            self.structure = structure
 
         return self.structure
 
@@ -1659,11 +1659,11 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
                 structure['depth'].append(b_structure['depth'])
                 # if len(b_structure) == 1:
                 #     structure['width'] = structure['width'] + b_structure['width']
-                
+
                 # elif len(b_structure) == 2:
                 #     structure['width'] = structure['width'] + b_structure['width']
                 #     structure['depth'] = structure['depth'] + b_structure['depth']
-            
+
             for b in self.attentions:
                 assert hasattr(b, "get_gate_structure")
                 b_structure = b.get_gate_structure()
@@ -1671,12 +1671,12 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
                 structure['depth'].append(b_structure['depth'])
                 # if len(b_structure) == 1:
                 #     structure['width'] = structure['width'] + b_structure['width']
-                
+
                 # elif len(b_structure) == 2:
                 #     structure['width'] = structure['width'] + b_structure['width']
                 #     structure['depth'] = structure['depth'] + b_structure['depth']
 
-            self.structure = structure  
+            self.structure = structure
 
         return self.structure
 
@@ -1786,7 +1786,7 @@ class DownBlock2DWidthHalfDepthGated(DownBlock2D):
 
         self.resnets = nn.ModuleList(resnets)
         self.structure = {'width': [], 'depth': []}
-    
+
     def get_gate_structure(self):
         if len(self.structure['width']) == 0:
             structure = {'width': [], 'depth': []}
@@ -1797,14 +1797,14 @@ class DownBlock2DWidthHalfDepthGated(DownBlock2D):
                 structure['depth'].append(b_structure['depth'])
                 # if len(b_structure) == 1:
                 #     structure['width'] = structure['width'] + b_structure['width']
-                
+
                 # elif len(b_structure) == 2:
                 #     structure['width'] = structure['width'] + b_structure['width']
                 #     structure['depth'] = structure['depth'] + b_structure['depth']
 
-            self.structure = structure  
+            self.structure = structure
         return self.structure
-    
+
 
 class UpBlock2DWidthDepthGated(UpBlock2D):
     def __init__(
@@ -1927,12 +1927,12 @@ class UpBlock2DWidthHalfDepthGated(UpBlock2D):
                 structure['depth'].append(b_structure['depth'])
                 # if len(b_structure) == 1:
                 #     structure['width'] = structure['width'] + b_structure['width']
-                
+
                 # elif len(b_structure) == 2:
                 #     structure['width'] = structure['width'] + b_structure['width']
                 #     structure['depth'] = structure['depth'] + b_structure['depth']
 
-            self.structure = structure  
+            self.structure = structure
         return self.structure
 
 
@@ -2041,7 +2041,7 @@ class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
                 structure['depth'].append(b_structure['depth'])
                 # assert len(b_structure) == 1
                 # structure['width'] = structure['width'] + b_structure['width']
-            
+
             for b in self.attentions:
                 assert hasattr(b, "get_gate_structure")
                 b_structure = b.get_gate_structure()
@@ -2050,6 +2050,6 @@ class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
                 # assert len(b_structure) == 1
                 # structure['width'] = structure['width'] + b_structure['width']
 
-            self.structure = structure  
+            self.structure = structure
 
         return self.structure
