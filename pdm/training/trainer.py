@@ -43,7 +43,6 @@ class DiffPruningTrainer:
                  noise_scheduler: nn.Module,
                  vae: nn.Module,
                  text_encoder: nn.Module,
-                 text_projection: nn.Module,
                  clip_loss: nn.Module,
                  resource_loss: nn.Module,
                  train_dataset: Dataset,
@@ -63,7 +62,6 @@ class DiffPruningTrainer:
         self.noise_scheduler = noise_scheduler
         self.vae = vae
         self.text_encoder = text_encoder
-        self.text_projection = text_projection
         self.train_dataset = train_dataset
         self.clip_loss = clip_loss
         self.resource_loss = resource_loss
@@ -378,7 +376,6 @@ class DiffPruningTrainer:
 
         # Move text_encode and vae to gpu and cast to weight_dtype
         self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
-        self.text_projection.to(self.accelerator.device, dtype=self.weight_dtype)
         self.vae.to(self.accelerator.device, dtype=self.weight_dtype)
 
         self.pre_train_setup()
@@ -442,19 +439,16 @@ class DiffPruningTrainer:
                         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
                     # Get the text embedding for conditioning
-                    text_outputs = self.text_encoder(batch["input_ids"])
-                    encoder_hidden_states = text_outputs[0]
-                    # pooled_output = text_outputs[1]
-                    # text_features = self.text_projection(pooled_output)
-                    text_features = batch["mpnet_embeddings"]
+                    encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
+                    text_embeddings = batch["mpnet_embeddings"]
 
                     arch_vector = self.hyper_net(encoder_hidden_states)
                     arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
 
                     # gather the arch_vector_quantized across all processes to get large batch for contrastive loss
-                    text_features_list = self.accelerator.gather(text_features)
+                    text_embeddings_list = self.accelerator.gather(text_embeddings)
                     arch_vector_quantized_list = self.accelerator.gather(arch_vector_quantized)
-                    contrastive_loss = self.clip_loss(text_features_list,
+                    contrastive_loss = self.clip_loss(text_embeddings_list,
                                                       arch_vector_quantized_list)
 
                     if self.unet.total_flops is None:
