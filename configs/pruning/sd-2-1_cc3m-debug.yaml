@@ -33,7 +33,8 @@ model:
     quantizer_base: 3.0
     num_arch_vq_codebook_embeddings: 256
     arch_vq_beta: 0.25
-    depth_order: [-1, -2, -3, -4, -5, 0, 1, 2, -6, -7, 3, 4]
+    depth_order: [-1, -2, 0, 1, -3, -4, 2, 3, -5, -6, 4, 5, -7, 6]
+    non_zero_width: true
 
 
 data:
@@ -45,12 +46,12 @@ data:
   train_data_dir: "training"
   train_data_file: "Train_GCC-training.tsv"
   train_bad_images_path: "./data/train_cc3m_bad_images.txt"
-  max_train_samples: null
+  max_train_samples: 500
 
   validation_data_dir: "validation"
   validation_data_file: "Validation_GCC-1.1.0-Validation.tsv"
   validation_bad_images_path: "./data/validation_cc3m_bad_images.txt"
-  max_validation_samples: null
+  max_validation_samples: 500
 
   image_column: "image"
   caption_column: "caption"
@@ -115,7 +116,8 @@ training:
     hub_model_id: null
 
   logging:
-    logging_dir: "/path/to/logs/"
+    # logging_dir: "/path/to/logs/"
+    logging_dir: "/fs/cbcb-scratch/aliganj/results"
     report_to: "wandb"
     checkpointing_steps: 1000
     checkpoints_total_limit: 1

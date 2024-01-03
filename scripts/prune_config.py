@@ -44,7 +44,7 @@ from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPModel
 from transformers.utils import ContextManagers
 from pdm.utils.op_counter import (add_flops_counting_methods)
 
@@ -205,6 +205,9 @@ def main():
         text_encoder = CLIPTextModel.from_pretrained(
             config.pretrained_model_name_or_path, subfolder="text_encoder", revision=config.revision
         )
+
+        text_projection = CLIPModel.from_pretrained(config.clip_model_name_or_path).text_projection
+
         vae = AutoencoderKL.from_pretrained(
             config.pretrained_model_name_or_path, subfolder="vae", revision=config.revision
         )
@@ -231,7 +234,8 @@ def main():
                                          beta=config["model"]["quantizer"]["arch_vq_beta"],
                                          temperature=config["model"]["quantizer"]["quantizer_T"],
                                          base=config["model"]["quantizer"]["quantizer_base"],
-                                         depth_order=config["model"]["quantizer"]["depth_order"])
+                                         depth_order=config["model"]["quantizer"]["depth_order"],
+                                         non_zero_width=config["model"]["quantizer"]["non_zero_width"])
 
     r_loss = ResourceLoss(p=config["training"]["losses"]["resource_loss"]["pruning_target"],
                           loss_type=config["training"]["losses"]["resource_loss"]["type"])
@@ -708,15 +712,23 @@ def main():
                     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                # encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                text_outputs = text_encoder(batch["input_ids"])
+                encoder_hidden_states = text_outputs[0]
+                pooled_output = text_outputs[1]
+                text_features = text_projection(pooled_output)
 
                 arch_vector = hyper_net(encoder_hidden_states)
                 arch_vector_quantized, q_loss, _ = quantizer(arch_vector)
 
                 # gather the arch_vector_quantized across all processes to get large batch for contrastive loss
-                encoder_hidden_states_list = accelerator.gather(encoder_hidden_states)
+                # encoder_hidden_states_list = accelerator.gather(encoder_hidden_states)
+
+                text_features_list = self.accelerator.gather(text_features)
                 arch_vector_quantized_list = accelerator.gather(arch_vector_quantized)
-                contrastive_loss = clip_loss(torch.sum(encoder_hidden_states_list, dim=1).squeeze(1),
+
+                # contrastive_loss = clip_loss(torch.sum(encoder_hidden_states_list, dim=1).squeeze(1), arch_vector_quantized_list)
+                contrastive_loss = clip_loss(text_features_list,
                                              arch_vector_quantized_list)
 
                 if unet.total_flops is None:

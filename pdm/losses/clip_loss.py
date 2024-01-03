@@ -10,10 +10,11 @@ class ClipLoss(nn.Module):
         self.temperature = temperature
 
         self.structure = structure
-        self.width_list = [sum(sub_width_list) for sub_width_list in self.structure['width']]
+        self.width_list = [w for sub_width_list in self.structure['width'] for w in sub_width_list]
+        self.width_list_sum = [sum(sub_width_list) for sub_width_list in self.structure['width']]
         self.depth_list = [d for sub_depth_list in self.structure['depth'] for d in sub_depth_list]
 
-        width_indices = [0] + np.cumsum(self.width_list).tolist()
+        width_indices = [0] + np.cumsum(self.width_list_sum).tolist()
         self.width_intervals = [(width_indices[i], width_indices[i + 1]) for i in range(len(width_indices) - 1)]
 
         widths_sum = sum(self.width_list) - 1
@@ -35,7 +36,7 @@ class ClipLoss(nn.Module):
             if elem != 0:
                 arch_vectors_clone[:, self.width_intervals[i][0]:self.width_intervals[i][1]] = (
                         arch_vectors[:, self.width_intervals[i][0]:self.width_intervals[i][1]] *
-                        arch_vectors[:, self.depth_indices[i]:self.depth_indices[i]+1])
+                        arch_vectors[:, self.depth_indices[i]:(self.depth_indices[i]+1)])
 
         arch_vectors_ = arch_vectors_clone * torch.sqrt(self.template).detach()
 
