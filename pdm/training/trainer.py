@@ -253,10 +253,15 @@ class DiffPruningTrainer:
         return optimizer
 
     def initialize_dataloaders(self, collate_fn):
+        if self.config.seed is None:
+            generator = None
+        else:
+            generator = torch.Generator().manual_seed(self.config.seed)
         train_dataloader = torch.utils.data.DataLoader(
             self.train_dataset,
             shuffle=True,
             collate_fn=collate_fn,
+            generator=generator,
             batch_size=self.config.data.dataloader.train_batch_size,
             num_workers=self.config.data.dataloader.dataloader_num_workers,
         )
@@ -266,6 +271,7 @@ class DiffPruningTrainer:
                 self.eval_dataset,
                 shuffle=False,
                 collate_fn=collate_fn,
+                generator=generator,
                 batch_size=self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes,
                 num_workers=self.config.data.dataloader.dataloader_num_workers,
             )
@@ -438,8 +444,9 @@ class DiffPruningTrainer:
                     # Get the text embedding for conditioning
                     text_outputs = self.text_encoder(batch["input_ids"])
                     encoder_hidden_states = text_outputs[0]
-                    pooled_output = text_outputs[1]
-                    text_features = self.text_projection(pooled_output)
+                    # pooled_output = text_outputs[1]
+                    # text_features = self.text_projection(pooled_output)
+                    text_features = batch["mpnet_embeddings"]
 
                     arch_vector = self.hyper_net(encoder_hidden_states)
                     arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)

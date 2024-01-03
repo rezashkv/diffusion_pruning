@@ -19,6 +19,7 @@ import random
 import sys
 import datetime
 
+from accelerate.utils import set_seed
 from omegaconf import OmegaConf
 
 import PIL
@@ -27,19 +28,20 @@ import numpy as np
 import requests
 import torch
 import torch.utils.checkpoint
+import torch.nn.functional as F
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from datasets import load_dataset, Dataset, concatenate_datasets
 from packaging import version
 from torchvision import transforms
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPModel
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPModel, AutoTokenizer, AutoModel
 from transformers.utils import ContextManagers
 from pdm.utils.op_counter import (add_flops_counting_methods)
 
 from diffusers import AutoencoderKL, DDIMScheduler
 from pdm.models.diffusion import UNet2DConditionModelGated
 from diffusers.training_utils import EMAModel
-from diffusers.utils import check_min_version, deprecate, is_wandb_available
+from diffusers.utils import check_min_version, deprecate
 from diffusers.utils.import_utils import is_xformers_available
 from pdm.models import HyperStructure
 from pdm.models import StructureVectorQuantizer
@@ -50,8 +52,6 @@ from pdm.datasets.laion_aes import load_main_laion_dataset
 
 from pdm.training.trainer import DiffPruningTrainer
 
-if is_wandb_available():
-    import wandb
 
 DATASET_NAME_MAPPING = {
     "lambdalabs/pokemon-blip-captions": ("image", "text"),
@@ -69,6 +69,9 @@ def main():
     config = OmegaConf.load(args.base_config_path)
     # add args to config
     config.update(vars(args))
+
+    if config.seed is not None:
+        set_seed(config.seed)
 
     if config.non_ema_revision is not None:
         deprecate(
@@ -326,6 +329,37 @@ def main():
         )
         return inputs.input_ids
 
+
+    mpnet_tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-mpnet-base-v2')
+    mpnet_model = AutoModel.from_pretrained('sentence-transformers/all-mpnet-base-v2')
+
+    def get_mpnet_embeddings(examples, is_train=True):
+        # Mean Pooling - Take attention mask into account for correct averaging
+        def mean_pooling(model_output, attention_mask):
+            token_embeddings = model_output[0]  # First element of model_output contains all token embeddings
+            input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+            return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1),
+                                                                                      min=1e-9)
+
+        captions = []
+        for caption in examples[caption_column]:
+            if isinstance(caption, str):
+                captions.append(caption)
+            elif isinstance(caption, (list, np.ndarray)):
+                # take a random caption if there are multiple
+                captions.append(random.choice(caption) if is_train else caption[0])
+            else:
+                raise ValueError(
+                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
+                )
+        encoded_input = mpnet_tokenizer(captions, padding=True, truncation=True, return_tensors="pt")
+        # Compute token embeddings
+        with torch.no_grad():
+            model_output = mpnet_model(**encoded_input)
+        sentence_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
+        sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
+        return sentence_embeddings
+
     # Preprocessing the datasets.
     train_transforms = transforms.Compose(
         [
@@ -362,6 +396,7 @@ def main():
         images = [image.convert("RGB") for image in examples[image_column]]
         examples["pixel_values"] = [train_transforms(image) for image in images]
         examples["input_ids"] = tokenize_captions(examples)
+        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples, is_train=True)
         return examples
 
     def preprocess_validation(examples):
@@ -376,13 +411,16 @@ def main():
         images = [image.convert("RGB") for image in examples[image_column]]
         examples["pixel_values"] = [validation_transforms(image) for image in images]
         examples["input_ids"] = tokenize_captions(examples, is_train=False)
+        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples, is_train=False)
         return examples
 
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
         input_ids = torch.stack([example["input_ids"] for example in examples])
-        return {"pixel_values": pixel_values, "input_ids": input_ids}
+        mpnet_embeddings = torch.stack([example["mpnet_embeddings"] for example in examples])
+        mpnet_embeddings = mpnet_embeddings.to(memory_format=torch.contiguous_format).float()
+        return {"pixel_values": pixel_values, "input_ids": input_ids, "mpnet_embeddings": mpnet_embeddings}
 
     trainer = DiffPruningTrainer(config=config,
                                  hyper_net=hyper_net,
