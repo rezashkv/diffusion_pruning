@@ -1331,7 +1331,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
         else:
             vq_embed_dim = self.quantizer.vq_embed_dim
         structure_vector_quantized = torch.ones((batch_size, vq_embed_dim), device=device)
-        # structure_vector_quantized[:, depth_index] = 1
+        structure_vector_quantized[:, depth_index] = 0
         self.unet.set_structure(structure_vector_quantized)
 
         # For classifier free guidance, we need to do two forward passes.

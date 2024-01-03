@@ -32,7 +32,7 @@ from accelerate.state import AcceleratorState
 from datasets import load_dataset, Dataset, concatenate_datasets
 from packaging import version
 from torchvision import transforms
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPModel
 from transformers.utils import ContextManagers
 from pdm.utils.op_counter import (add_flops_counting_methods)
 
@@ -128,6 +128,7 @@ def main():
         text_encoder = CLIPTextModel.from_pretrained(
             config.pretrained_model_name_or_path, subfolder="text_encoder", revision=config.revision
         )
+        text_projection = CLIPModel.from_pretrained(config.clip_model_name_or_path).text_projection
         vae = AutoencoderKL.from_pretrained(
             config.pretrained_model_name_or_path, subfolder="vae", revision=config.revision
         )
@@ -394,6 +395,7 @@ def main():
                                  noise_scheduler=noise_scheduler,
                                  vae=vae,
                                  text_encoder=text_encoder,
+                                 text_projection=text_projection,
                                  clip_loss=clip_loss,
                                  resource_loss=r_loss,
                                  train_dataset=dataset["train"],

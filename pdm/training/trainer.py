@@ -760,11 +760,6 @@ class DiffPruningTrainer:
         if self.config.enable_xformers_memory_efficient_attention:
             pipeline.enable_xformers_memory_efficient_attention()
 
-        if self.config.seed is None:
-            generator = None
-        else:
-            generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
-
         image_output_dir = os.path.join(self.config.training.logging.logging_dir, "prompt_images",
                                         f"epoch_{epoch}")
         os.makedirs(image_output_dir, exist_ok=True)
@@ -775,6 +770,11 @@ class DiffPruningTrainer:
                     step:step + self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes]
             with torch.autocast("cuda"):
                 with self.accelerator.split_between_processes(batch) as batch:
+                    if self.config.seed is None:
+                        generator = None
+                    else:
+                        generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
+
                     gen_images = pipeline(batch, num_inference_steps=self.config.training.num_inference_steps,
                                           generator=generator).images
                     gen_images = self.accelerator.gather(gen_images)
@@ -830,11 +830,6 @@ class DiffPruningTrainer:
         if self.config.enable_xformers_memory_efficient_attention:
             pipeline.enable_xformers_memory_efficient_attention()
 
-        if self.config.seed is None:
-            generator = None
-        else:
-            generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
-
         image_output_dir = os.path.join(self.config.training.logging.logging_dir, "quantizer_embedding_images",
                                         f"epoch_{epoch}")
         os.makedirs(image_output_dir, exist_ok=True)
@@ -852,6 +847,11 @@ class DiffPruningTrainer:
                                    device=self.accelerator.device)
             with torch.autocast("cuda"):
                 with self.accelerator.split_between_processes(indices) as indices:
+                    if self.config.seed is None:
+                        generator = None
+                    else:
+                        generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
+
                     gen_images, quantizer_embed_gs = pipeline.quantizer_samples(indices=indices,
                                                                                 num_inference_steps=self.config.training.num_inference_steps,
                                                                                 generator=generator)
@@ -1032,11 +1032,6 @@ class DiffPruningTrainer:
         if self.config.enable_xformers_memory_efficient_attention:
             pipeline.enable_xformers_memory_efficient_attention()
 
-        if self.config.seed is None:
-            generator = None
-        else:
-            generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
-
         image_output_dir = os.path.join(self.config.training.logging.logging_dir, "depth_analysis_images")
         os.makedirs(image_output_dir, exist_ok=True)
 
@@ -1058,6 +1053,11 @@ class DiffPruningTrainer:
                         step:step + self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes]
                 with torch.autocast("cuda"):
                     with self.accelerator.split_between_processes(batch) as batch:
+                        if self.config.seed is None:
+                            generator = None
+                        else:
+                            generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
+
                         gen_images = pipeline.depth_analysis(batch,
                                                              num_inference_steps=self.config.training.num_inference_steps,
                                                              generator=generator, depth_index=d_block,
