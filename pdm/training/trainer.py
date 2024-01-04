@@ -1028,9 +1028,11 @@ class DiffPruningTrainer:
         os.makedirs(image_output_dir, exist_ok=True)
 
         n_depth_pruned_blocks = sum([sum(d) for d in self.unet.get_structure()['depth']])
-        images = {i: [] for i in range(n_depth_pruned_blocks)}
 
-        for d_block in range(n_depth_pruned_blocks):
+        # index n_depth_pruned_blocks is for no pruning
+        images = {i: [] for i in range(n_depth_pruned_blocks + 1)}
+
+        for d_block in range(n_depth_pruned_blocks + 1):
             logger.info(f"Generating samples for depth block {d_block}...")
             progress_bar = tqdm(
                 range(0, len(self.config.data.prompts)),
@@ -1050,10 +1052,16 @@ class DiffPruningTrainer:
                         else:
                             generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
 
-                        gen_images = pipeline.depth_analysis(batch,
-                                                             num_inference_steps=self.config.training.num_inference_steps,
-                                                             generator=generator, depth_index=d_block,
-                                                             output_type="pt").images
+                        if d_block == n_depth_pruned_blocks:
+                            gen_images = pipeline.depth_analysis(batch,
+                                                                 num_inference_steps=self.config.training.num_inference_steps,
+                                                                 generator=generator, depth_index=None,
+                                                                 output_type="pt").images
+                        else:
+                            gen_images = pipeline.depth_analysis(batch,
+                                                                 num_inference_steps=self.config.training.num_inference_steps,
+                                                                 generator=generator, depth_index=d_block,
+                                                                 output_type="pt").images
 
                         gen_images = self.accelerator.gather(gen_images)
 
