@@ -175,11 +175,12 @@ class HeadGatedAttnProcessor2(AttnProcessor2_0):
 
 
 class ResnetBlock2DWidthGated(ResnetBlock2D):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, is_input_concatenated=False, *args, **kwargs):
         # extract gate_flag from kwargs
         super().__init__(*args, **kwargs)
         # self.gate = BlockVirtualGate(self.norm1.num_groups)
         self.gate = WidthGate(self.norm1.num_groups)
+        self.is_input_concatenated = is_input_concatenated
         self.structure = {'width': [], 'depth': []}
 
     def forward(self, input_tensor, temb, scale: float = 1.0):
@@ -279,19 +280,22 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
 
 
 class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, is_input_concatenated=False, *args, **kwargs):
         # extract gate_flag from kwargs
         super().__init__(*args, **kwargs)
         # self.gate = BlockVirtualGate(self.norm1.num_groups)
         # self.depth_gate = BlockVirtualGate(1)
         self.gate = WidthGate(self.norm1.num_groups)
         self.depth_gate = DepthGate(1)
+        self.is_input_concatenated = is_input_concatenated
         self.structure = {'width': [], 'depth': []}
 
     def forward(self, input_tensor, temb, scale: float = 1.0):
-        assert (self.upsample is None) and (self.downsample is None)  # Depth gate cannot be in the up/down sample blocks.
-        if self.conv_shortcut is not None:  # We are in the upsample blocks, input is concatenated.
-            input_hidden_states = input_tensor.chunk(2, dim=1)[0]
+        assert (self.upsample is None) and (self.downsample is None) # Depth gate cannot be in the up/down sample blocks.
+        if self.is_input_concatenated:  # We are in the upsample blocks, input is concatenated.
+            input_hidden_states = input_tensor.chunk(2, dim=1)[0]  # [0] because the forward pass is hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1) 
+            # in here: https://github.com/huggingface/diffusers/blob/acd926f4f208e4cf12be69315787c450da48913b/src/diffusers/models/unet_2d_blocks.py#L2324
+             
         else:  # We are in the downsample blocks
             input_hidden_states = input_tensor
         
@@ -375,10 +379,11 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         # hidden_states = self.depth_gate(hidden_states)
         # output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
         # return output_tensor
+        
         output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
-        assert torch.equal(output_tensor.shape, input_hidden_states.shape)
-        output = (1 - self.depth_gate.gate_f.expand_as(input_hidden_states)) * input_hidden_states + (self.depth_gate.gate_f.expand_as(output_tensor)) * output_tensor 
-        # output = self.depth_gate(output)
+        assert output_tensor.shape == input_hidden_states.shape
+        mask = self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        output = (1 - mask) * input_hidden_states + mask * output_tensor 
         return output
         
     def set_virtual_gate(self, gate_val):
@@ -954,7 +959,7 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
         lora_scale = cross_attention_kwargs.get("scale", 1.0) if cross_attention_kwargs is not None else 1.0
 
         # ########### 1. Input
-        input_hidden_states = hidden_states.clone()
+        input_hidden_states = hidden_states
         if self.is_input_continuous:
             batch, _, height, width = hidden_states.shape
             residual = hidden_states
@@ -1078,13 +1083,22 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
             )
 
         # ########### TODO: Depth gate
-        output = (1 - self.depth_gate.gate_f.expand_as(output)) * input_hidden_states + (self.depth_gate.gate_f.expand_as(output)) * output 
+        assert output.shape == input_hidden_states.shape
+        mask = self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        output_tensor = (1 - mask) * input_hidden_states + mask * output
+        
+        if not return_dict:
+            return (output_tensor,)
+
+        return Transformer2DModelOutput(sample=output_tensor)
+
+        # output = (1 - self.depth_gate.gate_f.expand_as(output)) * input_hidden_states + (self.depth_gate.gate_f.expand_as(output)) * output 
         # output = self.depth_gate(output)
 
-        if not return_dict:
-            return (output,)
+        # if not return_dict:
+        #     return (output,)
 
-        return Transformer2DModelOutput(sample=output)
+        # return Transformer2DModelOutput(sample=output)
 
     def get_gate_structure(self):
         if len(self.structure['width']) == 0:
@@ -1389,6 +1403,7 @@ class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    is_input_concatenated=False
                 )
             )
             if not dual_cross_attention:
@@ -1433,6 +1448,7 @@ class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    is_input_concatenated=False
                 )
             )
             if not dual_cross_attention:
@@ -1674,6 +1690,7 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    is_input_concatenated=True
                 )
             )
             if not dual_cross_attention:
@@ -1720,6 +1737,7 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    is_input_concatenated=True
                 )
             )
             if not dual_cross_attention:
@@ -1902,6 +1920,7 @@ class DownBlock2DWidthHalfDepthGated(DownBlock2D):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    is_input_concatenated=False
                 )
             )
         for i in range(num_layers - 1, num_layers):
@@ -1918,6 +1937,7 @@ class DownBlock2DWidthHalfDepthGated(DownBlock2D):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    is_input_concatenated=False
                 )
             )
 
@@ -2045,6 +2065,7 @@ class UpBlock2DWidthHalfDepthGated(UpBlock2D):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    is_input_concatenated=True
                 )
             )
 
@@ -2064,6 +2085,7 @@ class UpBlock2DWidthHalfDepthGated(UpBlock2D):
                     non_linearity=resnet_act_fn,
                     output_scale_factor=output_scale_factor,
                     pre_norm=resnet_pre_norm,
+                    is_input_concatenated=True
                 )
             )
 
