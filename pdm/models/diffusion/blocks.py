@@ -38,7 +38,13 @@ class GEGLUGated(GEGLU):
     def forward(self, hidden_states, scale: float = 1.0):
         args = () if USE_PEFT_BACKEND else (scale,)
         hidden_states, gate = self.proj(hidden_states, *args).chunk(2, dim=-1)
-        hidden_states, gate = (self.gate(hidden_states), self.gate(gate))
+        # hidden_states, gate = (self.gate(hidden_states), self.gate(gate))
+
+        assert hidden_states.shape[2] == self.gate.width
+        assert gate.shape[2] == self.gate.width
+        mask = self.gate.gate_f.unsqueeze(1)
+        hidden_states = mask.expand_as(hidden_states) * hidden_states
+        gate = mask.expand_as(gate) * gate
         return hidden_states * self.gelu(gate)
 
 
@@ -67,15 +73,21 @@ class FeedForwardWidthGated(FeedForward):
         super().__init__(dim, dim_out, mult, dropout, activation_fn, final_dropout)
         inner_dim = int(dim * mult)
 
-        if activation_fn == "geglu":
-            act_fn = GEGLUGated(dim, inner_dim)
-            self.net[0] = act_fn
-
-    def set_virtual_gate(self, gate_val):
-        self.net[0].gate.set_structure_value(gate_val)
+        assert activation_fn == "geglu", f"Only GEGLU is supported in {self.__class__.__name__}"
+        act_fn = GEGLUGated(dim, inner_dim)
+        self.net[0] = act_fn
+        self.structure = {'width': [], 'depth': []}
 
     def get_gate_structure(self):
-        return {"width": [self.net[0].gate.width]}
+        if not self.structure["width"]:
+            self.structure = {"width": [self.net[0].gate.width], "depth": [0]}
+        return self.structure
+
+    def set_gate_structure(self, arch_vectors):
+        assert len(arch_vectors['depth']) == 0, f"{self.__class__.__name__} does not support depth gate."
+        assert len(arch_vectors['width']) == 1, f"{self.__class__.__name__} only has one width gate."
+        assert arch_vectors['width'][0].shape[1] == self.net[0].gate.width
+        self.net[0].gate.set_structure_value(arch_vectors['width'][0])
 
 
 class HeadGatedAttnProcessor2(AttnProcessor2_0):
@@ -291,11 +303,13 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         self.structure = {'width': [], 'depth': []}
 
     def forward(self, input_tensor, temb, scale: float = 1.0):
-        assert (self.upsample is None) and (self.downsample is None) # Depth gate cannot be in the up/down sample blocks.
+        assert (self.upsample is None) and (
+                self.downsample is None)  # Depth gate cannot be in the up/down sample blocks.
         if self.is_input_concatenated:  # We are in the upsample blocks, input is concatenated.
-            input_hidden_states = input_tensor.chunk(2, dim=1)[0]  # [0] because the forward pass is hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1) 
+            input_hidden_states = input_tensor.chunk(2, dim=1)[
+                0]  # [0] because the forward pass is hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
             # in here: https://github.com/huggingface/diffusers/blob/acd926f4f208e4cf12be69315787c450da48913b/src/diffusers/models/unet_2d_blocks.py#L2324
-             
+
         else:  # We are in the downsample blocks
             input_hidden_states = input_tensor
 
@@ -379,10 +393,13 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         # hidden_states = self.depth_gate(hidden_states)
         # output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
         # return output_tensor
-        
+
         output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
-        assert torch.equal(output_tensor.shape, input_hidden_states.shape)
-        output = (1 - self.depth_gate.gate_f.expand_as(input_hidden_states)) * input_hidden_states + (self.depth_gate.gate_f.expand_as(output_tensor)) * output_tensor 
+        assert torch.equal(torch.tensor(output_tensor.shape), torch.tensor(input_hidden_states.shape))
+        output = ((1 - self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand_as(
+            input_hidden_states)) * input_hidden_states +
+                  (self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand_as(
+                      output_tensor)) * output_tensor)
         # output = self.depth_gate(output)
         return output
 
@@ -1083,7 +1100,9 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
             )
 
         # ########### TODO: Depth gate
-        output = (1 - self.depth_gate.gate_f.expand_as(output)) * input_hidden_states + (self.depth_gate.gate_f.expand_as(output)) * output 
+        output_tensor = ((1 - self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand_as(output)) *
+                         input_hidden_states +
+                         (self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand_as(output)) * output)
         # output = self.depth_gate(output)
 
         if not return_dict:
