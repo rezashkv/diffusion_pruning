@@ -18,11 +18,9 @@ class ClipLoss(nn.Module):
         self.width_intervals = [(width_indices[i], width_indices[i + 1]) for i in range(len(width_indices) - 1)]
 
         widths_sum = sum(self.width_list) - 1
-
         self.depth_indices = (widths_sum + np.cumsum(self.depth_list)).tolist()
 
         template = torch.tensor(self.width_list + [d for d in self.depth_list if d != 0])
-
         template = torch.repeat_interleave(template, template).type(torch.float32)
         self.template = (1.0 / template).requires_grad_(False)
 

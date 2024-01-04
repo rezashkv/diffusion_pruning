@@ -442,7 +442,7 @@ class DiffPruningTrainer:
                     contrastive_loss = self.clip_loss(text_embeddings_list,
                                                       arch_vector_quantized_list)
 
-                    arch_vectors_separated = self.hyper_net.transfrom_structure_vector(arch_vector_quantized)
+                    arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
                     self.unet.set_structure(arch_vectors_separated)
 
                     if self.unet.total_flops is None:

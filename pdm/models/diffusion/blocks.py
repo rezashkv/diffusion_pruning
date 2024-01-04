@@ -1945,21 +1945,21 @@ class DownBlock2DWidthHalfDepthGated(DownBlock2D):
             self.structure = structure
         return self.structure
 
-    # def set_gate_structure(self, arch_vectors):
-    #
-    #     width_vectors, depth_vectors = arch_vectors['width'], arch_vectors['depth']
-    #     for b in self.resnets:
-    #         assert hasattr(b, "get_gate_structure")
-    #         b_structure = b.get_gate_structure()
-    #         assert len(b_structure) == 2
-    #         block_vectors = {'width': [], 'depth': []}
-    #         for i in range(len(b_structure['width'])):
-    #             b_structure['width'][i] == width_vectors[0].shape[1]
-    #             block_vectors['width'].append(width_vectors.pop(0))
-    #         for i in range(len(b_structure['depth'])):
-    #             if b_structure['depth'][i] == 1:
-    #                 block_vectors['depth'].append(depth_vectors.pop(0))
-    #         b.set_gate_structure(block_vectors)
+    def set_gate_structure(self, arch_vectors):
+
+        width_vectors, depth_vectors = arch_vectors['width'], arch_vectors['depth']
+        for b in self.resnets:
+            assert hasattr(b, "get_gate_structure")
+            b_structure = b.get_gate_structure()
+            assert len(b_structure) == 2
+            block_vectors = {'width': [], 'depth': []}
+            for i in range(len(b_structure['width'])):
+                b_structure['width'][i] == width_vectors[0].shape[1]
+                block_vectors['width'].append(width_vectors.pop(0))
+            for i in range(len(b_structure['depth'])):
+                if b_structure['depth'][i] == 1:
+                    block_vectors['depth'].append(depth_vectors.pop(0))
+            b.set_gate_structure(block_vectors)
 
 
 class UpBlock2DWidthDepthGated(UpBlock2D):

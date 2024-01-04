@@ -31,7 +31,8 @@ model:
     quantizer_base: 3.0
     num_arch_vq_codebook_embeddings: 256
     arch_vq_beta: 0.25
-    depth_order: [-1, -2, -3, -4, -5, 0, 1, 2, -6, -7, 3, 4]
+    depth_order: [-1, -2, 0, 1, -3, -4, 2, 3, -5, -6, 4, 5, -7, 6]
+    non_zero_width: true
 
 
 data:
@@ -91,7 +92,7 @@ training:
       weight: 1.0
 
     contrastive_clip_loss:
-      temperature: 1.0
+      temperature: 0.15
       weight: 0.1
 
   optim:
