@@ -40,7 +40,10 @@ class ClipLoss(nn.Module):
 
         arch_vectors_ = arch_vectors_clone * torch.sqrt(self.template).detach()
 
-        arch_vectors_similarity = F.softmax((arch_vectors_ @ arch_vectors_.T) / self.temperature, dim=-1)
+        arch_vectors_normalized = arch_vectors_ / arch_vectors_.norm(dim=1, keepdim=True)
+        prompt_embeddings = prompt_embeddings / prompt_embeddings.norm(dim=1, keepdim=True)
+        arch_vectors_similarity = F.softmax((arch_vectors_normalized @ arch_vectors_normalized.T) / self.temperature, dim=-1)
         texts_similarity = F.softmax((prompt_embeddings @ prompt_embeddings.T) / self.temperature, dim=-1)
+        print(f"texts_similarity: {texts_similarity}")
         loss = F.cross_entropy(arch_vectors_similarity.T, texts_similarity.T, reduction='mean')
         return loss.mean()

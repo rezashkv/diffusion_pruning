@@ -138,10 +138,15 @@ class HeadGatedAttnProcessor2(AttnProcessor2_0):
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
-        # apply gate
-        query = attn.gate(query)
-        key = attn.gate(key)
-        value = attn.gate(value)
+        # ########## Apply Width Gate
+        assert key.shape[1] == attn.gate.gate_f.shape[1]
+        mask = attn.gate.gate_f.unsqueeze(-1).unsqueeze(-1)
+        query = query * mask
+        key = key * mask
+        value = value * mask
+        # query = attn.gate(query)
+        # key = attn.gate(key)
+        # value = attn.gate(value)
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         hidden_states = F.scaled_dot_product_attention(
@@ -229,7 +234,11 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
             hidden_states = hidden_states + temb
 
         # DO it here or after norm2?
-        hidden_states = self.gate(hidden_states)
+        assert self.norm2.num_groups == self.gate.gate_f.shape[1]
+        num_repeat = int(hidden_states.shape[1] / self.norm2.num_groups)
+        mask = torch.repeat_interleave(self.gate.gate_f, repeats=num_repeat, dim=1).unsqueeze(-1).unsqueeze(-1)
+        hidden_states = hidden_states * mask
+        # hidden_states = self.gate(hidden_states)
 
         if self.time_embedding_norm == "ada_group" or self.time_embedding_norm == "spatial":
             hidden_states = self.norm2(hidden_states, temb)
@@ -262,6 +271,12 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
             self.structure = {"width": [self.gate.width], "depth": [0]}
         return self.structure
 
+    def set_gate_structure(self, arch_vectors):
+        assert len(arch_vectors['depth']) == 0
+        assert len(arch_vectors['width']) == 1
+        assert arch_vectors['width'][0].shape[1] == self.gate.width
+        self.gate.set_structure_value(arch_vectors['width'][0])
+
 
 class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
     def __init__(self, *args, **kwargs):
@@ -274,6 +289,12 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         self.structure = {'width': [], 'depth': []}
 
     def forward(self, input_tensor, temb, scale: float = 1.0):
+        assert (self.upsample is None) and (self.downsample is None)  # Depth gate cannot be in the up/down sample blocks.
+        if self.conv_shortcut is not None:  # We are in the upsample blocks, input is concatenated.
+            input_hidden_states = input_tensor.chunk(2, dim=1)[0]
+        else:  # We are in the downsample blocks
+            input_hidden_states = input_tensor
+        
         hidden_states = input_tensor
 
         if self.time_embedding_norm == "ada_group" or self.time_embedding_norm == "spatial":
@@ -325,7 +346,11 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
             hidden_states = hidden_states + temb
 
         # DO it here or after norm2?
-        hidden_states = self.gate(hidden_states)
+        assert self.norm2.num_groups == self.gate.gate_f.shape[1]
+        num_repeat = int(hidden_states.shape[1] / self.norm2.num_groups)
+        mask = torch.repeat_interleave(self.gate.gate_f, repeats=num_repeat, dim=1).unsqueeze(-1).unsqueeze(-1)
+        hidden_states = hidden_states * mask
+        # hidden_states = self.gate(hidden_states)
 
         if self.time_embedding_norm == "ada_group" or self.time_embedding_norm == "spatial":
             hidden_states = self.norm2(hidden_states, temb)
@@ -345,13 +370,17 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
             input_tensor = (
                 self.conv_shortcut(input_tensor, scale) if not USE_PEFT_BACKEND else self.conv_shortcut(input_tensor)
             )
-
-        hidden_states = self.depth_gate(hidden_states)
-
+    
+        # ########### TODO: Depth gate
+        # hidden_states = self.depth_gate(hidden_states)
+        # output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
+        # return output_tensor
         output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
-
-        return output_tensor
-
+        assert torch.equal(output_tensor.shape, input_hidden_states.shape)
+        output = (1 - self.depth_gate.gate_f.expand_as(input_hidden_states)) * input_hidden_states + (self.depth_gate.gate_f.expand_as(output_tensor)) * output_tensor 
+        # output = self.depth_gate(output)
+        return output
+        
     def set_virtual_gate(self, gate_val):
         self.gate.set_structure_value(gate_val[:, :-1])
         self.depth_gate.set_structure_value(gate_val[:, -1:])
@@ -360,6 +389,13 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         if self.structure["width"] == []:
             self.structure = {"depth": [self.depth_gate.width], "width": [self.gate.width]}
         return self.structure
+
+    def set_gate_structure(self, arch_vectors):
+        assert len(arch_vectors['depth']) == 1
+        assert len(arch_vectors['width']) == 1
+        assert arch_vectors['width'][0].shape[1] == self.gate.width
+        self.gate.set_structure_value(arch_vectors['width'][0])
+        self.depth_gate.set_structure_value(arch_vectors['depth'][0])
 
 
 class BasicTransformerBlockWidthGated(BasicTransformerBlock):
@@ -401,6 +437,7 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
             self.attn2.set_processor(HeadGatedAttnProcessor2())
             self.attn2.gate = gate2
 
+        self.gated_ff = gated_ff
         if gated_ff:
             self.ff = FeedForwardWidthGated(dim, dropout=dropout, activation_fn=activation_fn,
                                             final_dropout=final_dropout)
@@ -514,6 +551,24 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
         if isinstance(self.ff, FeedForwardWidthGated):
             gate_3_val = gate_val[:, self.attn1.gate.width + self.attn2.gate.width:-1]
             self.ff.set_virtual_gate(gate_3_val)
+
+    def set_gate_structure(self, arch_vectors):
+        assert len(arch_vectors['depth']) == 0
+        assert len(arch_vectors['width']) >= 2
+
+        # attn1
+        assert arch_vectors['width'][0].shape[1] == self.attn1.gate.width
+        self.attn1.gate.set_structure_value(arch_vectors['width'][0])
+        
+        # attn2
+        assert arch_vectors['width'][1].shape[1] == self.attn2.gate.width
+        self.attn2.gate.set_structure_value(arch_vectors['width'][1])
+
+        # ff
+        if self.gated_ff:
+            assert len(arch_vectors['width']) == 3
+            assert arch_vectors['width'][2].shape[1] == self.ff.gate.width            
+            self.ff.gate.set_structure_value(arch_vectors['width'][2])
 
 
 class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
@@ -749,6 +804,13 @@ class Transformer2DModelWidthGated(Transformer2DModel):
             self.structure['depth'] = [0]
         return self.structure
 
+    def set_gate_structure(self, arch_vectors):
+        if len(self.transformer_blocks) > 1:
+            raise NotImplementedError
+        
+        assert len(arch_vectors['depth']) == 0
+        self.transformer_blocks[0].set_gate_structure(arch_vectors)
+
 
 class Transformer2DModelWidthDepthGated(Transformer2DModel):
     @register_to_config
@@ -891,7 +953,8 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
         # Retrieve lora scale.
         lora_scale = cross_attention_kwargs.get("scale", 1.0) if cross_attention_kwargs is not None else 1.0
 
-        # 1. Input
+        # ########### 1. Input
+        input_hidden_states = hidden_states.clone()
         if self.is_input_continuous:
             batch, _, height, width = hidden_states.shape
             residual = hidden_states
@@ -930,7 +993,7 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
                     timestep, added_cond_kwargs, batch_size=batch_size, hidden_dtype=hidden_states.dtype
                 )
 
-        # 2. Blocks
+        # ########### 2. Blocks
         if self.caption_projection is not None:
             batch_size = hidden_states.shape[0]
             encoder_hidden_states = self.caption_projection(encoder_hidden_states)
@@ -960,7 +1023,7 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
                     class_labels=class_labels,
                 )
 
-        # 3. Output
+        # ########### 3. Output
         if self.is_input_continuous:
             if not self.use_linear_projection:
                 hidden_states = hidden_states.reshape(batch, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
@@ -1014,7 +1077,9 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
                 shape=(-1, self.out_channels, height * self.patch_size, width * self.patch_size)
             )
 
-        output = self.depth_gate(output)
+        # ########### TODO: Depth gate
+        output = (1 - self.depth_gate.gate_f.expand_as(output)) * input_hidden_states + (self.depth_gate.gate_f.expand_as(output)) * output 
+        # output = self.depth_gate(output)
 
         if not return_dict:
             return (output,)
@@ -1030,6 +1095,14 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
             self.structure['depth'].append(1)
         return self.structure
 
+    def set_gate_structure(self, arch_vectors):
+        if len(self.transformer_blocks) > 1:
+            raise NotImplementedError
+
+        assert len(arch_vectors['depth']) == 1
+        self.depth_gate.set_structure_value(arch_vectors['depth'][0])
+        self.transformer_blocks[0].set_gate_structure({'width': arch_vectors['width'], 'depth': []})
+        
 
 class DualTransformer2DModelWidthGated(DualTransformer2DModel):
     def __init__(
@@ -1425,6 +1498,38 @@ class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
 
         return self.structure
 
+    def set_gate_structure(self, arch_vectors):
+        # We first read the resnets and then attentions in the "get_gate_structure" method. Thus, we do a similar approach here.
+        width_vectors, depth_vectors = arch_vectors['width'], arch_vectors['depth']
+
+        for b in self.resnets:
+            
+            assert hasattr(b, "get_gate_structure")
+            b_structure = b.get_gate_structure()
+            assert len(b_structure) == 2
+            block_vectors = {'width': [], 'depth': []}
+            for i in range(len(b_structure['width'])):
+                b_structure['width'][i] == width_vectors[0].shape[1]
+                block_vectors['width'].append(width_vectors.pop(0))
+            for i in range(len(b_structure['depth'])):
+                if b_structure['depth'][i] == 1:
+                    block_vectors['depth'].append(depth_vectors.pop(0))
+            b.set_gate_structure(block_vectors)
+            
+        for b in self.attentions:
+            
+            assert hasattr(b, "get_gate_structure")
+            b_structure = b.get_gate_structure()
+            assert len(b_structure) == 2
+            block_vectors = {'width': [], 'depth': []}
+            for i in range(len(b_structure['width'])):
+                assert b_structure['width'][i] == width_vectors[0].shape[1]
+                block_vectors['width'].append(width_vectors.pop(0))     
+            for i in range(len(b_structure['depth'])):
+                if b_structure['depth'][i] == 1:
+                    block_vectors['depth'].append(depth_vectors.pop(0))
+            b.set_gate_structure(block_vectors)
+
 
 class CrossAttnUpBlock2DWidthDepthGated(CrossAttnUpBlock2D):
     def __init__(
@@ -1680,6 +1785,38 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
 
         return self.structure
 
+    def set_gate_structure(self, arch_vectors):
+        # We first read the resnets and then attentions in the "get_gate_structure" method. Thus, we do a similar approach here.
+        width_vectors, depth_vectors = arch_vectors['width'], arch_vectors['depth']
+
+        for b in self.resnets:
+            
+            assert hasattr(b, "get_gate_structure")
+            b_structure = b.get_gate_structure()
+            assert len(b_structure) == 2
+            block_vectors = {'width': [], 'depth': []}
+            for i in range(len(b_structure['width'])):
+                b_structure['width'][i] == width_vectors[0].shape[1]
+                block_vectors['width'].append(width_vectors.pop(0))
+            for i in range(len(b_structure['depth'])):
+                if b_structure['depth'][i] == 1:
+                    block_vectors['depth'].append(depth_vectors.pop(0))
+            b.set_gate_structure(block_vectors)
+            
+        for b in self.attentions:
+            
+            assert hasattr(b, "get_gate_structure")
+            b_structure = b.get_gate_structure()
+            assert len(b_structure) == 2
+            block_vectors = {'width': [], 'depth': []}
+            for i in range(len(b_structure['width'])):
+                assert b_structure['width'][i] == width_vectors[0].shape[1]
+                block_vectors['width'].append(width_vectors.pop(0))     
+            for i in range(len(b_structure['depth'])):
+                if b_structure['depth'][i] == 1:
+                    block_vectors['depth'].append(depth_vectors.pop(0))
+            b.set_gate_structure(block_vectors)
+
 
 class DownBlock2DWidthDepthGated(DownBlock2D):
     def __init__(
@@ -1804,7 +1941,23 @@ class DownBlock2DWidthHalfDepthGated(DownBlock2D):
 
             self.structure = structure  
         return self.structure
-    
+
+    def set_gate_structure(self, arch_vectors):
+
+        width_vectors, depth_vectors = arch_vectors['width'], arch_vectors['depth']
+        for b in self.resnets:
+            assert hasattr(b, "get_gate_structure")
+            b_structure = b.get_gate_structure()
+            assert len(b_structure) == 2
+            block_vectors = {'width': [], 'depth': []}
+            for i in range(len(b_structure['width'])):
+                b_structure['width'][i] == width_vectors[0].shape[1]
+                block_vectors['width'].append(width_vectors.pop(0))
+            for i in range(len(b_structure['depth'])):
+                if b_structure['depth'][i] == 1:
+                    block_vectors['depth'].append(depth_vectors.pop(0))
+            b.set_gate_structure(block_vectors)
+            
 
 class UpBlock2DWidthDepthGated(UpBlock2D):
     def __init__(
@@ -1935,6 +2088,22 @@ class UpBlock2DWidthHalfDepthGated(UpBlock2D):
             self.structure = structure  
         return self.structure
 
+    def set_gate_structure(self, arch_vectors):
+
+        width_vectors, depth_vectors = arch_vectors['width'], arch_vectors['depth']
+        for b in self.resnets:
+            assert hasattr(b, "get_gate_structure")
+            b_structure = b.get_gate_structure()
+            assert len(b_structure) == 2
+            block_vectors = {'width': [], 'depth': []}
+            for i in range(len(b_structure['width'])):
+                b_structure['width'][i] == width_vectors[0].shape[1]
+                block_vectors['width'].append(width_vectors.pop(0))
+            for i in range(len(b_structure['depth'])):
+                if b_structure['depth'][i] == 1:
+                    block_vectors['depth'].append(depth_vectors.pop(0))
+            b.set_gate_structure(block_vectors)
+
 
 class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
     def __init__(
@@ -2053,3 +2222,35 @@ class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
             self.structure = structure  
 
         return self.structure
+
+    def set_gate_structure(self, arch_vectors):
+        # We first read the resnets and then attentions in the "get_gate_structure" method. Thus, we do a similar approach here.
+        width_vectors, depth_vectors = arch_vectors['width'], arch_vectors['depth']
+
+        for b in self.resnets:
+            
+            assert hasattr(b, "get_gate_structure")
+            b_structure = b.get_gate_structure()
+            assert len(b_structure) == 2
+            block_vectors = {'width': [], 'depth': []}
+            for i in range(len(b_structure['width'])):
+                b_structure['width'][i] == width_vectors[0].shape[1]
+                block_vectors['width'].append(width_vectors.pop(0))
+            for i in range(len(b_structure['depth'])):
+                if b_structure['depth'][i] == 1:
+                    block_vectors['depth'].append(depth_vectors.pop(0))
+            b.set_gate_structure(block_vectors)
+            
+        for b in self.attentions:
+            
+            assert hasattr(b, "get_gate_structure")
+            b_structure = b.get_gate_structure()
+            assert len(b_structure) == 2
+            block_vectors = {'width': [], 'depth': []}
+            for i in range(len(b_structure['width'])):
+                assert b_structure['width'][i] == width_vectors[0].shape[1]
+                block_vectors['width'].append(width_vectors.pop(0))     
+            for i in range(len(b_structure['depth'])):
+                if b_structure['depth'][i] == 1:
+                    block_vectors['depth'].append(depth_vectors.pop(0))
+            b.set_gate_structure(block_vectors)

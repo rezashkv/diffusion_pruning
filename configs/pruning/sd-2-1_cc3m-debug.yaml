@@ -94,7 +94,7 @@ training:
       weight: 1.0
 
     contrastive_clip_loss:
-      temperature: 1.0
+      temperature: 0.15
       weight: 0.1
 
   optim:

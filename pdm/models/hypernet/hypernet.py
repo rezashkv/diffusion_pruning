@@ -70,7 +70,8 @@ class HyperStructure(ModelMixin, ConfigMixin):
             x = x.cuda()
             self.h0 = self.h0.cuda()
         outputs, hn = self.Bi_GRU(x, self.h0)
-        outputs = outputs.sum(dim=1).unsqueeze(1).expand(outputs.size(0), len(self.mh_fc), outputs.size(2))
+        # outputs = outputs.sum(dim=1).unsqueeze(1).expand(outputs.size(0), len(self.mh_fc), outputs.size(2))
+        outputs = outputs.mean(dim=1).unsqueeze(1).expand(outputs.size(0), len(self.mh_fc), outputs.size(2))
         outputs = [F.relu(self.bn1(outputs[:, i, :])) for i in range(len(self.mh_fc))]
         outputs = [self.mh_fc[i](outputs[i]) for i in range(len(self.mh_fc))]
 
@@ -82,3 +83,20 @@ class HyperStructure(ModelMixin, ConfigMixin):
         for name, param in self.named_parameters():
             if "weight" in name:
                 print(f"{name}: {param.mean()}, {param.std()}")
+
+    def transfrom_structure_vector(self, inputs):
+        assert inputs.shape[1] == (sum(self.width_list) + sum(self.depth_list))
+        width_list = []
+        depth_list = []
+        width_vectors = inputs[:, :sum(self.width_list)]
+        depth_vectors = inputs[:, sum(self.width_list):]
+        start = 0
+        for i in range(len(self.width_list)):
+            end = start + self.width_list[i]
+            width_list.append(width_vectors[:, start:end])
+            start = end
+
+        for i in range(sum(self.depth_list)):
+            depth_list.append(depth_vectors[:, i])
+
+        return {"width": width_list, "depth": depth_list}

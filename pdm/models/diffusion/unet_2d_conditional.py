@@ -1344,6 +1344,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
                 structure['width'] = structure['width'] + m_structure['width']
                 structure['depth'] = structure['depth'] + m_structure['depth']
             
+            # Middle Blocks
             assert hasattr(self.mid_block, "get_gate_structure")
             mid_structure = self.mid_block.get_gate_structure()
             assert len(mid_structure) == 2
@@ -1378,26 +1379,77 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
     #             structure_size.append(elem["depth"][0])
     #     return structure, structure_size
 
-    def set_structure(self, arch_vector):
-        structure = self.get_structure()
-        width_structure = structure['width']
-        width_size = sum([sum(w) for w in width_structure])
+    def set_structure(self, arch_vectors):
 
-        width_start = 0
-        depth_start = width_size
-        for m in self.modules():
-            if hasattr(m, "set_virtual_gate"):
-                m_structure = m.get_gate_structure()
-                width = sum(m_structure["width"])
-                depth = sum(m_structure["depth"])
-                gate = arch_vector[:, width_start:width_start+width]
-                if "depth" in m_structure:
-                    depth_gate = arch_vector[:, depth_start:depth_start+depth]
-                    gate = torch.cat([gate, depth_gate], dim=1)
+        width_vectors, depth_vectors = arch_vectors['width'], arch_vectors['depth']
+        # Down Blocks
+        for m in self.down_blocks:
+            assert hasattr(m, "get_gate_structure")
+            m_structure = m.get_gate_structure()
+            assert len(m_structure) == 2
+            assert len(m_structure['width']) == len(m_structure['depth'])
+            block_vectors = {'width': [], 'depth': []}
+            for i in range(len(m_structure['width'])):
+                for j in range(len(m_structure['width'][i])):
+                    assert m_structure['width'][i][j] == width_vectors[0].shape[1]
+                    block_vectors['width'].append(width_vectors.pop(0))
+            for i in range(len(m_structure['depth'])):
+                if m_structure['depth'][i] == [1]:
+                    block_vectors['depth'].append(depth_vectors.pop(0))
+            m.set_gate_structure(block_vectors)
+        
+        # Middle Blocks
+        assert hasattr(self.mid_block, "get_gate_structure")
+        mid_structure = self.mid_block.get_gate_structure()
+        assert len(mid_structure) == 2
+        assert len(mid_structure['width']) == len(mid_structure['depth'])
+        block_vectors = {'width': [], 'depth': []}
+        for i in range(len(mid_structure['width'])):
+            for j in range(len(mid_structure['width'][i])):
+                assert mid_structure['width'][i][j] == width_vectors[0].shape[1]
+                block_vectors['width'].append(width_vectors.pop(0))
+        for i in range(len(mid_structure['depth'])):
+            if mid_structure['depth'][i] == [1]:
+                block_vectors['depth'].append(depth_vectors.pop(0))
+        self.mid_block.set_gate_structure(block_vectors)
 
-                m.set_virtual_gate(gate)
-                width_start += width
-                depth_start += depth
+        # Up Blocks
+        for m in self.up_blocks:
+            assert hasattr(m, "get_gate_structure")
+            m_structure = m.get_gate_structure()
+            assert len(m_structure) == 2
+            assert len(m_structure['width']) == len(m_structure['depth'])
+            block_vectors = {'width': [], 'depth': []}
+            for i in range(len(m_structure['width'])):
+                for j in range(len(m_structure['width'][i])):
+                    assert m_structure['width'][i][j] == width_vectors[0].shape[1]
+                    block_vectors['width'].append(width_vectors.pop(0))
+            for i in range(len(m_structure['depth'])):
+                if m_structure['depth'][i] == [1]:
+                    block_vectors['depth'].append(depth_vectors.pop(0))
+            m.set_gate_structure(block_vectors)
+        
+
+    # def set_structure(self, width_vectors, depth_vectors):
+    #     structure = self.get_structure()
+    #     width_structure = structure['width']
+    #     width_size = sum([sum(w) for w in width_structure])
+
+    #     width_start = 0
+    #     depth_start = width_size
+    #     for m in self.modules():
+    #         if hasattr(m, "set_virtual_gate"):
+    #             m_structure = m.get_gate_structure()
+    #             width = sum(m_structure["width"])
+    #             depth = sum(m_structure["depth"])
+    #             gate = arch_vector[:, width_start:width_start+width]
+    #             if "depth" in m_structure:
+    #                 depth_gate = arch_vector[:, depth_start:depth_start+depth]
+    #                 gate = torch.cat([gate, depth_gate], dim=1)
+
+    #             m.set_virtual_gate(gate)
+    #             width_start += width
+    #             depth_start += depth
 
     def forward(
             self,

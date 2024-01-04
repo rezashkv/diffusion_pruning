@@ -66,6 +66,9 @@ from pdm.datasets.cc3m import load_cc3m_dataset
 from pdm.datasets.laion_aes import load_main_laion_dataset
 from pdm.training.validation import validation
 
+from sentence_transformers import SentenceTransformer
+
+
 if is_wandb_available():
     import wandb
 
@@ -158,6 +161,10 @@ def main():
 
     # If passed along, set the training seed now.
     if config.seed is not None:
+        random.seed(config.seed)
+        np.random.seed(config.seed)
+        torch.manual_seed(config.seed)
+        torch.cuda.manual_seed_all(config.seed)
         set_seed(config.seed)
 
     # Handle the repository creation
@@ -246,6 +253,7 @@ def main():
     # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
+    text_projection.requires_grad_(False)
 
     # Create EMA for the unet.
     if config["model"]["unet"]["use_ema"]:
@@ -494,6 +502,10 @@ def main():
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
+        
+        for i, c in enumerate(captions):
+            print(f"{i+1}: {c}")
+
         inputs = tokenizer(
             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
@@ -578,8 +590,8 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    unet, optimizer, train_dataloader, lr_scheduler, hyper_net, quantizer = accelerator.prepare(
-        unet, optimizer, train_dataloader, lr_scheduler, hyper_net, quantizer
+    unet, optimizer, train_dataloader, lr_scheduler, hyper_net, quantizer, text_projection = accelerator.prepare(
+        unet, optimizer, train_dataloader, lr_scheduler, hyper_net, quantizer, text_projection
     )
 
     if config.use_ema:
@@ -626,9 +638,10 @@ def main():
         tracker_config = cfg2dict(config)
         if config.wandb_run_name is None:
             config.wandb_run_name = f"{config.data.dataset_name if config.data.dataset_name else config.data.data_dir.split('/')[-1]}-{config.data.max_train_samples}"
-        accelerator.init_trackers(config.tracker_project_name, tracker_config,
-                                  init_kwargs={"wandb": {"name": config.wandb_run_name}}
-                                  )
+        # accelerator.init_trackers(config.tracker_project_name, tracker_config,
+        #                           init_kwargs={"wandb": {"name": config.wandb_run_name}}  #TODO: uncomment later.
+        #                           )
+    
     # Train!
     total_batch_size = (config.data.dataloader.train_batch_size * accelerator.num_processes *
                         config.training.gradient_accumulation_steps)
@@ -724,19 +737,20 @@ def main():
                 # gather the arch_vector_quantized across all processes to get large batch for contrastive loss
                 # encoder_hidden_states_list = accelerator.gather(encoder_hidden_states)
 
-                text_features_list = self.accelerator.gather(text_features)
+                text_features_list = accelerator.gather(text_features)
                 arch_vector_quantized_list = accelerator.gather(arch_vector_quantized)
 
                 # contrastive_loss = clip_loss(torch.sum(encoder_hidden_states_list, dim=1).squeeze(1), arch_vector_quantized_list)
                 contrastive_loss = clip_loss(text_features_list,
                                              arch_vector_quantized_list)
 
+                arch_vectors_separated = hyper_net.transfrom_structure_vector(arch_vector_quantized)
+                unet.set_structure(arch_vectors_separated)
                 if unet.total_flops is None:
                     with torch.no_grad():
-                        unet.set_structure(arch_vector_quantized)
                         unet(noisy_latents, timesteps, encoder_hidden_states)
-                        unet.total_flops = unet.compute_average_flops_cost()[0]
-                        unet.reset_flops_count()
+                    unet.total_flops = unet.compute_average_flops_cost()[0]
+                    unet.reset_flops_count()
 
                 unet.set_structure(arch_vector_quantized)
 
