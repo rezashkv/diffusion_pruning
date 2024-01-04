@@ -64,7 +64,6 @@ logger = get_logger(__name__)
 
 
 def main():
-    torch.autograd.set_detect_anomaly(True)
     args = parse_args()
     config = OmegaConf.load(args.base_config_path)
     # add args to config

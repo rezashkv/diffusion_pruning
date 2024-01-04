@@ -4,7 +4,7 @@ from pathlib import Path
 import torch.nn.functional as F
 import os
 import shutil
-from typing import Optional, Tuple, List, Dict, Callable
+from typing import Optional, Tuple, Dict, Callable
 
 import diffusers
 import math
@@ -13,7 +13,7 @@ import torch
 import torchvision
 import transformers
 import wandb
-from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils import ProjectConfiguration
 from datasets import Dataset
 from diffusers import UNet2DConditionModel, EMAModel, get_scheduler
 from diffusers.utils import make_image_grid, is_wandb_available
@@ -70,9 +70,6 @@ class DiffPruningTrainer:
         self.tokenizer = tokenizer
         self.configure_logging()
 
-        # If passed along, set the training seed now.
-        if config.seed is not None:
-            set_seed(config.seed)
         self.create_repo()
 
         if config.use_ema:
@@ -198,14 +195,14 @@ class DiffPruningTrainer:
     def prepare_datasets(self, preprocess_train, preprocess_eval):
         with self.accelerator.main_process_first():
             if self.config.data.max_train_samples is not None:
-                self.train_dataset = self.train_dataset.shuffle(seed=self.config.seed).select(
+                self.train_dataset = self.train_dataset.select(
                     range(self.config.data.max_train_samples))
             # Set the training transforms
             self.train_dataset = self.train_dataset.with_transform(preprocess_train)
 
             if self.eval_dataset is not None:
                 if self.config.data.max_validation_samples is not None:
-                    self.eval_dataset = self.eval_dataset.shuffle(seed=self.config.seed).select(
+                    self.eval_dataset = self.eval_dataset.select(
                         range(self.config.data.max_validation_samples))
                     # Set the validation transforms
                 self.eval_dataset = self.eval_dataset.with_transform(preprocess_eval)
@@ -251,15 +248,10 @@ class DiffPruningTrainer:
         return optimizer
 
     def initialize_dataloaders(self, collate_fn):
-        if self.config.seed is None:
-            generator = None
-        else:
-            generator = torch.Generator().manual_seed(self.config.seed)
         train_dataloader = torch.utils.data.DataLoader(
             self.train_dataset,
             shuffle=True,
             collate_fn=collate_fn,
-            generator=generator,
             batch_size=self.config.data.dataloader.train_batch_size,
             num_workers=self.config.data.dataloader.dataloader_num_workers,
         )
@@ -269,7 +261,6 @@ class DiffPruningTrainer:
                 self.eval_dataset,
                 shuffle=False,
                 collate_fn=collate_fn,
-                generator=generator,
                 batch_size=self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes,
                 num_workers=self.config.data.dataloader.dataloader_num_workers,
             )
