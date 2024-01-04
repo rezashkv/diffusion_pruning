@@ -1,14 +1,12 @@
+import logging
 import os
 import pickle
 import PIL
 import pandas as pd
 from PIL import ImageFile
-from accelerate.logging import get_logger
 from datasets import Dataset
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-
-logger = get_logger(__name__)
 
 
 def load_cc3m_dataset(data_dir,  split="train", split_file="Train_GCC-training.tsv",
@@ -39,7 +37,7 @@ def load_cc3m_dataset(data_dir,  split="train", split_file="Train_GCC-training.t
             bad_images = f.readlines()
         bad_images = [image.strip() for image in bad_images]
         images = set(images) - set(bad_images)
-        images = list(images)
+        images = sorted(list(images))
 
     else:
         # remove images that cant be opened by PIL
@@ -52,7 +50,7 @@ def load_cc3m_dataset(data_dir,  split="train", split_file="Train_GCC-training.t
                     imgs.append(img)
             except PIL.UnidentifiedImageError:
                 bad_images.append(image)
-                logger.info(
+                logging.info(
                     f"Image file `{image}` is corrupt and can't be opened."
                 )
         images = imgs

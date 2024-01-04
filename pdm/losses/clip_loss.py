@@ -18,11 +18,9 @@ class ClipLoss(nn.Module):
         self.width_intervals = [(width_indices[i], width_indices[i + 1]) for i in range(len(width_indices) - 1)]
 
         widths_sum = sum(self.width_list) - 1
-
         self.depth_indices = (widths_sum + np.cumsum(self.depth_list)).tolist()
 
         template = torch.tensor(self.width_list + [d for d in self.depth_list if d != 0])
-        #
         template = torch.repeat_interleave(template, template).type(torch.float32)
         self.template = (1.0 / template).requires_grad_(False)
 
@@ -44,6 +42,5 @@ class ClipLoss(nn.Module):
         prompt_embeddings = prompt_embeddings / prompt_embeddings.norm(dim=1, keepdim=True)
         arch_vectors_similarity = F.softmax((arch_vectors_normalized @ arch_vectors_normalized.T) / self.temperature, dim=-1)
         texts_similarity = F.softmax((prompt_embeddings @ prompt_embeddings.T) / self.temperature, dim=-1)
-        print(f"texts_similarity: {texts_similarity}")
         loss = F.cross_entropy(arch_vectors_similarity.T, texts_similarity.T, reduction='mean')
         return loss.mean()

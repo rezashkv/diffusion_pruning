@@ -1398,7 +1398,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
                     block_vectors['depth'].append(depth_vectors.pop(0))
             m.set_gate_structure(block_vectors)
         
-        # Middle Blocks
+        # Middle Block
         assert hasattr(self.mid_block, "get_gate_structure")
         mid_structure = self.mid_block.get_gate_structure()
         assert len(mid_structure) == 2
@@ -1428,7 +1428,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
                 if m_structure['depth'][i] == [1]:
                     block_vectors['depth'].append(depth_vectors.pop(0))
             m.set_gate_structure(block_vectors)
-        
+
 
     # def set_structure(self, width_vectors, depth_vectors):
     #     structure = self.get_structure()

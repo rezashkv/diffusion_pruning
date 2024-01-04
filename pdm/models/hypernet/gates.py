@@ -69,18 +69,3 @@ class LinearVirtualGate(VirtualGate):
             gate_f = gate_f.cuda()
         x = gate_f.expand_as(x) * x
         return x
-        
-
-
-class LinearVirtualGate(VirtualGate):
-    def __init__(self, width):
-        super(LinearVirtualGate, self).__init__(width)
-
-    def forward(self, x):
-        gate_f = self.gate_f
-        for _ in range(len(x.size()) - 2):
-            gate_f = gate_f.unsqueeze(1)
-        if x.is_cuda:
-            gate_f = gate_f.cuda()
-        x = gate_f.expand_as(x) * x
-        return x

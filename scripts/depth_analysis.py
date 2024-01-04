@@ -154,8 +154,7 @@ def main():
                                          beta=config.model.quantizer.arch_vq_beta,
                                          temperature=config.model.quantizer.quantizer_T,
                                          base=config.model.quantizer.quantizer_base,
-                                         depth_order=config.model.quantizer.depth_order,
-                                         non_zero_width=config.model.quantizer.non_zero_width)
+                                         depth_order=config.model.quantizer.depth_order)
 
     r_loss = ResourceLoss(p=config.training.losses.resource_loss.pruning_target,
                           loss_type=config.training.losses.resource_loss.type)
@@ -421,6 +420,9 @@ def main():
         mpnet_embeddings = mpnet_embeddings.to(memory_format=torch.contiguous_format).float()
         return {"pixel_values": pixel_values, "input_ids": input_ids, "mpnet_embeddings": mpnet_embeddings}
 
+    if config.data.prompts is None:
+        config.data.prompts = dataset["validation"][caption_column][:config.data.max_generated_samples]
+
     trainer = DiffPruningTrainer(config=config,
                                  hyper_net=hyper_net,
                                  quantizer=quantizer,
@@ -439,7 +441,7 @@ def main():
                                  tokenizer=tokenizer,
                                  )
 
-    trainer.train()
+    trainer.depth_analysis()
 
 
 if __name__ == "__main__":

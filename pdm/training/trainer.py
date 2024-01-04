@@ -4,15 +4,16 @@ from pathlib import Path
 import torch.nn.functional as F
 import os
 import shutil
-from typing import Optional, Tuple, List, Dict, Callable
+from typing import Optional, Tuple, Dict, Callable
 
 import diffusers
 import math
 import numpy as np
 import torch
+import torchvision
 import transformers
 import wandb
-from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils import ProjectConfiguration
 from datasets import Dataset
 from diffusers import UNet2DConditionModel, EMAModel, get_scheduler
 from diffusers.utils import make_image_grid, is_wandb_available
@@ -69,9 +70,6 @@ class DiffPruningTrainer:
         self.tokenizer = tokenizer
         self.configure_logging()
 
-        # If passed along, set the training seed now.
-        if config.seed is not None:
-            set_seed(config.seed)
         self.create_repo()
 
         if config.use_ema:
@@ -179,13 +177,35 @@ class DiffPruningTrainer:
 
     def prepare_with_accelerator(self):
         # Prepare everything with our `accelerator`.
-        self.unet, self.optimizer, self.train_dataloader, self.lr_scheduler, self.hyper_net, self.quantizer = (
-            self.accelerator.prepare(self.unet, self.optimizer, self.train_dataloader,
-                                     self.lr_scheduler, self.hyper_net, self.quantizer
-                                     ))
+        if self.eval_dataloader is not None:
+            (self.unet, self.optimizer, self.train_dataloader, self.eval_dataloader, self.lr_scheduler, self.hyper_net,
+             self.quantizer) = (self.accelerator.prepare(self.unet, self.optimizer, self.train_dataloader,
+                                                         self.eval_dataloader, self.lr_scheduler, self.hyper_net,
+                                                         self.quantizer
+                                                         ))
+        else:
+            self.unet, self.optimizer, self.train_dataloader, self.lr_scheduler, self.hyper_net, self.quantizer = (
+                self.accelerator.prepare(self.unet, self.optimizer, self.train_dataloader, self.lr_scheduler,
+                                         self.hyper_net, self.quantizer
+                                         ))
 
         if self.config.use_ema:
             self.ema_unet.to(self.accelerator.device)
+
+    def prepare_datasets(self, preprocess_train, preprocess_eval):
+        with self.accelerator.main_process_first():
+            if self.config.data.max_train_samples is not None:
+                self.train_dataset = self.train_dataset.select(
+                    range(self.config.data.max_train_samples))
+            # Set the training transforms
+            self.train_dataset = self.train_dataset.with_transform(preprocess_train)
+
+            if self.eval_dataset is not None:
+                if self.config.data.max_validation_samples is not None:
+                    self.eval_dataset = self.eval_dataset.select(
+                        range(self.config.data.max_validation_samples))
+                    # Set the validation transforms
+                self.eval_dataset = self.eval_dataset.with_transform(preprocess_eval)
 
     def initialize_optimizer(self):
         if self.config.training.optim.scale_lr:
@@ -321,7 +341,7 @@ class DiffPruningTrainer:
 
         return initial_global_step, first_epoch
 
-    def pre_train_setup(self):
+    def init_weight_dtype(self):
         # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
         # as these weights are only used for inference, keeping weights in full precision is not required.
         self.weight_dtype = torch.float32
@@ -332,10 +352,7 @@ class DiffPruningTrainer:
             self.weight_dtype = torch.bfloat16
             self.config.mixed_precision = self.accelerator.mixed_precision
 
-        # Move text_encode and vae to gpu and cast to weight_dtype
-        self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
-        self.vae.to(self.accelerator.device, dtype=self.weight_dtype)
-
+    def pre_train_setup(self):
         # We need to recalculate our total training steps as the size of the training dataloader may have changed.
         num_update_steps_per_epoch = math.ceil(
             len(self.train_dataloader) / self.config.training.gradient_accumulation_steps)
@@ -345,10 +362,17 @@ class DiffPruningTrainer:
         self.config.training.num_train_epochs = math.ceil(
             self.config.training.max_train_steps / num_update_steps_per_epoch)
 
-        self.init_trackers()
-
     def train(self):
+        self.init_weight_dtype()
+
+        # Move text_encode and vae to gpu and cast to weight_dtype
+        self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
+        self.vae.to(self.accelerator.device, dtype=self.weight_dtype)
+
         self.pre_train_setup()
+        if len(self.accelerator.trackers) == 0:
+            self.init_trackers()
+
         # Train!
         logging_dir = self.config.training.logging.logging_dir
         total_batch_size = (self.config.data.dataloader.train_batch_size * self.accelerator.num_processes *
@@ -407,24 +431,25 @@ class DiffPruningTrainer:
 
                     # Get the text embedding for conditioning
                     encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
+                    text_embeddings = batch["mpnet_embeddings"]
 
                     arch_vector = self.hyper_net(encoder_hidden_states)
                     arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
 
                     # gather the arch_vector_quantized across all processes to get large batch for contrastive loss
-                    encoder_hidden_states_list = self.accelerator.gather(encoder_hidden_states)
+                    text_embeddings_list = self.accelerator.gather(text_embeddings)
                     arch_vector_quantized_list = self.accelerator.gather(arch_vector_quantized)
-                    contrastive_loss = self.clip_loss(torch.sum(encoder_hidden_states_list, dim=1).squeeze(1),
+                    contrastive_loss = self.clip_loss(text_embeddings_list,
                                                       arch_vector_quantized_list)
+
+                    arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
+                    self.unet.set_structure(arch_vectors_separated)
 
                     if self.unet.total_flops is None:
                         with torch.no_grad():
-                            self.unet.set_structure(arch_vector_quantized)
                             self.unet(noisy_latents, timesteps, encoder_hidden_states)
-                            self.unet.total_flops = self.unet.compute_average_flops_cost()[0]
-                            self.unet.reset_flops_count()
-
-                    self.unet.set_structure(arch_vector_quantized)
+                        self.unet.total_flops = self.unet.compute_average_flops_cost()[0]
+                        self.unet.reset_flops_count()
 
                     # Get the target for loss depending on the prediction type
                     if self.config.model.unet.prediction_type is not None:
@@ -598,7 +623,13 @@ class DiffPruningTrainer:
 
         self.accelerator.end_training()
 
-    def validate(self, global_step):
+    def validate(self, epoch):
+        self.init_weight_dtype()
+        # Move text_encode and vae to gpu and cast to weight_dtype
+        self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
+        self.vae.to(self.accelerator.device, dtype=self.weight_dtype)
+        if len(self.accelerator.trackers) == 0:
+            self.init_trackers()
 
         progress_bar = tqdm(
             range(0, len(self.eval_dataloader)),
@@ -607,99 +638,99 @@ class DiffPruningTrainer:
             # Only show the progress bar once on each machine.
             disable=not self.accelerator.is_local_main_process,
         )
+
         val_loss = 0.0
+
+        self.hyper_net.eval()
+        self.quantizer.eval()
+        self.unet.eval()
         for step, batch in enumerate(self.eval_dataloader):
-
-            self.hyper_net.eval()
-            self.quantizer.eval()
-            self.unet.eval()
             self.unet.reset_flops_count()
-            with self.accelerator.split_between_processes(batch) as batch:
-                batch = {k: v.to(self.accelerator.device) for k, v in batch.items()}
-                with torch.no_grad():
-                    # Convert images to latent space
-                    latents = self.vae.encode(batch["pixel_values"].to(self.weight_dtype)).latent_dist.sample()
-                    latents = latents * self.vae.config.scaling_factor
+            # with self.accelerator.split_between_processes(batch) as batch:
+            batch = {k: v.to(self.accelerator.device) for k, v in batch.items()}
+            with torch.no_grad():
+                # Convert images to latent space
+                latents = self.vae.encode(batch["pixel_values"].to(self.weight_dtype)).latent_dist.sample()
+                latents = latents * self.vae.config.scaling_factor
 
-                    # Sample noise that we'll add to the latents
-                    noise = torch.randn_like(latents)
-                    if self.config.model.unet.noise_offset:
-                        # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                        noise += self.config.model.unet.noise_offset * torch.randn(
-                            (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
-                        )
-                    if self.config.model.unet.input_perturbation:
-                        new_noise = noise + self.config.model.unet.input_perturbation * torch.randn_like(noise)
-                    bsz = latents.shape[0]
-                    # Sample a random timestep for each image
-                    timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,),
-                                              device=latents.device)
-                    timesteps = timesteps.long()
+                # Sample noise that we'll add to the latents
+                noise = torch.randn_like(latents)
+                if self.config.model.unet.noise_offset:
+                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+                    noise += self.config.model.unet.noise_offset * torch.randn(
+                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+                    )
+                if self.config.model.unet.input_perturbation:
+                    new_noise = noise + self.config.model.unet.input_perturbation * torch.randn_like(noise)
+                bsz = latents.shape[0]
+                # Sample a random timestep for each image
+                timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,),
+                                          device=latents.device)
+                timesteps = timesteps.long()
 
-                    # Add noise to the latents according to the noise magnitude at each timestep
-                    # (this is the forward diffusion process)
-                    if self.config.model.unet.input_perturbation:
-                        noisy_latents = self.noise_scheduler.add_noise(latents, new_noise, timesteps)
-                    else:
-                        noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+                # Add noise to the latents according to the noise magnitude at each timestep
+                # (this is the forward diffusion process)
+                if self.config.model.unet.input_perturbation:
+                    noisy_latents = self.noise_scheduler.add_noise(latents, new_noise, timesteps)
+                else:
+                    noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
-                    # Get the text embedding for conditioning
-                    encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
+                # Get the text embedding for conditioning
+                encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
 
-                    arch_vector = self.hyper_net(encoder_hidden_states)
-                    arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
+                arch_vector = self.hyper_net(encoder_hidden_states)
+                arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
 
-                    self.unet.set_structure(arch_vector_quantized)
+                self.unet.set_structure(arch_vector_quantized)
 
-                    # Get the target for loss depending on the prediction type
-                    if self.config.model.unet.prediction_type is not None:
-                        # set prediction_type of scheduler if defined
-                        self.noise_scheduler.register_to_config(prediction_type=self.config.model.unet.prediction_type)
+                # Get the target for loss depending on the prediction type
+                if self.config.model.unet.prediction_type is not None:
+                    # set prediction_type of scheduler if defined
+                    self.noise_scheduler.register_to_config(prediction_type=self.config.model.unet.prediction_type)
 
-                    if self.noise_scheduler.config.prediction_type == "epsilon":
-                        target = noise
-                    elif self.noise_scheduler.config.prediction_type == "v_prediction":
-                        target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
-                    else:
-                        raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
+                if self.noise_scheduler.config.prediction_type == "epsilon":
+                    target = noise
+                elif self.noise_scheduler.config.prediction_type == "v_prediction":
+                    target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
 
-                    # Predict the noise residual and compute loss
-                    model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                # Predict the noise residual and compute loss
+                model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
-                    if self.config.training.losses.diffusion_loss.snr_gamma is None:
-                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                    else:
-                        # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                        # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                        # This is discussed in Section 4.2 of the same paper.
-                        snr = compute_snr(self.noise_scheduler, timesteps)
-                        if self.noise_scheduler.config.prediction_type == "v_prediction":
-                            # Velocity objective requires that we add one to SNR values before we divide by them.
-                            snr = snr + 1
-                        mse_loss_weights = (
-                                torch.stack(
-                                    [snr,
-                                     self.config.training.losses.diffusion_loss.snr_gamma * torch.ones_like(timesteps)],
-                                    dim=1).min(dim=1)[0] / snr
-                        )
+                if self.config.training.losses.diffusion_loss.snr_gamma is None:
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                else:
+                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+                    # This is discussed in Section 4.2 of the same paper.
+                    snr = compute_snr(self.noise_scheduler, timesteps)
+                    if self.noise_scheduler.config.prediction_type == "v_prediction":
+                        # Velocity objective requires that we add one to SNR values before we divide by them.
+                        snr = snr + 1
+                    mse_loss_weights = (
+                            torch.stack(
+                                [snr,
+                                 self.config.training.losses.diffusion_loss.snr_gamma * torch.ones_like(timesteps)],
+                                dim=1).min(dim=1)[0] / snr
+                    )
 
-                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                        loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                        loss = loss.mean()
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+                    loss = loss.mean()
 
-                    # Gather the losses across all processes for logging (if we use distributed training).
-                    avg_loss = self.accelerator.gather(
-                        loss.repeat(self.config.data.dataloader.validation_batch_size)).mean()
-                    val_loss += avg_loss.item() / len(self.eval_dataloader)
-                    progress_bar.update(1)
-                    step += 1
-                self.accelerator.log({"val_loss": val_loss})
-                logs = {"val_step_loss": loss.detach().item()}
-                progress_bar.set_postfix(**logs)
+                # Gather the losses across all processes for logging (if we use distributed training).
+                avg_loss = self.accelerator.gather(
+                    loss.repeat(self.config.data.dataloader.validation_batch_size)).mean()
+                val_loss += avg_loss.item() / len(self.eval_dataloader)
+                progress_bar.update(1)
+                step += 1
+            self.accelerator.log({"val_loss": val_loss}, step=epoch * len(self.eval_dataloader) + step)
+            logs = {"val_step_loss": loss.detach().item()}
+            progress_bar.set_postfix(**logs)
 
     def generate_samples_from_prompts(self, epoch):
         logger.info("Generating samples from the given prompts... ")
-
         self.hyper_net.eval()
         self.quantizer.eval()
         pipeline = StableDiffusionPruningPipeline.from_pretrained(
@@ -721,12 +752,7 @@ class DiffPruningTrainer:
         if self.config.enable_xformers_memory_efficient_attention:
             pipeline.enable_xformers_memory_efficient_attention()
 
-        if self.config.seed is None:
-            generator = None
-        else:
-            generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
-
-        image_output_dir = os.path.join(self.config["training"]["logging"]["logging_dir"], "prompt_images",
+        image_output_dir = os.path.join(self.config.training.logging.logging_dir, "prompt_images",
                                         f"epoch_{epoch}")
         os.makedirs(image_output_dir, exist_ok=True)
         images = []
@@ -736,6 +762,11 @@ class DiffPruningTrainer:
                     step:step + self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes]
             with torch.autocast("cuda"):
                 with self.accelerator.split_between_processes(batch) as batch:
+                    if self.config.seed is None:
+                        generator = None
+                    else:
+                        generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
+
                     gen_images = pipeline(batch, num_inference_steps=self.config.training.num_inference_steps,
                                           generator=generator).images
                     gen_images = self.accelerator.gather(gen_images)
@@ -791,12 +822,7 @@ class DiffPruningTrainer:
         if self.config.enable_xformers_memory_efficient_attention:
             pipeline.enable_xformers_memory_efficient_attention()
 
-        if self.config.seed is None:
-            generator = None
-        else:
-            generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
-
-        image_output_dir = os.path.join(self.config["training"]["logging"]["logging_dir"], "quantizer_embedding_images",
+        image_output_dir = os.path.join(self.config.training.logging.logging_dir, "quantizer_embedding_images",
                                         f"epoch_{epoch}")
         os.makedirs(image_output_dir, exist_ok=True)
 
@@ -813,6 +839,11 @@ class DiffPruningTrainer:
                                    device=self.accelerator.device)
             with torch.autocast("cuda"):
                 with self.accelerator.split_between_processes(indices) as indices:
+                    if self.config.seed is None:
+                        generator = None
+                    else:
+                        generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
+
                     gen_images, quantizer_embed_gs = pipeline.quantizer_samples(indices=indices,
                                                                                 num_inference_steps=self.config.training.num_inference_steps,
                                                                                 generator=generator)
@@ -862,10 +893,10 @@ class DiffPruningTrainer:
                 print(OmegaConf.to_yaml(self.config))
                 OmegaConf.save(self.config, os.path.join(self.config.training.logging.logging_dir, "config.yaml"))
 
-            if self.config["training"]["hf_hub"]["push_to_hub"]:
+            if self.config.training.hf_hub.push_to_hub:
                 self.repo_id = create_repo(
-                    repo_id=self.config["training"]["hf_hub"]["hub_model_id"] or Path(logging_dir).name, exist_ok=True,
-                    token=self.config["training"]["hf_hub"]["hub_token"]
+                    repo_id=self.config.training.hf_hub.hub_model_id or Path(logging_dir).name, exist_ok=True,
+                    token=self.config.training.hf_hub.hub_token
                 ).repo_id
 
     def save_model_card(
@@ -944,11 +975,11 @@ class DiffPruningTrainer:
             f.write(yaml + model_card)
 
     def init_prompts(self):
-        if os.path.isfile(self.config["data"]["prompts"][0]):
-            with open(self.config["data"]["prompts"][0], "r") as f:
-                self.config["data"]["prompts"] = [line.strip() for line in f.readlines()]
-        elif os.path.isdir(self.config["data"]["prompts"][0]):
-            validation_prompts_dir = self.config["data"]["prompts"][0]
+        if os.path.isfile(self.config.data.prompts[0]):
+            with open(self.config.data.prompts[0], "r") as f:
+                self.config.data.prompts = [line.strip() for line in f.readlines()]
+        elif os.path.isdir(self.config.data.prompts[0]):
+            validation_prompts_dir = self.config.data.prompts[0]
             prompts = []
             for d in validation_prompts_dir:
                 files = [os.path.join(d, caption_file) for caption_file in os.listdir(d) if f.endswith(".txt")]
@@ -956,23 +987,117 @@ class DiffPruningTrainer:
                     with open(f, "r") as f:
                         prompts.extend([line.strip() for line in f.readlines()])
 
-            self.config["data"]["prompts"] = prompts
+            self.config.data.prompts = prompts
 
-        if self.config["data"]["max_generated_samples"] is not None:
-            self.config["data"]["prompts"] = self.config["data"]["prompts"][
-                                             :self.config["data"]["max_generated_samples"]]
+        if self.config.data.max_generated_samples is not None:
+            self.config.data.prompts = self.config.data.prompts[
+                                       :self.config.data.max_generated_samples]
 
-    def prepare_datasets(self, preprocess_train, preprocess_eval):
-        with self.accelerator.main_process_first():
-            if self.config.data.max_train_samples is not None:
-                self.train_dataset = self.train_dataset.shuffle(seed=self.config.seed).select(
-                    range(self.config.data.max_train_samples))
-            # Set the training transforms
-            self.train_dataset = self.train_dataset.with_transform(preprocess_train)
+    def depth_analysis(self):
+        self.init_weight_dtype()
+        # Move text_encode and vae to gpu and cast to weight_dtype
+        self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
+        self.vae.to(self.accelerator.device, dtype=self.weight_dtype)
+        if len(self.accelerator.trackers) == 0:
+            self.init_trackers()
 
-            if self.eval_dataset is not None:
-                if self.config.data.max_validation_samples is not None:
-                    self.eval_dataset = self.eval_dataset.shuffle(seed=self.config.seed).select(
-                        range(self.config.data.max_validation_samples))
-                    # Set the validation transforms
-                self.eval_dataset = self.eval_dataset.with_transform(preprocess_eval)
+        logger.info("Generating depth analysis samples from the given prompts... ")
+
+        self.hyper_net.eval()
+        self.quantizer.eval()
+        pipeline = StableDiffusionPruningPipeline.from_pretrained(
+            self.config.pretrained_model_name_or_path,
+            vae=self.accelerator.unwrap_model(self.vae),
+            text_encoder=self.accelerator.unwrap_model(self.text_encoder),
+            tokenizer=self.tokenizer,
+            unet=self.accelerator.unwrap_model(self.unet),
+            safety_checker=None,
+            revision=self.config.revision,
+            torch_dtype=self.weight_dtype,
+            hyper_net=self.hyper_net,
+            quantizer=self.quantizer,
+        )
+
+        pipeline = pipeline.to(self.accelerator.device)
+        pipeline.set_progress_bar_config()
+
+        if self.config.enable_xformers_memory_efficient_attention:
+            pipeline.enable_xformers_memory_efficient_attention()
+
+        image_output_dir = os.path.join(self.config.training.logging.logging_dir, "depth_analysis_images")
+        os.makedirs(image_output_dir, exist_ok=True)
+
+        n_depth_pruned_blocks = sum([sum(d) for d in self.unet.get_structure()['depth']])
+
+        # index n_depth_pruned_blocks is for no pruning
+        images = {i: [] for i in range(n_depth_pruned_blocks + 1)}
+
+        for d_block in range(n_depth_pruned_blocks + 1):
+            logger.info(f"Generating samples for depth block {d_block}...")
+            progress_bar = tqdm(
+                range(0, len(self.config.data.prompts)),
+                initial=0,
+                desc="Depth Analysis Steps",
+                # Only show the progress bar once on each machine.
+                disable=not self.accelerator.is_local_main_process,
+            )
+            for step in range(0, len(self.config.data.prompts),
+                              self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes):
+                batch = self.config.data.prompts[
+                        step:step + self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes]
+                with torch.autocast("cuda"):
+                    with self.accelerator.split_between_processes(batch) as batch:
+                        if self.config.seed is None:
+                            generator = None
+                        else:
+                            generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
+
+                        if d_block == n_depth_pruned_blocks:
+                            gen_images = pipeline.depth_analysis(batch,
+                                                                 num_inference_steps=self.config.training.num_inference_steps,
+                                                                 generator=generator, depth_index=None,
+                                                                 output_type="pt").images
+                        else:
+                            gen_images = pipeline.depth_analysis(batch,
+                                                                 num_inference_steps=self.config.training.num_inference_steps,
+                                                                 generator=generator, depth_index=d_block,
+                                                                 output_type="pt").images
+
+                        gen_images = self.accelerator.gather(gen_images)
+
+                        # append gen_images to images dict at the same key
+                        images[d_block] += gen_images
+
+                progress_bar.update(self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes)
+
+        image_grids = {}
+        for i, image in images.items():
+            # convert image from tensor to PIL image
+            image = [torchvision.transforms.ToPILImage()(img) for img in image]
+
+            # make an image grid with 4 columns
+            image_grid = make_image_grid(image, len(image) // 4, 4)
+            image_grid.save(os.path.join(image_output_dir, f"depth_{i}.png"))
+            image_grids[i] = image_grid
+
+        for tracker in self.accelerator.trackers:
+            if tracker.name == "tensorboard":
+                for i, image_grid in image_grids.items():
+                    tracker.writer.add_image(f"depth_{i}", np.asarray(image_grid), dataformats="HWC")
+
+            elif tracker.name == "wandb":
+                tracker.log(
+                    {
+                        "depth analysis": [
+                            wandb.Image(image_grid, caption=f"Depth: {i}")
+                            for i, image_grid in image_grids.items()
+                        ]
+                    }
+                )
+            else:
+                logger.warn(f"image logging not implemented for {tracker.name}")
+
+        del pipeline
+        torch.cuda.empty_cache()
+
+        return gen_images

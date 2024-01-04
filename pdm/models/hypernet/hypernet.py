@@ -84,7 +84,7 @@ class HyperStructure(ModelMixin, ConfigMixin):
             if "weight" in name:
                 print(f"{name}: {param.mean()}, {param.std()}")
 
-    def transfrom_structure_vector(self, inputs):
+    def transform_structure_vector(self, inputs):
         assert inputs.shape[1] == (sum(self.width_list) + sum(self.depth_list))
         width_list = []
         depth_list = []
