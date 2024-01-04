@@ -381,9 +381,9 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         # return output_tensor
         
         output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
-        assert torch.equal(output_tensor.shape, input_hidden_states.shape)
-        output = (1 - self.depth_gate.gate_f.expand_as(input_hidden_states)) * input_hidden_states + (self.depth_gate.gate_f.expand_as(output_tensor)) * output_tensor 
-        # output = self.depth_gate(output)
+        assert output_tensor.shape == input_hidden_states.shape
+        mask = self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        output = (1 - mask) * input_hidden_states + mask * output_tensor 
         return output
 
     def set_virtual_gate(self, gate_val):
@@ -1083,8 +1083,9 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
             )
 
         # ########### TODO: Depth gate
-        output = (1 - self.depth_gate.gate_f.expand_as(output)) * input_hidden_states + (self.depth_gate.gate_f.expand_as(output)) * output 
-        # output = self.depth_gate(output)
+        assert output.shape == input_hidden_states.shape
+        mask = self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        output_tensor = (1 - mask) * input_hidden_states + mask * output
 
         if not return_dict:
             return (output_tensor,)
