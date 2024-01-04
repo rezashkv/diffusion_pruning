@@ -1285,7 +1285,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
             callback_steps: int = 1,
             cross_attention_kwargs: Optional[Dict[str, Any]] = None,
             guidance_rescale: float = 0.0,
-            depth_index: int = 0,
+            depth_index: Optional[int] = None,
     ):
         # 0. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
@@ -1331,7 +1331,8 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
         else:
             vq_embed_dim = self.quantizer.vq_embed_dim
         structure_vector_quantized = torch.ones((batch_size, vq_embed_dim), device=device)
-        structure_vector_quantized[:, depth_index] = 0
+        if depth_index is not None:
+            structure_vector_quantized[:, depth_index] = 0
         self.unet.set_structure(structure_vector_quantized)
 
         # For classifier free guidance, we need to do two forward passes.

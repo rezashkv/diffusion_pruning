@@ -220,20 +220,20 @@ def main():
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    dataset_name = getattr(config["data"], "dataset_name", None)
-    dataset_config_name = getattr(config["data"], "dataset_config_name", None)
-    data_files = getattr(config["data"], "data_files", None)
-    data_dir = getattr(config["data"], "data_dir", None)
+    dataset_name = getattr(config.data, "dataset_name", None)
+    dataset_config_name = getattr(config.data, "dataset_config_name", None)
+    data_files = getattr(config.data, "data_files", None)
+    data_dir = getattr(config.data, "data_dir", None)
 
-    train_data_dir = getattr(config["data"], "train_data_dir", None)
-    train_data_file = getattr(config["data"], "train_data_file", None)
-    train_bad_images_path = getattr(config["data"], "train_bad_images_path", None)
-    max_train_samples = getattr(config["data"], "max_train_samples", None)
+    train_data_dir = getattr(config.data, "train_data_dir", None)
+    train_data_file = getattr(config.data, "train_data_file", None)
+    train_bad_images_path = getattr(config.data, "train_bad_images_path", None)
+    max_train_samples = getattr(config.data, "max_train_samples", None)
 
-    validation_data_dir = getattr(config["data"], "validation_data_dir", None)
-    validation_data_file = getattr(config["data"], "validation_data_file", None)
-    validation_bad_images_path = getattr(config["data"], "validation_bad_images_path", None)
-    max_validation_samples = getattr(config["data"], "max_validation_samples", None)
+    validation_data_dir = getattr(config.data, "validation_data_dir", None)
+    validation_data_file = getattr(config.data, "validation_data_file", None)
+    validation_bad_images_path = getattr(config.data, "validation_bad_images_path", None)
+    max_validation_samples = getattr(config.data, "max_validation_samples", None)
 
     if dataset_name is not None:
         # Downloading and loading a dataset from the hub.
@@ -419,6 +419,7 @@ def main():
         mpnet_embeddings = torch.stack([example["mpnet_embeddings"] for example in examples])
         mpnet_embeddings = mpnet_embeddings.to(memory_format=torch.contiguous_format).float()
         return {"pixel_values": pixel_values, "input_ids": input_ids, "mpnet_embeddings": mpnet_embeddings}
+
 
     trainer = DiffPruningTrainer(config=config,
                                  hyper_net=hyper_net,
