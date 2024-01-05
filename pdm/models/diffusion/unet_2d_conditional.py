@@ -1210,6 +1210,8 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         self.total_flops = total_flops
         self.structure = {'width': [], 'depth': []}
 
+        self.t_flops, self.prunable_flops = [], []
+
     @property
     def attn_processors(self) -> Dict[str, AttentionProcessor]:
         r"""
@@ -2147,3 +2149,59 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         for name, param in self.named_parameters():
             if "gate_f" not in name:
                 param.requires_grad = False
+
+    def calc_flops(self):
+        if not self.t_flops:
+            # Time_embedding
+            t_embed_flops = 0
+            for m in self.time_embedding.children():
+                t_embed_flops += m.__flops__
+            self.t_flops.append(t_embed_flops)
+
+            # conv_in
+            self.t_flops.append(self.conv_in.__flops__)
+
+            # down_blocks
+            for m in self.down_blocks:
+                m_flops = m.calc_flops()
+                self.t_flops.append(m_flops["total_flops"])
+                self.prunable_flops.append(m_flops["prunable_flops"])
+
+            # mid_block
+            if self.mid_block:
+                m_flops = self.mid_block.calc_flops()
+                self.t_flops.append(m_flops["total_flops"])
+                self.prunable_flops.append(m_flops["prunable_flops"])
+
+            # up_blocks
+            for m in self.up_blocks:
+                m_flops = m.calc_flops()
+                self.t_flops.append(m_flops["total_flops"])
+                self.prunable_flops.append(m_flops["prunable_flops"])
+
+            # conv_norm_out
+            if self.conv_norm_out:
+                self.t_flops.append(self.conv_norm_out.__flops__ + self.conv_act.__flops__)
+
+            # conv_out
+            self.t_flops.append(self.conv_out.__flops__)
+
+        curr_prunable_flops = []
+        curr_total_flops = []
+        for m in self.down_blocks:
+            m_flops = m.calc_flops()
+            curr_total_flops.append(m_flops["total_flops"])
+            curr_prunable_flops.append(m_flops["prunable_flops"])
+        if self.mid_block:
+            m_flops = self.mid_block.calc_flops()
+            curr_total_flops.append(m_flops["total_flops"])
+            curr_prunable_flops.append(m_flops["prunable_flops"])
+        for m in self.up_blocks:
+            m_flops = m.calc_flops()
+            curr_total_flops.append(m_flops["total_flops"])
+            curr_prunable_flops.append(m_flops["prunable_flops"])
+
+        return {"prunable_flops": self.prunable_flops,
+                "total_flops": self.total_flops,
+                "cur_prunable_flops": curr_prunable_flops,
+                "cur_total_flops": curr_total_flops}

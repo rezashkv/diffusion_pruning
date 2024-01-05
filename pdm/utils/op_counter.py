@@ -17,7 +17,7 @@ from diffusers.models.resnet import Upsample2D
 from diffusers.models.lora import (LoRACompatibleConv, LoRACompatibleLinear)
 from pdm.models.diffusion.blocks import (ResnetBlock2DWidthGated, ResnetBlock2DWidthDepthGated,
                                          BasicTransformerBlockWidthGated, Transformer2DModelWidthGated,
-                                         Transformer2DModelWidthDepthGated)
+                                         Transformer2DModelWidthDepthGated, GatedAttention, GEGLUGated)
 from pdm.utils.estimation_utils import hard_concrete
 
 import sys
@@ -315,6 +315,24 @@ def qkv_attention_counter_hook(qkv_attention_module, input, output):
     qkv_attention_module.__flops__ += attn_flops
 
 
+def gated_qkv_attention_counter_hook(qkv_attention_module, input, output):
+    attn_flops = 0
+    batch_size, seq_len, dim = output.shape
+    num_heads, head_dim = qkv_attention_module.heads, dim // qkv_attention_module.heads
+
+    head_flops = (
+            (seq_len * seq_len * head_dim)  # QK^T
+            + (seq_len * seq_len)  # softmax
+            + (seq_len * seq_len * head_dim)  # AV
+    )
+
+    attn_flops += num_heads * head_flops
+
+    attn_flops *= batch_size
+
+    qkv_attention_module.__flops__ += attn_flops
+
+
 def gate_flops_counter_hook(module, input, output):
     input = input[0]
     active_elements_count = np.prod(input.shape)
@@ -337,6 +355,7 @@ MODULES_MAPPING = {
     nn.ReLU6: relu_flops_counter_hook,
     nn.SiLU: silu_flops_counter_hook,
     GEGLU: geglu_flops_counter_hook,
+    GEGLUGated: geglu_flops_counter_hook,
 
     # poolings
     nn.MaxPool1d: pool_flops_counter_hook,
@@ -385,6 +404,7 @@ MODULES_MAPPING = {
 
     # Self-Attention
     Attention: qkv_attention_counter_hook,
+    GatedAttention: gated_qkv_attention_counter_hook,
 
     # Gate
     # BlockVirtualGate: gate_flops_counter_hook,
@@ -432,7 +452,7 @@ def accumulate_flops(self):
             curr_att1_flops = att1_flops * gate_1_hard_out.sum() / gate_1_hard_out.numel()
             curr_att2_flops = att2_flops * gate_2_hard_out.sum() / gate_2_hard_out.numel()
             current_total_flops = (
-                        norm1_flops + curr_att1_flops + curr_att2_flops + norm2_flops + norm3_flops + ff_flops)
+                    norm1_flops + curr_att1_flops + curr_att2_flops + norm2_flops + norm3_flops + ff_flops)
 
         elif isinstance(self, (Transformer2DModelWidthGated, Transformer2DModelWidthDepthGated)):
             current_total_flops = 0
@@ -446,7 +466,7 @@ def accumulate_flops(self):
 
         if hasattr(self, 'depth_gate'):
             hard_out = hard_concrete(self.depth_gate.gate_f)
-            current_total_flops = current_total_flops* hard_out.sum() / hard_out.numel()
+            current_total_flops = current_total_flops * hard_out.sum() / hard_out.numel()
 
         return current_total_flops
 
