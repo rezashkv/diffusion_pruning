@@ -280,7 +280,7 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
 
 
 class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
-    def __init__(self, is_input_concatenated=False, *args, **kwargs):
+    def __init__(self, skip_connection_dim=None, is_input_concatenated=False, *args, **kwargs):
         # extract gate_flag from kwargs
         super().__init__(*args, **kwargs)
         # self.gate = BlockVirtualGate(self.norm1.num_groups)
@@ -288,14 +288,18 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         self.gate = WidthGate(self.norm1.num_groups)
         self.depth_gate = DepthGate(1)
         self.is_input_concatenated = is_input_concatenated
+        self.skip_connection_dim = skip_connection_dim
         self.structure = {'width': [], 'depth': []}
 
     def forward(self, input_tensor, temb, scale: float = 1.0):
         assert (self.upsample is None) and (self.downsample is None) # Depth gate cannot be in the up/down sample blocks.
         if self.is_input_concatenated:  # We are in the upsample blocks, input is concatenated.
-            input_hidden_states = input_tensor.chunk(2, dim=1)[0]  # [0] because the forward pass is hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1) 
+            # input_hidden_states = input_tensor.chunk(2, dim=1)[0]  # [0] because the forward pass is hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1) 
             # in here: https://github.com/huggingface/diffusers/blob/acd926f4f208e4cf12be69315787c450da48913b/src/diffusers/models/unet_2d_blocks.py#L2324
-             
+            assert input_tensor.ndim == 4
+            assert self.skip_connection_dim is not None
+            n_channels_concat = input_tensor.shape[1]
+            input_hidden_states = input_tensor[:, :(n_channels_concat - self.skip_connection_dim), :, :]
         else:  # We are in the downsample blocks
             input_hidden_states = input_tensor
 
@@ -1592,6 +1596,7 @@ class CrossAttnUpBlock2DWidthDepthGated(CrossAttnUpBlock2D):
 
             resnets.append(
                 ResnetBlock2DWidthDepthGated(
+                    skip_connection_dim=res_skip_channels,
                     in_channels=resnet_in_channels + res_skip_channels,
                     out_channels=out_channels,
                     temb_channels=temb_channels,
@@ -1727,6 +1732,7 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
 
             resnets.append(
                 ResnetBlock2DWidthDepthGated(
+                    skip_connection_dim=res_skip_channels,
                     in_channels=resnet_in_channels + res_skip_channels,
                     out_channels=out_channels,
                     temb_channels=temb_channels,
@@ -2009,6 +2015,7 @@ class UpBlock2DWidthDepthGated(UpBlock2D):
 
             resnets.append(
                 ResnetBlock2DWidthDepthGated(
+                    skip_connection_dim=res_skip_channels,
                     in_channels=resnet_in_channels + res_skip_channels,
                     out_channels=out_channels,
                     temb_channels=temb_channels,
@@ -2075,6 +2082,7 @@ class UpBlock2DWidthHalfDepthGated(UpBlock2D):
 
             resnets.append(
                 ResnetBlock2DWidthDepthGated(
+                    skip_connection_dim=res_skip_channels,
                     in_channels=resnet_in_channels + res_skip_channels,
                     out_channels=out_channels,
                     temb_channels=temb_channels,
