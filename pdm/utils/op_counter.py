@@ -15,8 +15,9 @@ from diffusers.models.normalization import AdaGroupNorm
 from diffusers.models.activations import GEGLU
 from diffusers.models.resnet import Upsample2D
 from diffusers.models.lora import (LoRACompatibleConv, LoRACompatibleLinear)
-from pdm.models.diffusion.blocks import (ResnetBlock2DWidthGated, BasicTransformerBlockWidthGated,
-                                         ResnetBlock2DWidthDepthGated, BasicTransformerBlockWidthDepthGated)
+from pdm.models.diffusion.blocks import (ResnetBlock2DWidthGated, ResnetBlock2DWidthDepthGated,
+                                         BasicTransformerBlockWidthGated, Transformer2DModelWidthGated,
+                                         Transformer2DModelWidthDepthGated)
 from pdm.utils.estimation_utils import hard_concrete
 
 import sys
@@ -399,7 +400,8 @@ def accumulate_flops(self):
     else:
         sum = 0
         if not isinstance(self, (ResnetBlock2DWidthGated, BasicTransformerBlockWidthGated,
-                                 ResnetBlock2DWidthDepthGated, BasicTransformerBlockWidthDepthGated)):
+                                 ResnetBlock2DWidthDepthGated, Transformer2DModelWidthGated,
+                                 Transformer2DModelWidthDepthGated)):
             for m in self.children():
                 sum += m.accumulate_flops()
             return sum
@@ -417,7 +419,7 @@ def accumulate_flops(self):
             current_total_flops = current_prunable_flops + non_prunable_flops
 
         # instance of BasicTransformerBlockGated or BasicTransformerBlockWidthDepthGated
-        else:
+        elif isinstance(self, BasicTransformerBlockWidthGated):
             norm1_flops = self.norm1.accumulate_flops()
             att1_flops = self.attn1.accumulate_flops()
             norm2_flops = self.norm2.accumulate_flops()
@@ -431,6 +433,16 @@ def accumulate_flops(self):
             curr_att2_flops = att2_flops * gate_2_hard_out.sum() / gate_2_hard_out.numel()
             current_total_flops = (
                         norm1_flops + curr_att1_flops + curr_att2_flops + norm2_flops + norm3_flops + ff_flops)
+
+        elif isinstance(self, (Transformer2DModelWidthGated, Transformer2DModelWidthDepthGated)):
+            current_total_flops = 0
+            for m in self.children():
+                current_total_flops += m.accumulate_flops()
+
+        else:
+            current_total_flops = 0
+            for m in self.children():
+                current_total_flops += m.accumulate_flops()
 
         if hasattr(self, 'depth_gate'):
             hard_out = hard_concrete(self.depth_gate.gate_f)

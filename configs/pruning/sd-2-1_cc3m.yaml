@@ -21,6 +21,9 @@ model:
       - CrossAttnUpBlock2DHalfGated
       - CrossAttnUpBlock2DHalfGated
 
+    gated_ff: true
+    ff_gate_width: 32
+
   hypernet:
     hypernet_sparsity: 0
     weight_norm: true

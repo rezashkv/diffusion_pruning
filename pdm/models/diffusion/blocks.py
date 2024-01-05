@@ -39,6 +39,8 @@ class GEGLUGated(GEGLU):
         hidden_states, gate = self.proj(hidden_states, *args).chunk(2, dim=-1)
 
         mask = self.gate.gate_f.repeat_interleave(self.dim_out // self.gate.gate_f.shape[1], dim=1).unsqueeze(1)
+        if mask.shape[0] != hidden_states.shape[0]:
+            mask = mask.repeat(hidden_states.shape[0] // mask.shape[0], 1, 1)
         hidden_states = mask.expand_as(hidden_states) * hidden_states
         gate = mask.expand_as(gate) * gate
         return hidden_states * self.gelu(gate)
@@ -139,6 +141,9 @@ class HeadGatedAttnProcessor2(AttnProcessor2_0):
         # ########## Apply Width Gate
         assert key.shape[1] == attn.gate.gate_f.shape[1]
         mask = attn.gate.gate_f.unsqueeze(-1).unsqueeze(-1)
+
+        if mask.shape[0] != key.shape[0]:
+            mask = mask.repeat(key.shape[0] // mask.shape[0], 1, 1, 1)
         query = query * mask
         key = key * mask
         value = value * mask
@@ -235,7 +240,13 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
         # DO it here or after norm2?
         assert self.norm2.num_groups == self.gate.gate_f.shape[1]
         num_repeat = int(hidden_states.shape[1] / self.norm2.num_groups)
-        mask = torch.repeat_interleave(self.gate.gate_f, repeats=num_repeat, dim=1).unsqueeze(-1).unsqueeze(-1)
+        mask = torch.repeat_interleave(self.gate.gate_f, repeats=num_repeat, dim=1).unsqueeze(-1).unsqueeze(
+            -1)
+        # when doing inference with cfg the mask and hidden_states do not have the same size at dim 0. repeat the mask
+        # to match the size of hidden_states
+        if mask.shape[0] != hidden_states.shape[0]:
+            mask = mask.repeat(hidden_states.shape[0] // mask.shape[0], 1, 1, 1)
+
         hidden_states = hidden_states * mask
         # hidden_states = self.gate(hidden_states)
 
@@ -278,24 +289,26 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
 
 
 class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
-    def __init__(self, is_input_concatenated=False, *args, **kwargs):
+    def __init__(self, skip_connection_dim=None, is_input_concatenated=False, *args, **kwargs):
         # extract gate_flag from kwargs
         super().__init__(*args, **kwargs)
-        # self.gate = BlockVirtualGate(self.norm1.num_groups)
-        # self.depth_gate = BlockVirtualGate(1)
+
         self.gate = WidthGate(self.norm1.num_groups)
         self.depth_gate = DepthGate(1)
         self.is_input_concatenated = is_input_concatenated
+        self.skip_connection_dim = skip_connection_dim
         self.structure = {'width': [], 'depth': []}
 
     def forward(self, input_tensor, temb, scale: float = 1.0):
         assert (self.upsample is None) and (
                 self.downsample is None)  # Depth gate cannot be in the up/down sample blocks.
         if self.is_input_concatenated:  # We are in the upsample blocks, input is concatenated.
-            input_hidden_states = input_tensor.chunk(2, dim=1)[
-                0]  # [0] because the forward pass is hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+            # input_hidden_states = input_tensor.chunk(2, dim=1)[0]  # [0] because the forward pass is hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1) 
             # in here: https://github.com/huggingface/diffusers/blob/acd926f4f208e4cf12be69315787c450da48913b/src/diffusers/models/unet_2d_blocks.py#L2324
-
+            assert input_tensor.ndim == 4
+            assert self.skip_connection_dim is not None
+            n_channels_concat = input_tensor.shape[1]
+            input_hidden_states = input_tensor[:, :(n_channels_concat - self.skip_connection_dim), :, :]
         else:  # We are in the downsample blocks
             input_hidden_states = input_tensor
 
@@ -352,7 +365,12 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         # DO it here or after norm2?
         assert self.norm2.num_groups == self.gate.gate_f.shape[1]
         num_repeat = int(hidden_states.shape[1] / self.norm2.num_groups)
-        mask = torch.repeat_interleave(self.gate.gate_f, repeats=num_repeat, dim=1).unsqueeze(-1).unsqueeze(-1)
+        mask = torch.repeat_interleave(self.gate.gate_f, repeats=num_repeat, dim=1).unsqueeze(-1).unsqueeze(
+            -1)
+
+        if mask.shape[0] != hidden_states.shape[0]:
+            mask = mask.repeat(hidden_states.shape[0] // mask.shape[0], 1, 1, 1)
+
         hidden_states = hidden_states * mask
         # hidden_states = self.gate(hidden_states)
 
@@ -383,7 +401,10 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
         assert output_tensor.shape == input_hidden_states.shape
         mask = self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        output = (1 - mask) * input_hidden_states + mask * output_tensor
+        if mask.shape[0] != output_tensor.shape[0]:
+            mask = mask.repeat(output_tensor.shape[0] // mask.shape[0], 1, 1, 1)
+        output = ((1 - mask) * input_hidden_states +
+                  mask * output_tensor)
         return output
 
     def set_virtual_gate(self, gate_val):
@@ -921,6 +942,8 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
         # ########### TODO: Depth gate
         assert output.shape == input_hidden_states.shape
         mask = self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        if mask.shape[0] != output.shape[0]:
+            mask = mask.repeat(output.shape[0] // mask.shape[0], 1, 1, 1)
         output_tensor = (1 - mask) * input_hidden_states + mask * output
 
         if not return_dict:
@@ -1437,6 +1460,7 @@ class CrossAttnUpBlock2DWidthDepthGated(CrossAttnUpBlock2D):
 
             resnets.append(
                 ResnetBlock2DWidthDepthGated(
+                    skip_connection_dim=res_skip_channels,
                     in_channels=resnet_in_channels + res_skip_channels,
                     out_channels=out_channels,
                     temb_channels=temb_channels,
@@ -1576,6 +1600,7 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
 
             resnets.append(
                 ResnetBlock2DWidthDepthGated(
+                    skip_connection_dim=res_skip_channels,
                     in_channels=resnet_in_channels + res_skip_channels,
                     out_channels=out_channels,
                     temb_channels=temb_channels,
@@ -1859,6 +1884,7 @@ class UpBlock2DWidthDepthGated(UpBlock2D):
 
             resnets.append(
                 ResnetBlock2DWidthDepthGated(
+                    skip_connection_dim=res_skip_channels,
                     in_channels=resnet_in_channels + res_skip_channels,
                     out_channels=out_channels,
                     temb_channels=temb_channels,
@@ -1925,6 +1951,7 @@ class UpBlock2DWidthHalfDepthGated(UpBlock2D):
 
             resnets.append(
                 ResnetBlock2DWidthDepthGated(
+                    skip_connection_dim=res_skip_channels,
                     in_channels=resnet_in_channels + res_skip_channels,
                     out_channels=out_channels,
                     temb_channels=temb_channels,

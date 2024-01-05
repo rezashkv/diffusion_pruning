@@ -742,7 +742,8 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
 
         structure_vector = self.hyper_net(prompt_embeds)
         structure_vector_quantized, _, _ = self.quantizer(structure_vector)
-        self.unet.set_structure(structure_vector_quantized)
+        arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
+        self.unet.set_structure(arch_vectors_separated)
 
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch
@@ -957,7 +958,8 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
 
         structure_vector = self.hyper_net(prompt_embeds)
         structure_vector_quantized, _, _ = self.quantizer(structure_vector)
-        self.unet.set_structure(structure_vector_quantized)
+        arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
+        self.unet.set_structure(arch_vectors_separated)
 
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch
@@ -1181,7 +1183,8 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
         else:
             structure_vector_quantized = self.quantizer.get_codebook_entry_gumbel_sigmoid(indices)
 
-        self.unet.set_structure(structure_vector_quantized)
+        arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
+        self.unet.set_structure(arch_vectors_separated)
 
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch
@@ -1333,7 +1336,9 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
         structure_vector_quantized = torch.ones((batch_size, vq_embed_dim), device=device)
         if depth_index is not None:
             structure_vector_quantized[:, depth_index] = 0
-        self.unet.set_structure(structure_vector_quantized)
+
+        arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
+        self.unet.set_structure(arch_vectors_separated)
 
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch

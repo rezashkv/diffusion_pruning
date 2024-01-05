@@ -744,15 +744,13 @@ def main():
                 contrastive_loss = clip_loss(text_features_list,
                                              arch_vector_quantized_list)
 
-                arch_vectors_separated = hyper_net.transfrom_structure_vector(arch_vector_quantized)
+                arch_vectors_separated = hyper_net.transform_structure_vector(arch_vector_quantized)
                 unet.set_structure(arch_vectors_separated)
                 if unet.total_flops is None:
                     with torch.no_grad():
                         unet(noisy_latents, timesteps, encoder_hidden_states)
                     unet.total_flops = unet.compute_average_flops_cost()[0]
                     unet.reset_flops_count()
-
-                unet.set_structure(arch_vector_quantized)
 
                 # Get the target for loss depending on the prediction type
                 if config.model.unet.prediction_type is not None:

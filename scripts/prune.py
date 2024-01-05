@@ -64,6 +64,7 @@ logger = get_logger(__name__)
 
 
 def main():
+    torch.autograd.set_detect_anomaly(True)
     args = parse_args()
     config = OmegaConf.load(args.base_config_path)
     # add args to config
@@ -141,6 +142,9 @@ def main():
         down_block_types=config.model.unet.unet_down_blocks,
         mid_block_type=config.model.unet.unet_mid_block,
         up_block_types=config.model.unet.unet_up_blocks,
+        gated_ff=config.model.unet.gated_ff,
+        ff_gate_width=config.model.unet.ff_gate_width,
+
     )
     unet_structure = unet.get_structure()
     hyper_net = HyperStructure(input_dim=text_encoder.config.hidden_size,
