@@ -88,7 +88,8 @@ def get_down_block(
         attention_head_dim=None,
         downsample_type=None,
         dropout=0.0,
-        gated_ff=False
+        gated_ff=False,
+        ff_gate_width=32
 ):
     # If attn head dim is not defined, we default it to the number of heads
     if attention_head_dim is None:
@@ -221,6 +222,8 @@ def get_down_block(
             upcast_attention=upcast_attention,
             resnet_time_scale_shift=resnet_time_scale_shift,
             attention_type=attention_type,
+            gated_ff=gated_ff,
+            ff_gate_width=ff_gate_width
         )
     elif down_block_type == "CrossAttnDownBlock2DHalfGated":
         if cross_attention_dim is None:
@@ -245,7 +248,8 @@ def get_down_block(
             upcast_attention=upcast_attention,
             resnet_time_scale_shift=resnet_time_scale_shift,
             attention_type=attention_type,
-            gated_ff=gated_ff
+            gated_ff=gated_ff,
+            ff_gate_width=ff_gate_width
         )
     elif down_block_type == "SimpleCrossAttnDownBlock2D":
         if cross_attention_dim is None:
@@ -375,7 +379,8 @@ def get_up_block(
         attention_head_dim=None,
         upsample_type=None,
         dropout=0.0,
-        gated_ff=False
+        gated_ff=False,
+        ff_gate_width=32
 ):
     # If attn head dim is not defined, we default it to the number of heads
     if attention_head_dim is None:
@@ -491,6 +496,8 @@ def get_up_block(
             upcast_attention=upcast_attention,
             resnet_time_scale_shift=resnet_time_scale_shift,
             attention_type=attention_type,
+            gated_ff=gated_ff,
+            ff_gate_width=ff_gate_width
         )
     elif up_block_type == "CrossAttnUpBlock2DHalfGated":
         if cross_attention_dim is None:
@@ -515,7 +522,8 @@ def get_up_block(
             upcast_attention=upcast_attention,
             resnet_time_scale_shift=resnet_time_scale_shift,
             attention_type=attention_type,
-            gated_ff=gated_ff
+            gated_ff=gated_ff,
+            ff_gate_width=ff_gate_width
         )
     elif up_block_type == "SimpleCrossAttnUpBlock2D":
         if cross_attention_dim is None:
@@ -790,7 +798,8 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
             cross_attention_norm: Optional[str] = None,
             addition_embed_type_num_heads=64,
             total_flops=None,
-            gated_ff: bool = False
+            gated_ff: bool = True,
+            ff_gate_width: Union[int, Tuple[int]] = 32,
     ):
         super().__init__()
 
@@ -844,6 +853,11 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         if not isinstance(layers_per_block, int) and len(layers_per_block) != len(down_block_types):
             raise ValueError(
                 f"Must provide the same number of `layers_per_block` as `down_block_types`. `layers_per_block`: {layers_per_block}. `down_block_types`: {down_block_types}."
+            )
+
+        if not isinstance(ff_gate_width, int) and len(ff_gate_width) != len(down_block_types):
+            raise ValueError(
+                f"Must provide the same number of `ff_gate_width` as `down_block_types`. `ff_gate_width`: {ff_gate_width}. `down_block_types`: {down_block_types}."
             )
 
         # input
@@ -999,6 +1013,9 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         if isinstance(layers_per_block, int):
             layers_per_block = [layers_per_block] * len(down_block_types)
 
+        if isinstance(ff_gate_width, int):
+            ff_gate_width = [ff_gate_width] * (len(down_block_types) + 1)
+
         if isinstance(transformer_layers_per_block, int):
             transformer_layers_per_block = [transformer_layers_per_block] * len(down_block_types)
 
@@ -1042,7 +1059,8 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
                 cross_attention_norm=cross_attention_norm,
                 attention_head_dim=attention_head_dim[i] if attention_head_dim[i] is not None else output_channel,
                 dropout=dropout,
-                gated_ff=gated_ff
+                gated_ff=gated_ff,
+                ff_gate_width=ff_gate_width[i],
             )
             self.down_blocks.append(down_block)
 
@@ -1064,7 +1082,8 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
                 use_linear_projection=use_linear_projection,
                 upcast_attention=upcast_attention,
                 attention_type=attention_type,
-                gated_ff=gated_ff
+                gated_ff=gated_ff,
+                ff_gate_width=ff_gate_width[-1],
             )
         elif mid_block_type == "UNetMidBlock2DSimpleCrossAttn":
             self.mid_block = UNetMidBlock2DSimpleCrossAttn(
@@ -1107,9 +1126,11 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         reversed_block_out_channels = list(reversed(block_out_channels))
         reversed_num_attention_heads = list(reversed(num_attention_heads))
         reversed_layers_per_block = list(reversed(layers_per_block))
+        reversed_ff_gate_width = list(reversed(ff_gate_width))[1:]
         reversed_cross_attention_dim = list(reversed(cross_attention_dim))
         reversed_transformer_layers_per_block = list(reversed(transformer_layers_per_block))
         only_cross_attention = list(reversed(only_cross_attention))
+
 
         output_channel = reversed_block_out_channels[0]
         for i, up_block_type in enumerate(up_block_types):
@@ -1151,6 +1172,8 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
                 cross_attention_norm=cross_attention_norm,
                 attention_head_dim=attention_head_dim[i] if attention_head_dim[i] is not None else output_channel,
                 dropout=dropout,
+                gated_ff=gated_ff,
+                ff_gate_width=reversed_ff_gate_width[i],
             )
             self.up_blocks.append(up_block)
             prev_output_channel = output_channel
@@ -1364,21 +1387,6 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
             self.structure = structure
         return self.structure
 
-    # def get_structure(self):
-    #     structure = []
-    #     for m in self.modules():
-    #         if hasattr(m, "get_gate_structure"):
-    #             structure.append(m.get_gate_structure())
-    #     self.structure = structure
-    #     structure_size = []
-    #     for elem in self.structure:
-    #         if "width" in elem:
-    #             for w in elem["width"]:
-    #                 structure_size.append(w)
-    #         if "depth" in elem:
-    #             structure_size.append(elem["depth"][0])
-    #     return structure, structure_size
-
     def set_structure(self, arch_vectors):
 
         width_vectors, depth_vectors = arch_vectors['width'], arch_vectors['depth']
@@ -1429,27 +1437,6 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
                     block_vectors['depth'].append(depth_vectors.pop(0))
             m.set_gate_structure(block_vectors)
 
-
-    # def set_structure(self, width_vectors, depth_vectors):
-    #     structure = self.get_structure()
-    #     width_structure = structure['width']
-    #     width_size = sum([sum(w) for w in width_structure])
-
-    #     width_start = 0
-    #     depth_start = width_size
-    #     for m in self.modules():
-    #         if hasattr(m, "set_virtual_gate"):
-    #             m_structure = m.get_gate_structure()
-    #             width = sum(m_structure["width"])
-    #             depth = sum(m_structure["depth"])
-    #             gate = arch_vector[:, width_start:width_start+width]
-    #             if "depth" in m_structure:
-    #                 depth_gate = arch_vector[:, depth_start:depth_start+depth]
-    #                 gate = torch.cat([gate, depth_gate], dim=1)
-
-    #             m.set_virtual_gate(gate)
-    #             width_start += width
-    #             depth_start += depth
 
     def forward(
             self,

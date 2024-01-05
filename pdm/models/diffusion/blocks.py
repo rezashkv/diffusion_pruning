@@ -10,7 +10,6 @@ from diffusers.models.transformer_2d import Transformer2DModelOutput
 from torch import nn
 from diffusers.configuration_utils import register_to_config
 
-from pdm.models.hypernet.gates import BlockVirtualGate, LinearVirtualGate
 from pdm.models.hypernet.gates import DepthGate, WidthGate
 from diffusers.models.attention import BasicTransformerBlock, FeedForward
 from diffusers.models.unet_2d_blocks import (CrossAttnDownBlock2D, CrossAttnUpBlock2D, DownBlock2D, UpBlock2D,
@@ -30,19 +29,16 @@ class GEGLUGated(GEGLU):
         dim_out (`int`): The number of channels in the output.
     """
 
-    def __init__(self, dim_in: int, dim_out: int):
+    def __init__(self, dim_in: int, dim_out: int, gate_width: int = 32):
         super().__init__(dim_in, dim_out)
-        # self.gate = LinearVirtualGate(dim_out)
-        self.gate = WidthGate(dim_out)
+        self.dim_out = dim_out
+        self.gate = WidthGate(gate_width)
 
     def forward(self, hidden_states, scale: float = 1.0):
         args = () if USE_PEFT_BACKEND else (scale,)
         hidden_states, gate = self.proj(hidden_states, *args).chunk(2, dim=-1)
-        # hidden_states, gate = (self.gate(hidden_states), self.gate(gate))
 
-        assert hidden_states.shape[2] == self.gate.width
-        assert gate.shape[2] == self.gate.width
-        mask = self.gate.gate_f.unsqueeze(1)
+        mask = self.gate.gate_f.repeat_interleave(self.dim_out // self.gate.gate_f.shape[1], dim=1).unsqueeze(1)
         hidden_states = mask.expand_as(hidden_states) * hidden_states
         gate = mask.expand_as(gate) * gate
         return hidden_states * self.gelu(gate)
@@ -69,25 +65,15 @@ class FeedForwardWidthGated(FeedForward):
             dropout: float = 0.0,
             activation_fn: str = "geglu",
             final_dropout: bool = False,
+            gate_width: int = 32,
     ):
         super().__init__(dim, dim_out, mult, dropout, activation_fn, final_dropout)
         inner_dim = int(dim * mult)
 
         assert activation_fn == "geglu", f"Only GEGLU is supported in {self.__class__.__name__}"
-        act_fn = GEGLUGated(dim, inner_dim)
+        act_fn = GEGLUGated(dim, inner_dim, gate_width=gate_width)
         self.net[0] = act_fn
         self.structure = {'width': [], 'depth': []}
-
-    def get_gate_structure(self):
-        if not self.structure["width"]:
-            self.structure = {"width": [self.net[0].gate.width], "depth": [0]}
-        return self.structure
-
-    def set_gate_structure(self, arch_vectors):
-        assert len(arch_vectors['depth']) == 0, f"{self.__class__.__name__} does not support depth gate."
-        assert len(arch_vectors['width']) == 1, f"{self.__class__.__name__} only has one width gate."
-        assert arch_vectors['width'][0].shape[1] == self.net[0].gate.width
-        self.net[0].gate.set_structure_value(arch_vectors['width'][0])
 
 
 class HeadGatedAttnProcessor2(AttnProcessor2_0):
@@ -395,12 +381,9 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         # return output_tensor
 
         output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
-        assert torch.equal(torch.tensor(output_tensor.shape), torch.tensor(input_hidden_states.shape))
-        output = ((1 - self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand_as(
-            input_hidden_states)) * input_hidden_states +
-                  (self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand_as(
-                      output_tensor)) * output_tensor)
-        # output = self.depth_gate(output)
+        assert output_tensor.shape == input_hidden_states.shape
+        mask = self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        output = (1 - mask) * input_hidden_states + mask * output_tensor
         return output
 
     def set_virtual_gate(self, gate_val):
@@ -438,22 +421,24 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
             norm_type: str = "layer_norm",
             final_dropout: bool = False,
             attention_type: str = "default",
-            gated_ff: bool = False,
+            gated_ff: bool = True,
+            ff_gate_width: int = 32,
     ):
-        super().__init__(dim, num_attention_heads, attention_head_dim, dropout, cross_attention_dim, activation_fn,
-                         num_embeds_ada_norm, attention_bias, only_cross_attention, double_self_attention,
-                         upcast_attention, norm_elementwise_affine, norm_type, final_dropout, attention_type)
+        super().__init__(dim=dim, num_attention_heads=num_attention_heads, attention_head_dim=attention_head_dim,
+                         dropout=dropout, cross_attention_dim=cross_attention_dim, activation_fn=activation_fn,
+                         num_embeds_ada_norm=num_embeds_ada_norm, attention_bias=attention_bias,
+                         only_cross_attention=only_cross_attention, double_self_attention=double_self_attention,
+                         upcast_attention=upcast_attention, norm_elementwise_affine=norm_elementwise_affine,
+                         norm_type=norm_type, final_dropout=final_dropout, attention_type=attention_type)
 
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
-        # gate1 = BlockVirtualGate(self.num_attention_heads)
         gate1 = WidthGate(self.num_attention_heads)
 
         if self.attn1 is not None:
             self.attn1.set_processor(HeadGatedAttnProcessor2())
             self.attn1.gate = gate1
 
-        # gate2 = BlockVirtualGate(self.num_attention_heads)
         gate2 = WidthGate(self.num_attention_heads)
         if self.attn2 is not None:
             self.attn2.set_processor(HeadGatedAttnProcessor2())
@@ -462,7 +447,7 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
         self.gated_ff = gated_ff
         if gated_ff:
             self.ff = FeedForwardWidthGated(dim, dropout=dropout, activation_fn=activation_fn,
-                                            final_dropout=final_dropout)
+                                            final_dropout=final_dropout, gate_width=ff_gate_width)
         else:
             self.ff = FeedForward(dim, dropout=dropout, activation_fn=activation_fn, final_dropout=final_dropout)
 
@@ -560,19 +545,9 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
         if len(self.structure['width']) == 0:
             self.structure['width'] = [self.attn1.gate.width, self.attn2.gate.width]
             if isinstance(self.ff, FeedForwardWidthGated):
-                self.structure['width'].append(self.ff.get_gate_structure()['width'])
+                self.structure['width'].append(self.ff.net[0].gate.width)
             self.structure['depth'] = [0]
         return self.structure
-
-    def set_virtual_gate(self, gate_val):
-        gate_1_val = gate_val[:, :self.attn1.gate.width]
-        gate_2_val = gate_val[:, self.attn1.gate.width:self.attn1.gate.width + self.attn2.gate.width]
-        self.attn1.gate.set_structure_value(gate_1_val)
-        self.attn2.gate.set_structure_value(gate_2_val)
-
-        if isinstance(self.ff, FeedForwardWidthGated):
-            gate_3_val = gate_val[:, self.attn1.gate.width + self.attn2.gate.width:-1]
-            self.ff.set_virtual_gate(gate_3_val)
 
     def set_gate_structure(self, arch_vectors):
         assert len(arch_vectors['depth']) == 0
@@ -589,168 +564,8 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
         # ff
         if self.gated_ff:
             assert len(arch_vectors['width']) == 3
-            assert arch_vectors['width'][2].shape[1] == self.ff.gate.width
-            self.ff.gate.set_structure_value(arch_vectors['width'][2])
-
-
-class BasicTransformerBlockWidthDepthGated(BasicTransformerBlock):
-    def __init__(
-            self,
-            dim: int,
-            num_attention_heads: int,
-            attention_head_dim: int,
-            dropout=0.0,
-            cross_attention_dim: Optional[int] = None,
-            activation_fn: str = "geglu",
-            num_embeds_ada_norm: Optional[int] = None,
-            attention_bias: bool = False,
-            only_cross_attention: bool = False,
-            double_self_attention: bool = False,
-            upcast_attention: bool = False,
-            norm_elementwise_affine: bool = True,
-            norm_type: str = "layer_norm",
-            final_dropout: bool = False,
-            attention_type: str = "default",
-            gated_ff: bool = False,
-    ):
-        super().__init__(dim, num_attention_heads, attention_head_dim, dropout, cross_attention_dim, activation_fn,
-                         num_embeds_ada_norm, attention_bias, only_cross_attention, double_self_attention,
-                         upcast_attention, norm_elementwise_affine, norm_type, final_dropout, attention_type)
-        self.num_attention_heads = num_attention_heads
-        self.attention_head_dim = attention_head_dim
-
-        # gate1 = BlockVirtualGate(self.num_attention_heads)
-        gate1 = WidthGate(self.num_attention_heads)
-        if self.attn1 is not None:
-            self.attn1.set_processor(HeadGatedAttnProcessor2())
-            self.attn1.gate = gate1
-
-        # gate2 = BlockVirtualGate(self.num_attention_heads)
-        gate2 = WidthGate(self.num_attention_heads)
-        if self.attn2 is not None:
-            self.attn2.set_processor(HeadGatedAttnProcessor2())
-            self.attn2.gate = gate2
-        if gated_ff:
-            self.ff = FeedForwardWidthGated(dim, dropout=dropout, activation_fn=activation_fn,
-                                            final_dropout=final_dropout)
-        else:
-            self.ff = FeedForward(dim, dropout=dropout, activation_fn=activation_fn, final_dropout=final_dropout)
-
-        # self.depth_gate = DepthGate(1)
-
-    def forward(
-            self,
-            hidden_states: torch.FloatTensor,
-            attention_mask: Optional[torch.FloatTensor] = None,
-            encoder_hidden_states: Optional[torch.FloatTensor] = None,
-            encoder_attention_mask: Optional[torch.FloatTensor] = None,
-            timestep: Optional[torch.LongTensor] = None,
-            cross_attention_kwargs: Dict[str, Any] = None,
-            class_labels: Optional[torch.LongTensor] = None,
-    ):
-        # Notice that normalization is always applied before the real computation in the following blocks.
-        # 0. Self-Attention
-        if self.use_ada_layer_norm:
-            norm_hidden_states = self.norm1(hidden_states, timestep)
-        elif self.use_ada_layer_norm_zero:
-            norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
-                hidden_states, timestep, class_labels, hidden_dtype=hidden_states.dtype
-            )
-        else:
-            norm_hidden_states = self.norm1(hidden_states)
-
-        # 1. Retrieve lora scale.
-        lora_scale = cross_attention_kwargs.get("scale", 1.0) if cross_attention_kwargs is not None else 1.0
-
-        # 2. Prepare GLIGEN inputs
-        cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
-        gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
-
-        attn_output = self.attn1(
-            norm_hidden_states,
-            encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
-            attention_mask=attention_mask,
-            **cross_attention_kwargs,
-        )
-        if self.use_ada_layer_norm_zero:
-            attn_output = gate_msa.unsqueeze(1) * attn_output
-
-        # attn_output = self.depth_gate(attn_output)
-
-        hidden_states = attn_output + hidden_states
-
-        # 2.5 GLIGEN Control
-        if gligen_kwargs is not None:
-            hidden_states = self.fuser(hidden_states, gligen_kwargs["objs"])
-        # 2.5 ends
-
-        # 3. Cross-Attention
-        if self.attn2 is not None:
-            norm_hidden_states = (
-                self.norm2(hidden_states, timestep) if self.use_ada_layer_norm else self.norm2(hidden_states)
-            )
-
-            attn_output = self.attn2(
-                norm_hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                attention_mask=encoder_attention_mask,
-                **cross_attention_kwargs,
-            )
-
-            # attn_output = self.depth_gate(attn_output)
-            hidden_states = attn_output + hidden_states
-
-        # 4. Feed-forward
-        norm_hidden_states = self.norm3(hidden_states)
-
-        if self.use_ada_layer_norm_zero:
-            norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-
-        if self._chunk_size is not None:
-            # "feed_forward_chunk_size" can be used to save memory
-            if norm_hidden_states.shape[self._chunk_dim] % self._chunk_size != 0:
-                raise ValueError(
-                    f"`hidden_states` dimension to be chunked: {norm_hidden_states.shape[self._chunk_dim]} has to be divisible by chunk size: {self._chunk_size}. Make sure to set an appropriate `chunk_size` when calling `unet.enable_forward_chunking`."
-                )
-
-            num_chunks = norm_hidden_states.shape[self._chunk_dim] // self._chunk_size
-            ff_output = torch.cat(
-                [
-                    self.ff(hid_slice, scale=lora_scale)
-                    for hid_slice in norm_hidden_states.chunk(num_chunks, dim=self._chunk_dim)
-                ],
-                dim=self._chunk_dim,
-            )
-        else:
-            ff_output = self.ff(norm_hidden_states, scale=lora_scale)
-
-        if self.use_ada_layer_norm_zero:
-            ff_output = gate_mlp.unsqueeze(1) * ff_output
-
-        # ff_output = self.depth_gate(ff_output)
-        hidden_states = ff_output + hidden_states
-
-        # hidden_states = self.depth_gate(hidden_states)
-        return hidden_states
-
-    def get_gate_structure(self):
-        width = [self.attn1.gate.width, self.attn2.gate.width]
-        if isinstance(self.ff, FeedForwardWidthGated):
-            width.append(self.ff.get_gate_structure())
-        depth = self.depth_gate.width
-        return {"width": width, "depth": [depth]}
-
-    def set_virtual_gate(self, gate_val):
-        gate_1_val = gate_val[:, :self.attn1.gate.width]
-        gate_2_val = gate_val[:, self.attn1.gate.width:self.attn1.gate.width + self.attn2.gate.width]
-        self.attn1.gate.set_structure_value(gate_1_val)
-        self.attn2.gate.set_structure_value(gate_2_val)
-
-        if isinstance(self.ff, FeedForwardWidthGated):
-            gate_3_val = gate_val[:, self.attn1.gate.width + self.attn2.gate.width:-1]
-            self.ff.set_virtual_gate(gate_3_val)
-
-        self.depth_gate.set_structure_value(gate_val[:, -1:])
+            assert arch_vectors['width'][2].shape[1] == self.ff.net[0].gate.width
+            self.ff.net[0].gate.set_structure_value(arch_vectors['width'][2])
 
 
 class Transformer2DModelWidthGated(Transformer2DModel):
@@ -778,7 +593,8 @@ class Transformer2DModelWidthGated(Transformer2DModel):
             norm_type: str = "layer_norm",
             norm_elementwise_affine: bool = True,
             attention_type: str = "default",
-            gated_ff: bool = False
+            gated_ff: bool = False,
+            ff_gate_width: int = 32
     ):
         super().__init__(num_attention_heads=num_attention_heads, attention_head_dim=attention_head_dim,
                          in_channels=in_channels, out_channels=out_channels, num_layers=num_layers, dropout=dropout,
@@ -809,7 +625,8 @@ class Transformer2DModelWidthGated(Transformer2DModel):
                     norm_type=norm_type,
                     norm_elementwise_affine=norm_elementwise_affine,
                     attention_type=attention_type,
-                    gated_ff=gated_ff
+                    gated_ff=gated_ff,
+                    ff_gate_width=ff_gate_width
                 )
                 for _ in range(num_layers)
             ]
@@ -859,7 +676,8 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
             norm_type: str = "layer_norm",
             norm_elementwise_affine: bool = True,
             attention_type: str = "default",
-            gated_ff: bool = False
+            gated_ff: bool = False,
+            ff_gate_width: int = 32
     ):
         super().__init__(num_attention_heads=num_attention_heads, attention_head_dim=attention_head_dim,
                          in_channels=in_channels, out_channels=out_channels, num_layers=num_layers, dropout=dropout,
@@ -890,7 +708,8 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
                     norm_type=norm_type,
                     norm_elementwise_affine=norm_elementwise_affine,
                     attention_type=attention_type,
-                    gated_ff=gated_ff
+                    gated_ff=gated_ff,
+                    ff_gate_width=ff_gate_width
                 )
                 for _ in range(num_layers)
             ]
@@ -1100,10 +919,9 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
             )
 
         # ########### TODO: Depth gate
-        output_tensor = ((1 - self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand_as(output)) *
-                         input_hidden_states +
-                         (self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand_as(output)) * output)
-        # output = self.depth_gate(output)
+        assert output.shape == input_hidden_states.shape
+        mask = self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        output_tensor = (1 - mask) * input_hidden_states + mask * output
 
         if not return_dict:
             return (output_tensor,)
@@ -1307,6 +1125,8 @@ class CrossAttnDownBlock2DWidthDepthGated(CrossAttnDownBlock2D):
             only_cross_attention=False,
             upcast_attention=False,
             attention_type="default",
+            gated_ff: bool = True,
+            ff_gate_width: int = 32
     ):
         super().__init__(in_channels=in_channels, out_channels=out_channels, temb_channels=temb_channels,
                          dropout=dropout, num_layers=num_layers,
@@ -1350,6 +1170,8 @@ class CrossAttnDownBlock2DWidthDepthGated(CrossAttnDownBlock2D):
                         only_cross_attention=only_cross_attention,
                         upcast_attention=upcast_attention,
                         attention_type=attention_type,
+                        gated_ff=gated_ff,
+                        ff_gate_width=ff_gate_width
                     )
                 )
             else:
@@ -1392,7 +1214,8 @@ class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
             only_cross_attention=False,
             upcast_attention=False,
             attention_type="default",
-            gated_ff: bool = False
+            gated_ff: bool = False,
+            ff_gate_width: int = 32
     ):
         super().__init__(in_channels=in_channels, out_channels=out_channels, temb_channels=temb_channels,
                          dropout=dropout, num_layers=num_layers,
@@ -1437,7 +1260,8 @@ class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
                         only_cross_attention=only_cross_attention,
                         upcast_attention=upcast_attention,
                         attention_type=attention_type,
-                        gated_ff=gated_ff
+                        gated_ff=gated_ff,
+                        ff_gate_width=ff_gate_width
                     )
                 )
             else:
@@ -1482,7 +1306,8 @@ class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
                         only_cross_attention=only_cross_attention,
                         upcast_attention=upcast_attention,
                         attention_type=attention_type,
-                        gated_ff=gated_ff
+                        gated_ff=gated_ff,
+                        ff_gate_width=ff_gate_width
                     )
                 )
             else:
@@ -1589,6 +1414,8 @@ class CrossAttnUpBlock2DWidthDepthGated(CrossAttnUpBlock2D):
             only_cross_attention=False,
             upcast_attention=False,
             attention_type="default",
+            gated_ff: bool = True,
+            ff_gate_width: int = 32
     ):
         super().__init__(in_channels=in_channels, out_channels=out_channels, prev_output_channel=prev_output_channel,
                          temb_channels=temb_channels, dropout=dropout, num_layers=num_layers,
@@ -1635,6 +1462,8 @@ class CrossAttnUpBlock2DWidthDepthGated(CrossAttnUpBlock2D):
                         only_cross_attention=only_cross_attention,
                         upcast_attention=upcast_attention,
                         attention_type=attention_type,
+                        gated_ff=gated_ff,
+                        ff_gate_width=ff_gate_width
                     )
                 )
             else:
@@ -1676,7 +1505,8 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
             only_cross_attention=False,
             upcast_attention=False,
             attention_type="default",
-            gated_ff: bool = False
+            gated_ff: bool = True,
+            ff_gate_width: int = 32
     ):
         super().__init__(in_channels=in_channels, out_channels=out_channels, prev_output_channel=prev_output_channel,
                          temb_channels=temb_channels, dropout=dropout, num_layers=num_layers,
@@ -1724,7 +1554,8 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
                         only_cross_attention=only_cross_attention,
                         upcast_attention=upcast_attention,
                         attention_type=attention_type,
-                        gated_ff=gated_ff
+                        gated_ff=gated_ff,
+                        ff_gate_width=ff_gate_width
                     )
                 )
             else:
@@ -1771,7 +1602,8 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
                         only_cross_attention=only_cross_attention,
                         upcast_attention=upcast_attention,
                         attention_type=attention_type,
-                        gated_ff=gated_ff
+                        gated_ff=gated_ff,
+                        ff_gate_width=ff_gate_width
                     )
                 )
             else:
@@ -2165,7 +1997,8 @@ class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
             use_linear_projection: bool = False,
             upcast_attention: bool = False,
             attention_type: str = "default",
-            gated_ff: bool = False
+            gated_ff: bool = False,
+            ff_gate_width: int = 32
     ):
         super().__init__(in_channels=in_channels, temb_channels=temb_channels, dropout=dropout, num_layers=num_layers,
                          transformer_layers_per_block=transformer_layers_per_block, resnet_eps=resnet_eps,
@@ -2207,7 +2040,8 @@ class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
                         use_linear_projection=use_linear_projection,
                         upcast_attention=upcast_attention,
                         attention_type=attention_type,
-                        gated_ff=gated_ff
+                        gated_ff=gated_ff,
+                        ff_gate_width=ff_gate_width
                     )
                 )
             else:
