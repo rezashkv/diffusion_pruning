@@ -877,7 +877,7 @@ class Transformer2DModelWidthGated(Transformer2DModel):
                 self.prunable_flops += tb_flops["prunable_flops"]
 
             # Output
-            if self.is_output_continuous:
+            if self.is_input_continuous:
                 # proj_out (conv or linear)
                 self.total_flops += self.proj_out.__flops__
 
@@ -959,6 +959,7 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
 
         self.depth_gate = DepthGate(1)
         self.structure = {'width': [], 'depth': []}
+        self.prunable_flops, self.total_flops = 0., 0.
 
     def forward(
             self,
@@ -1214,7 +1215,7 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
                 self.prunable_flops += tb_flops["prunable_flops"]
 
             # Output
-            if self.is_output_continuous:
+            if self.is_input_continuous:
                 # proj_out (conv or linear)
                 self.total_flops += self.proj_out.__flops__
 
@@ -1700,7 +1701,8 @@ class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
             b_flops = 0
             for m in b.children():
                 b_flops += m.__flops__
-            curr_total_flops.append(b_flops)
+            # same shape as other elements for easy summation
+            curr_total_flops.append(torch.zeros_like(curr_prunable_flops[0]) + b_flops)
 
         return {"prunable_flops": self.prunable_flops,
                 "total_flops": self.total_flops,
@@ -2017,11 +2019,12 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
                 self.prunable_flops.append(resnet_flops["prunable_flops"])
                 self.prunable_flops.append(attention_flops["prunable_flops"])
 
-            for b in self.upsamplers:
-                b_flops = 0
-                for m in b.children():
-                    b_flops += m.__flops__
-                self.total_flops.append(b_flops)
+            if self.upsamplers:
+                for b in self.upsamplers:
+                    b_flops = 0
+                    for m in b.children():
+                        b_flops += m.__flops__
+                    self.total_flops.append(b_flops)
 
         curr_prunable_flops = []
         curr_total_flops = []
@@ -2034,11 +2037,12 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
             curr_total_flops.append(resnet_flops["cur_total_flops"])
             curr_total_flops.append(attention_flops["cur_total_flops"])
 
-        for b in self.upsamplers:
-            b_flops = 0
-            for m in b.children():
-                b_flops += m.__flops__
-            curr_total_flops.append(b_flops)
+        if self.upsamplers:
+            for b in self.upsamplers:
+                b_flops = 0
+                for m in b.children():
+                    b_flops += m.__flops__
+                curr_total_flops.append(torch.zeros_like(curr_prunable_flops[0]) + b_flops)
 
         return {"prunable_flops": self.prunable_flops,
                 "total_flops": self.total_flops,
@@ -2215,7 +2219,7 @@ class DownBlock2DWidthHalfDepthGated(DownBlock2D):
                 b_flops = 0
                 for m in b.children():
                     b_flops += m.__flops__
-                curr_total_flops.append(b_flops)
+                curr_total_flops.append(torch.zeros_like(curr_prunable_flops[0]) + b_flops)
 
         return {"prunable_flops": self.prunable_flops,
                 "total_flops": self.total_flops,
@@ -2399,7 +2403,7 @@ class UpBlock2DWidthHalfDepthGated(UpBlock2D):
                 b_flops = 0
                 for m in b.children():
                     b_flops += m.__flops__
-                curr_total_flops.append(b_flops)
+                curr_total_flops.append(torch.zeros_like(curr_prunable_flops[0]) + b_flops)
 
         return {"prunable_flops": self.prunable_flops,
                 "total_flops": self.total_flops,

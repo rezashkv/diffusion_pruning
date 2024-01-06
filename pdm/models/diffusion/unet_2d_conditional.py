@@ -2190,18 +2190,18 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         curr_total_flops = []
         for m in self.down_blocks:
             m_flops = m.calc_flops()
-            curr_total_flops.append(m_flops["total_flops"])
-            curr_prunable_flops.append(m_flops["prunable_flops"])
+            curr_total_flops.append(m_flops["cur_total_flops"])
+            curr_prunable_flops.append(m_flops["cur_prunable_flops"])
         if self.mid_block:
             m_flops = self.mid_block.calc_flops()
-            curr_total_flops.append(m_flops["total_flops"])
-            curr_prunable_flops.append(m_flops["prunable_flops"])
+            curr_total_flops.append(m_flops["cur_total_flops"])
+            curr_prunable_flops.append(m_flops["cur_prunable_flops"])
         for m in self.up_blocks:
             m_flops = m.calc_flops()
-            curr_total_flops.append(m_flops["total_flops"])
-            curr_prunable_flops.append(m_flops["prunable_flops"])
+            curr_total_flops.append(m_flops["cur_total_flops"])
+            curr_prunable_flops.append(m_flops["cur_prunable_flops"])
 
         return {"prunable_flops": self.prunable_flops,
-                "total_flops": self.total_flops,
+                "total_flops": self.t_flops,
                 "cur_prunable_flops": curr_prunable_flops,
                 "cur_total_flops": curr_total_flops}
