@@ -17,6 +17,7 @@ from diffusers.models.normalization import AdaGroupNorm
 # from diffusers.models.activations import GEGLU
 from diffusers.models.resnet import Upsample2D
 from diffusers.models.lora import (LoRACompatibleConv, LoRACompatibleLinear)
+from pdm.models.diffusion.blocks import GatedAttention
 
 
 @torch.no_grad()
@@ -262,6 +263,24 @@ def multihead_attention_counter_hook(multihead_attention_module, input, output):
     multihead_attention_module.__flops__ += int(flops)
 
 
+def gated_qkv_attention_counter_hook(qkv_attention_module, input, output):
+    attn_flops = 0
+    batch_size, seq_len, dim = output.shape
+    num_heads, head_dim = qkv_attention_module.heads, dim // qkv_attention_module.heads
+
+    head_flops = (
+            (seq_len * seq_len * head_dim)  # QK^T
+            + (seq_len * seq_len)  # softmax
+            + (seq_len * seq_len * head_dim)  # AV
+    )
+
+    attn_flops += num_heads * head_flops
+
+    attn_flops *= batch_size
+
+    qkv_attention_module.__flops__ += attn_flops
+
+
 CUSTOM_MODULES_MAPPING = {}
 
 MODULES_MAPPING = {
@@ -326,7 +345,9 @@ MODULES_MAPPING = {
     nn.RNNCell: rnn_cell_flops_counter_hook,
     nn.LSTMCell: rnn_cell_flops_counter_hook,
     nn.GRUCell: rnn_cell_flops_counter_hook,
-    nn.MultiheadAttention: multihead_attention_counter_hook
+    nn.MultiheadAttention: multihead_attention_counter_hook,
+
+    GatedAttention: GatedAttention.calc_flops_hook,
 }
 
 if hasattr(nn, 'GELU'):

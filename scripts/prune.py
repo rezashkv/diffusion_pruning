@@ -17,6 +17,7 @@ import logging
 import os
 import random
 import sys
+sys.path.append(os.getcwd())
 import datetime
 
 from accelerate.utils import set_seed

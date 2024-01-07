@@ -465,11 +465,14 @@ class DiffPruningTrainer:
 
                     if global_step == 0:
                         with torch.no_grad():
-                            flops, params = count_ops_and_params(self.unet, 
-                                                                 {'sample': noisy_latents[0].unsqueeze(0),
-                                                                  'timestep': timesteps[0].unsqueeze(0),
-                                                                  'encoder_hidden_states': encoder_hidden_states[0].unsqueeze(0)})
-                            
+                            arch_vec_separated = self.hyper_net.transform_structure_vector(
+                                torch.ones((1, self.quantizer.vq_embed_dim), device=arch_vector_quantized.device))
+                            self.unet.set_structure(arch_vec_separated)
+                            flops, params = count_ops_and_params(self.unet,
+                                                                {'sample': noisy_latents[0].unsqueeze(0), 
+                                                                 'timestep': timesteps[0].unsqueeze(0), 
+                                                                 'encoder_hidden_states': encoder_hidden_states[0].unsqueeze(0)})
+                                         
                             logger.info("Calculating UNet's MACs for different layers for the first time: params: {:.3f}M\t MACs: {:.3f}G".format(params/1e6, flops/1e9))
                             # self.unet(noisy_latents, timesteps, encoder_hidden_states)
                             # self.unet.total_flops = self.unet.compute_average_flops_cost()[0]

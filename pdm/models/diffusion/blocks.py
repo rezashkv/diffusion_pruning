@@ -46,16 +46,6 @@ class GEGLUGated(GEGLU):
         hidden_states = mask.expand_as(hidden_states) * hidden_states
         gate = mask.expand_as(gate) * gate
         return hidden_states * self.gelu(gate)
-
-    def calc_flops(self):
-        if self.total_flops == 0:
-            # GEGLU
-            self.total_flops += self.net[0].__flops__
-            self.prunable_flops += self.net[0].__flops__
-
-            # Linear
-            self.total_flops += self.net[2].__flops__
-            self.prunable_flops += self.net[2].__flops__
     
 
 class FeedForwardWidthGated(FeedForward):
@@ -93,8 +83,8 @@ class FeedForwardWidthGated(FeedForward):
     def calc_flops(self):
         if self.total_flops == 0.:
             # GEGLU
-            self.total_flops += self.net[0].__flops__
-            self.prunable_flops += self.net[0].__flops__
+            self.total_flops += self.net[0].proj.__flops__
+            self.prunable_flops += self.net[0].proj.__flops__
 
             # Linear
             self.total_flops += self.net[2].__flops__
@@ -153,6 +143,64 @@ class GatedAttention(Attention):
             self.total_flops += self.to_out[0].__flops__
             self.prunable_flops += self.to_out[0].__flops__
 
+        hard_width_gate = hard_concrete(self.gate.gate_f)
+        ratio = hard_width_gate.sum(dim=1, keepdim=True) / hard_width_gate.shape[1]
+        return {"prunable_flops": self.prunable_flops,
+                "total_flops": self.total_flops,
+                "cur_prunable_flops": ratio * self.prunable_flops,
+                "cur_total_flops": ratio.detach() * self.prunable_flops + (self.total_flops - self.prunable_flops)}
+
+    def calc_flops_hook(self, input, output):
+        if self.total_flops == 0.:
+            # SpatialNorm
+            if self.spatial_norm is not None:
+                self.total_flops += self.spatial_norm.__flops__
+
+            # GroupNorm
+            if self.group_norm is not None:
+                self.total_flops += self.group_norm.__flops__
+
+            # NormCross
+            if self.norm_cross:
+                self.total_flops += self.norm_cross.__flops__
+
+            # to_q
+            self.total_flops += self.to_q.__flops__
+            self.prunable_flops += self.to_q.__flops__
+
+            # to_k
+            self.total_flops += self.to_k.__flops__
+            self.prunable_flops += self.to_k.__flops__
+
+            # to_v
+            self.total_flops += self.to_v.__flops__
+            self.prunable_flops += self.to_v.__flops__
+
+            # # sdp
+            # self.total_flops += self.__flops__
+            # self.prunable_flops += self.__flops__
+
+            attn_flops = 0
+            batch_size, seq_len, dim = output.shape
+            assert batch_size == 1
+            num_heads, head_dim = self.heads, dim // self.heads
+
+            head_flops = (
+                    (seq_len * seq_len * head_dim)  # QK^T
+                    + (seq_len * seq_len)  # softmax
+                    + (seq_len * seq_len * head_dim)  # AV
+            )
+
+            attn_flops += num_heads * head_flops
+
+            self.total_flops += self.to_out[0].attn_flops
+            self.prunable_flops += self.to_out[0].attn_flops
+
+            # to_out
+            self.total_flops += self.to_out[0].__flops__
+            self.prunable_flops += self.to_out[0].__flops__
+
+        self.__flops__ = self.total_flops
         hard_width_gate = hard_concrete(self.gate.gate_f)
         ratio = hard_width_gate.sum(dim=1, keepdim=True) / hard_width_gate.shape[1]
         return {"prunable_flops": self.prunable_flops,
