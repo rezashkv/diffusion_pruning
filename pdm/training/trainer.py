@@ -31,6 +31,8 @@ from datasets.utils.logging import set_verbosity_error, set_verbosity_warning
 from packaging import version
 import accelerate
 
+from pdm.utils.op_counter_orig import count_ops_and_params
+
 logger = get_logger(__name__)
 
 
@@ -396,12 +398,28 @@ class DiffPruningTrainer:
             disable=not self.accelerator.is_local_main_process,
         )
 
+    #     def forward(
+    #         self,
+    #         sample: torch.FloatTensor,
+    #         timestep: Union[torch.Tensor, float, int],
+    #         encoder_hidden_states: torch.Tensor,
+    #         class_labels: Optional[torch.Tensor] = None,
+    #         timestep_cond: Optional[torch.Tensor] = None,
+    #         attention_mask: Optional[torch.Tensor] = None,
+    #         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+    #         added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
+    #         down_block_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
+    #         mid_block_additional_residual: Optional[torch.Tensor] = None,
+    #         encoder_attention_mask: Optional[torch.Tensor] = None,
+    #         return_dict: bool = True,
+    # ) -> Union[UNet2DConditionOutput, Tuple]:
+
         for epoch in range(first_epoch, self.config.training.num_train_epochs):
             train_loss = 0.0
             for step, batch in enumerate(self.train_dataloader):
                 self.hyper_net.train()
                 self.quantizer.train()
-                self.unet.reset_flops_count()
+                # self.unet.reset_flops_count()
                 with self.accelerator.accumulate(self.unet):
                     # Convert images to latent space
                     latents = self.vae.encode(batch["pixel_values"].to(self.weight_dtype)).latent_dist.sample()
@@ -445,11 +463,17 @@ class DiffPruningTrainer:
                     arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
                     self.unet.set_structure(arch_vectors_separated)
 
-                    if self.unet.total_flops is None:
+                    if global_step == 0:
                         with torch.no_grad():
-                            self.unet(noisy_latents, timesteps, encoder_hidden_states)
-                            self.unet.total_flops = self.unet.compute_average_flops_cost()[0]
-                            self.unet.reset_flops_count()
+                            flops, params = count_ops_and_params(self.unet, 
+                                                                 {'sample': noisy_latents[0].unsqueeze(0),
+                                                                  'timestep': timesteps[0].unsqueeze(0),
+                                                                  'encoder_hidden_states': encoder_hidden_states[0].unsqueeze(0)})
+                            
+                            logger.info("Calculating UNet's MACs for different layers for the first time: params: {:.3f}M\t MACs: {:.3f}G".format(params/1e6, flops/1e9))
+                            # self.unet(noisy_latents, timesteps, encoder_hidden_states)
+                            # self.unet.total_flops = self.unet.compute_average_flops_cost()[0]
+                            # self.unet.reset_flops_count()
 
                     # Get the target for loss depending on the prediction type
                     if self.config.model.unet.prediction_type is not None:
@@ -487,9 +511,12 @@ class DiffPruningTrainer:
                         loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                         loss = loss.mean()
 
-                    curr_flops, _ = self.unet.compute_average_flops_cost()
+                    # curr_flops, _ = self.unet.compute_average_flops_cost()
+                    flops_dict = self.unet.calc_flops()
+                    curr_flops = flops_dict['cur_prunable_flops']
 
-                    resource_ratio = (curr_flops / self.unet.total_flops)
+                    # resource_ratio = (curr_flops / self.unet.total_flops)
+                    resource_ratio = (curr_flops / flops_dict['prunable_flops'])
                     resource_loss = self.resource_loss(resource_ratio)
 
                     loss += self.config.training.losses.resource_loss.weight * resource_loss

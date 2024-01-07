@@ -1,4 +1,4 @@
-"""
+'''
 This opcounter is adapted from https://github.com/sovrasov/flops-counter.pytorch
 
 Copyright (C) 2021 Sovrasov V. - All Rights Reserved
@@ -6,43 +6,23 @@ Copyright (C) 2021 Sovrasov V. - All Rights Reserved
  * terms of the MIT license.
  * You should have received a copy of the MIT license with
  * this file. If not visit https://opensource.org/licenses/MIT
-"""
+'''
 
 import numpy as np
+import torch.nn as nn
 import torch
+
 from diffusers.models.attention_processor import SpatialNorm
 from diffusers.models.normalization import AdaGroupNorm
-from diffusers.models.activations import GEGLU
+# from diffusers.models.activations import GEGLU
 from diffusers.models.resnet import Upsample2D
 from diffusers.models.lora import (LoRACompatibleConv, LoRACompatibleLinear)
-from pdm.models.diffusion.blocks import (ResnetBlock2DWidthGated, ResnetBlock2DWidthDepthGated,
-                                         BasicTransformerBlockWidthGated, Transformer2DModelWidthGated,
-                                         Transformer2DModelWidthDepthGated, GatedAttention, GEGLUGated)
-from pdm.utils.estimation_utils import hard_concrete
-
-import sys
-import os
-from functools import partial
-import torch.nn as nn
-import copy
-
-from diffusers.models.attention_processor import Attention
-
-
-# Disable
-def blockPrint():
-    sys.stdout = open(os.devnull, 'w')
-
-
-# Restore
-def enablePrint():
-    sys.stdout = sys.__stdout__
 
 
 @torch.no_grad()
 def count_ops_and_params(model, example_inputs):
     global CUSTOM_MODULES_MAPPING
-    model = copy.deepcopy(model)
+    # model = copy.deepcopy(model)
     flops_model = add_flops_counting_methods(model)
     flops_model.eval()
     flops_model.start_flops_count(ost=sys.stdout, verbose=False,
@@ -54,7 +34,7 @@ def count_ops_and_params(model, example_inputs):
     else:
         _ = flops_model(example_inputs)
     flops_count, params_count = flops_model.compute_average_flops_cost()
-    flops_model.stop_flops_count()
+    # flops_model.stop_flops_count()
     CUSTOM_MODULES_MAPPING = {}
     return flops_count, params_count
 
@@ -80,15 +60,6 @@ def relu_flops_counter_hook(module, input, output):
 def silu_flops_counter_hook(module, input, output):
     active_elements_count = output.numel()
     module.__flops__ += int(active_elements_count * 2)
-
-
-def geglu_flops_counter_hook(module, input, output):
-    input = input[0]
-    output_last_dim = output.shape[-1]
-    bias_flops = output_last_dim if module.proj.bias is not None else 0
-    proj_flops = np.prod(input.shape) * output_last_dim * 2 + bias_flops
-    gelu_flops = output.numel()
-    module.__flops__ += int(proj_flops + gelu_flops * 2)
 
 
 def linear_flops_counter_hook(module, input, output):
@@ -134,7 +105,7 @@ def conv_flops_counter_hook(conv_module, input, output):
 
     filters_per_channel = out_channels // groups
     conv_per_position_flops = int(np.prod(kernel_dims)) * \
-                              in_channels * filters_per_channel
+        in_channels * filters_per_channel
 
     active_elements_count = batch_size * int(np.prod(output_dims))
 
@@ -143,6 +114,7 @@ def conv_flops_counter_hook(conv_module, input, output):
     bias_flops = 0
 
     if conv_module.bias is not None:
+
         bias_flops = out_channels * active_elements_count
 
     overall_flops = overall_conv_flops + bias_flops
@@ -152,9 +124,9 @@ def conv_flops_counter_hook(conv_module, input, output):
 
 def rnn_flops(flops, rnn_module, w_ih, w_hh, input_size):
     # matrix matrix mult ih state and internal state
-    flops += w_ih.shape[0] * w_ih.shape[1]
+    flops += w_ih.shape[0]*w_ih.shape[1]
     # matrix matrix mult hh state and internal state
-    flops += w_hh.shape[0] * w_hh.shape[1]
+    flops += w_hh.shape[0]*w_hh.shape[1]
     if isinstance(rnn_module, (nn.RNN, nn.RNNCell)):
         # add both operations
         flops += rnn_module.hidden_size
@@ -162,12 +134,12 @@ def rnn_flops(flops, rnn_module, w_ih, w_hh, input_size):
         # hadamard of r
         flops += rnn_module.hidden_size
         # adding operations from both states
-        flops += rnn_module.hidden_size * 3
+        flops += rnn_module.hidden_size*3
         # last two hadamard product and add
-        flops += rnn_module.hidden_size * 3
+        flops += rnn_module.hidden_size*3
     elif isinstance(rnn_module, (nn.LSTM, nn.LSTMCell)):
         # adding operations from both states
-        flops += rnn_module.hidden_size * 4
+        flops += rnn_module.hidden_size*4
         # two hadamard product and add for C state
         flops += rnn_module.hidden_size + rnn_module.hidden_size + rnn_module.hidden_size
         # final hadamard
@@ -263,9 +235,9 @@ def multihead_attention_counter_hook(multihead_attention_module, input, output):
 
     # Initial projections
     flops += (
-            (qlen * qdim * qdim)  # QW
-            + (klen * kdim * kdim)  # KW
-            + (vlen * vdim * vdim)  # VW
+        (qlen * qdim * qdim)  # QW
+        + (klen * kdim * kdim)  # KW
+        + (vlen * vdim * vdim)  # VW
     )
 
     if multihead_attention_module.in_proj_bias is not None:
@@ -276,9 +248,9 @@ def multihead_attention_counter_hook(multihead_attention_module, input, output):
     v_head_dim = vdim // num_heads
 
     head_flops = (
-            (qlen * klen * qk_head_dim)  # QK^T
-            + (qlen * klen)  # softmax
-            + (qlen * klen * v_head_dim)  # AV
+        (qlen * klen * qk_head_dim)  # QK^T
+        + (qlen * klen)  # softmax
+        + (qlen * klen * v_head_dim)  # AV
     )
 
     flops += num_heads * head_flops
@@ -290,55 +262,6 @@ def multihead_attention_counter_hook(multihead_attention_module, input, output):
     multihead_attention_module.__flops__ += int(flops)
 
 
-def qkv_attention_counter_hook(qkv_attention_module, input, output):
-    for m in qkv_attention_module.children():
-        for m_m in m.modules():
-            m_m.accumulate_flops = accumulate_flops.__get__(m_m)
-
-        flops_sum = m.accumulate_flops()
-        qkv_attention_module.__flops__ += flops_sum
-
-    attn_flops = 0
-    batch_size, seq_len, dim = output.shape
-    num_heads, head_dim = qkv_attention_module.heads, dim // qkv_attention_module.heads
-
-    head_flops = (
-            (seq_len * seq_len * head_dim)  # QK^T
-            + (seq_len * seq_len)  # softmax
-            + (seq_len * seq_len * head_dim)  # AV
-    )
-
-    attn_flops += num_heads * head_flops
-
-    attn_flops *= batch_size
-
-    qkv_attention_module.__flops__ += attn_flops
-
-
-def gated_qkv_attention_counter_hook(qkv_attention_module, input, output):
-    attn_flops = 0
-    batch_size, seq_len, dim = output.shape
-    num_heads, head_dim = qkv_attention_module.heads, dim // qkv_attention_module.heads
-
-    head_flops = (
-            (seq_len * seq_len * head_dim)  # QK^T
-            + (seq_len * seq_len)  # softmax
-            + (seq_len * seq_len * head_dim)  # AV
-    )
-
-    attn_flops += num_heads * head_flops
-
-    attn_flops *= batch_size
-
-    qkv_attention_module.__flops__ += attn_flops
-
-
-def gate_flops_counter_hook(module, input, output):
-    input = input[0]
-    active_elements_count = np.prod(input.shape)
-    module.__flops__ += int(active_elements_count)
-
-
 CUSTOM_MODULES_MAPPING = {}
 
 MODULES_MAPPING = {
@@ -347,6 +270,7 @@ MODULES_MAPPING = {
     nn.Conv2d: conv_flops_counter_hook,
     nn.Conv3d: conv_flops_counter_hook,
     LoRACompatibleConv: conv_flops_counter_hook,
+
     # activations
     nn.ReLU: relu_flops_counter_hook,
     nn.PReLU: relu_flops_counter_hook,
@@ -354,8 +278,6 @@ MODULES_MAPPING = {
     nn.LeakyReLU: relu_flops_counter_hook,
     nn.ReLU6: relu_flops_counter_hook,
     nn.SiLU: silu_flops_counter_hook,
-    # GEGLU: geglu_flops_counter_hook,
-    # GEGLUGated: geglu_flops_counter_hook,
 
     # poolings
     nn.MaxPool1d: pool_flops_counter_hook,
@@ -383,16 +305,20 @@ MODULES_MAPPING = {
     SpatialNorm: bn_flops_counter_hook,
     AdaGroupNorm: bn_flops_counter_hook,
     nn.LayerNorm: layer_norm_flops_counter_hook,
+
     # FC
     nn.Linear: linear_flops_counter_hook,
     LoRACompatibleLinear: linear_flops_counter_hook,
+
     # Upscale
     nn.Upsample: upsample_flops_counter_hook,
     Upsample2D: upsample_flops_counter_hook,
+
     # Deconvolution
     nn.ConvTranspose1d: conv_flops_counter_hook,
     nn.ConvTranspose2d: conv_flops_counter_hook,
     nn.ConvTranspose3d: conv_flops_counter_hook,
+
     # RNN
     nn.RNN: rnn_flops_counter_hook,
     nn.GRU: rnn_flops_counter_hook,
@@ -400,76 +326,26 @@ MODULES_MAPPING = {
     nn.RNNCell: rnn_cell_flops_counter_hook,
     nn.LSTMCell: rnn_cell_flops_counter_hook,
     nn.GRUCell: rnn_cell_flops_counter_hook,
-    nn.MultiheadAttention: multihead_attention_counter_hook,
-
-    # Self-Attention
-    Attention: qkv_attention_counter_hook,
-    GatedAttention: gated_qkv_attention_counter_hook,
-
-    # Gate
-    # BlockVirtualGate: gate_flops_counter_hook,
+    nn.MultiheadAttention: multihead_attention_counter_hook
 }
-
 
 if hasattr(nn, 'GELU'):
     MODULES_MAPPING[nn.GELU] = relu_flops_counter_hook
 
+
+import sys
+from functools import partial
+import torch.nn as nn
+import copy
 
 def accumulate_flops(self):
     if is_supported_instance(self):
         return self.__flops__
     else:
         sum = 0
-        if not isinstance(self, (ResnetBlock2DWidthGated, BasicTransformerBlockWidthGated,
-                                 ResnetBlock2DWidthDepthGated, Transformer2DModelWidthGated,
-                                 Transformer2DModelWidthDepthGated)):
-            for m in self.children():
-                sum += m.accumulate_flops()
-            return sum
-
-        elif isinstance(self, (ResnetBlock2DWidthGated, ResnetBlock2DWidthDepthGated)):
-            for m in self.children():
-                sum += m.accumulate_flops()
-            norm1_flops = self.norm1.accumulate_flops()
-            nonlinearity_flops = self.nonlinearity.accumulate_flops()
-            non_prunable_flops = norm1_flops + nonlinearity_flops
-
-            prunable_flops = sum - non_prunable_flops
-            hard_out = hard_concrete(self.gate.gate_f)
-            current_prunable_flops = prunable_flops * hard_out.sum() / hard_out.numel()
-            current_total_flops = current_prunable_flops + non_prunable_flops
-
-        # instance of BasicTransformerBlockGated or BasicTransformerBlockWidthDepthGated
-        elif isinstance(self, BasicTransformerBlockWidthGated):
-            norm1_flops = self.norm1.accumulate_flops()
-            att1_flops = self.attn1.accumulate_flops()
-            norm2_flops = self.norm2.accumulate_flops()
-            att2_flops = self.attn2.accumulate_flops()
-            norm3_flops = self.norm3.accumulate_flops()
-            ff_flops = self.ff.accumulate_flops()
-
-            gate_1_hard_out = hard_concrete(self.attn1.gate.gate_f)
-            gate_2_hard_out = hard_concrete(self.attn2.gate.gate_f)
-            curr_att1_flops = att1_flops * gate_1_hard_out.sum() / gate_1_hard_out.numel()
-            curr_att2_flops = att2_flops * gate_2_hard_out.sum() / gate_2_hard_out.numel()
-            current_total_flops = (
-                    norm1_flops + curr_att1_flops + curr_att2_flops + norm2_flops + norm3_flops + ff_flops)
-
-        elif isinstance(self, (Transformer2DModelWidthGated, Transformer2DModelWidthDepthGated)):
-            current_total_flops = 0
-            for m in self.children():
-                current_total_flops += m.accumulate_flops()
-
-        else:
-            current_total_flops = 0
-            for m in self.children():
-                current_total_flops += m.accumulate_flops()
-
-        if hasattr(self, 'depth_gate'):
-            hard_out = hard_concrete(self.depth_gate.gate_f)
-            current_total_flops = current_total_flops * hard_out.sum() / hard_out.numel()
-
-        return current_total_flops
+        for m in self.children():
+            sum += m.accumulate_flops()
+        return sum
 
 
 def get_model_parameters_number(model):
@@ -484,7 +360,7 @@ def add_flops_counting_methods(net_main_module):
     net_main_module.stop_flops_count = stop_flops_count.__get__(net_main_module)
     net_main_module.reset_flops_count = reset_flops_count.__get__(net_main_module)
     net_main_module.compute_average_flops_cost = compute_average_flops_cost.__get__(
-        net_main_module)
+                                                    net_main_module)
 
     net_main_module.reset_flops_count()
 
@@ -497,6 +373,7 @@ def compute_average_flops_cost(self):
     on a desired net object.
     Returns current mean flops consumption per image.
     """
+
     for m in self.modules():
         m.accumulate_flops = accumulate_flops.__get__(m)
 
@@ -507,7 +384,6 @@ def compute_average_flops_cost(self):
             del m.accumulate_flops
 
     params_sum = get_model_parameters_number(self)
-
     return flops_sum / self.__batch_counter__, params_sum
 
 
@@ -532,14 +408,14 @@ def start_flops_count(self, **kwargs):
                 return
             if type(module) in CUSTOM_MODULES_MAPPING:
                 handle = module.register_forward_hook(
-                    CUSTOM_MODULES_MAPPING[type(module)])
+                                        CUSTOM_MODULES_MAPPING[type(module)])
             else:
                 handle = module.register_forward_hook(MODULES_MAPPING[type(module)])
             module.__flops_handle__ = handle
             seen_types.add(type(module))
         else:
             if verbose and not type(module) in (nn.Sequential, nn.ModuleList) and \
-                    not type(module) in seen_types:
+               not type(module) in seen_types:
                 print('Warning: module ' + type(module).__name__ +
                       ' is treated as a zero-op.', file=ost)
             seen_types.add(type(module))
@@ -584,6 +460,7 @@ def batch_counter_hook(module, input, output):
 
 
 def add_batch_counter_variables_or_reset(module):
+
     module.__batch_counter__ = 0
 
 
@@ -604,9 +481,9 @@ def remove_batch_counter_hook_function(module):
 def add_flops_counter_variable_or_reset(module):
     if is_supported_instance(module):
         if hasattr(module, '__flops__') or hasattr(module, '__params__'):
-            # print('Warning: variables __flops__ or __params__ are already '
-            #       'defined for the module' + type(module).__name__ +
-            #       ' ptflops can affect your code!')
+            print('Warning: variables __flops__ or __params__ are already '
+                  'defined for the module' + type(module).__name__ +
+                  ' ptflops can affect your code!')
             module.__ptflops_backup_flops__ = module.__flops__
             module.__ptflops_backup_params__ = module.__params__
         module.__flops__ = 0

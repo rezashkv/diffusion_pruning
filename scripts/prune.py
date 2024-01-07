@@ -213,8 +213,8 @@ def main():
     if config.training.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    unet = add_flops_counting_methods(unet)
-    unet.start_flops_count(ost=sys.stdout, verbose=False, ignore_list=[])
+    # unet = add_flops_counting_methods(unet)
+    # unet.start_flops_count(ost=sys.stdout, verbose=False, ignore_list=[])
 
     # ##################################################################################################################
     # #################################################### Datasets ####################################################
@@ -327,6 +327,8 @@ def main():
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
+        for iii, ccc in enumerate(captions):
+            print(f"{iii}: {ccc}")
         inputs = tokenizer(
             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
@@ -355,6 +357,8 @@ def main():
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
+        for iii, ccc in enumerate(captions):
+            print(f"{iii}: {ccc}")
         encoded_input = mpnet_tokenizer(captions, padding=True, truncation=True, return_tensors="pt")
         # Compute token embeddings
         with torch.no_grad():

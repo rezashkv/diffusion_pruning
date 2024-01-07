@@ -34,6 +34,7 @@ class GEGLUGated(GEGLU):
         super().__init__(dim_in, dim_out)
         self.dim_out = dim_out
         self.gate = WidthGate(gate_width)
+        self.total_flops, self.prunable_flops = 0., 0.
 
     def forward(self, hidden_states, scale: float = 1.0):
         args = () if USE_PEFT_BACKEND else (scale,)
@@ -46,6 +47,16 @@ class GEGLUGated(GEGLU):
         gate = mask.expand_as(gate) * gate
         return hidden_states * self.gelu(gate)
 
+    def calc_flops(self):
+        if self.total_flops == 0:
+            # GEGLU
+            self.total_flops += self.net[0].__flops__
+            self.prunable_flops += self.net[0].__flops__
+
+            # Linear
+            self.total_flops += self.net[2].__flops__
+            self.prunable_flops += self.net[2].__flops__
+    
 
 class FeedForwardWidthGated(FeedForward):
     r"""
