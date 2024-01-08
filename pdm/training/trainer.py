@@ -477,7 +477,10 @@ class DiffPruningTrainer:
                             sanity_flops_dict = self.unet.calc_flops()
                             sanity_string = "Our MACs calculation:\t"
                             for k, v in sanity_flops_dict.items():
-                                sanity_string += f" {k}: {v:.3f}\t"
+                                if isinstance(v, torch.Tensor):
+                                    sanity_string += f" {k}: {v.item()/1e9:.3f}\t"
+                                else:
+                                    sanity_string += f" {k}: {v/1e9:.3f}\t"
                             logger.info(sanity_string)
                             # self.unet(noisy_latents, timesteps, encoder_hidden_states)
                             # self.unet.total_flops = self.unet.compute_average_flops_cost()[0]

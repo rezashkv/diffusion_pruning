@@ -2163,7 +2163,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         out_dict['cur_total_flops'] += self.conv_in.__flops__
 
         # down_blocks
-        for m in self.down_blocks:
+        for i, m in enumerate(self.down_blocks):
             m_flops = m.calc_flops()
             for k in out_dict.keys():
                 out_dict[k] = out_dict[k] + m_flops[k]
@@ -2175,7 +2175,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
                 out_dict[k] = out_dict[k] + m_flops[k]
 
         # up_blocks
-        for m in self.up_blocks:
+        for i, m in enumerate(self.up_blocks):
             m_flops = m.calc_flops()
             for k in out_dict.keys():
                 out_dict[k] = out_dict[k] + m_flops[k]

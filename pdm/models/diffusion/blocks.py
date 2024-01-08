@@ -612,7 +612,8 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         depth_ratio = depth_hard_gate.sum(dim=1, keepdim=True) / depth_hard_gate.shape[1]
         return {"prunable_flops": self.prunable_flops,
                 "total_flops": self.total_flops,
-                "cur_prunable_flops": (ratio * self.prunable_flops) * depth_ratio,
+                "cur_prunable_flops": ((ratio * self.prunable_flops) + (
+                        self.total_flops - self.prunable_flops)) * depth_ratio,
                 "cur_total_flops": ((ratio.detach()) * self.prunable_flops + (
                         self.total_flops - self.prunable_flops)) * (depth_ratio.detach())}
 
@@ -1290,14 +1291,14 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
         depth_hard_gate = hard_concrete(self.depth_gate.gate_f).unsqueeze(1)
         depth_ratio = depth_hard_gate.sum(dim=1, keepdim=True) / depth_hard_gate.shape[1]
 
-        out_dict["cur_prunable_flops"] = out_dict["cur_prunable_flops"] * depth_ratio
-        out_dict["cur_total_flops"] = out_dict["cur_total_flops"] * (depth_ratio.detach())
-
         if self.total_flops == 0.:
             self.total_flops = out_dict["total_flops"]
         
         if self.prunable_flops == 0:
             self.prunable_flops = out_dict["prunable_flops"]
+
+        out_dict["cur_prunable_flops"] = (out_dict["cur_prunable_flops"] + self.total_flops - self.prunable_flops) * depth_ratio
+        out_dict["cur_total_flops"] = out_dict["cur_total_flops"] * (depth_ratio.detach())
         
         return out_dict
 
@@ -2685,7 +2686,7 @@ class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
         self.structure = {'width': [], 'depth': []}
-        self.total_flops, self.prunable_flops = [], []
+        self.total_flops, self.prunable_flops = 0., 0.
 
     def get_gate_structure(self):
         if len(self.structure['width']) == 0:
@@ -2754,6 +2755,12 @@ class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
             attention_flops = attention.calc_flops()
             for k in out_dict.keys():
                 out_dict[k] = out_dict[k] + attention_flops[k]
+
+        if self.total_flops == 0.:
+            self.total_flops = out_dict["total_flops"]
+        
+        if self.prunable_flops == 0:
+            self.prunable_flops = out_dict["prunable_flops"]
 
         return out_dict
 
