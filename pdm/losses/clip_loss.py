@@ -36,7 +36,7 @@ class ClipLoss(nn.Module):
                         arch_vectors[:, self.width_intervals[i][0]:self.width_intervals[i][1]] *
                         arch_vectors[:, self.depth_indices[i]:(self.depth_indices[i]+1)])
 
-        arch_vectors_ = arch_vectors_clone * torch.sqrt(self.template).detach()
+        arch_vectors_ = arch_vectors_clone * (torch.sqrt(self.template).detach())
 
         arch_vectors_normalized = arch_vectors_ / arch_vectors_.norm(dim=1, keepdim=True)
         prompt_embeddings = prompt_embeddings / prompt_embeddings.norm(dim=1, keepdim=True)

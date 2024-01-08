@@ -35,7 +35,7 @@ def count_ops_and_params(model, example_inputs):
     else:
         _ = flops_model(example_inputs)
     flops_count, params_count = flops_model.compute_average_flops_cost()
-    # flops_model.stop_flops_count()
+    flops_model.stop_flops_count()
     CUSTOM_MODULES_MAPPING = {}
     return flops_count, params_count
 
@@ -370,7 +370,8 @@ def accumulate_flops(self):
 
 
 def get_model_parameters_number(model):
-    params_num = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # params_num = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    params_num = sum(p.numel() for p in model.parameters())
     return params_num
 
 
@@ -453,7 +454,7 @@ def stop_flops_count(self):
     """
     remove_batch_counter_hook_function(self)
     self.apply(remove_flops_counter_hook_function)
-    self.apply(remove_flops_counter_variables)
+    # self.apply(remove_flops_counter_variables)
 
 
 def reset_flops_count(self):

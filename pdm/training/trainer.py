@@ -461,22 +461,29 @@ class DiffPruningTrainer:
                                                       arch_vector_quantized_list)
 
                     arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
-                    self.unet.set_structure(arch_vectors_separated)
 
+                    # Calculating the MACs of each module of the model in the first iteration.
                     if global_step == 0:
                         with torch.no_grad():
-                            arch_vec_separated = self.hyper_net.transform_structure_vector(
+                            arch_vecs_separated = self.hyper_net.transform_structure_vector(
                                 torch.ones((1, self.quantizer.vq_embed_dim), device=arch_vector_quantized.device))
-                            self.unet.set_structure(arch_vec_separated)
+                            self.unet.set_structure(arch_vecs_separated)
                             flops, params = count_ops_and_params(self.unet,
                                                                 {'sample': noisy_latents[0].unsqueeze(0), 
                                                                  'timestep': timesteps[0].unsqueeze(0), 
                                                                  'encoder_hidden_states': encoder_hidden_states[0].unsqueeze(0)})
                                          
-                            logger.info("Calculating UNet's MACs for different layers for the first time: params: {:.3f}M\t MACs: {:.3f}G".format(params/1e6, flops/1e9))
+                            logger.info("UNet's Params/MACs calculated by OpCounter:\tparams: {:.3f}M\t MACs: {:.3f}G".format(params/1e6, flops/1e9))
+                            sanity_flops_dict = self.unet.calc_flops()
+                            sanity_string = "Our MACs calculation:\t"
+                            for k, v in sanity_flops_dict.items():
+                                sanity_string += f" {k}: {v:.3f}\t"
+                            logger.info(sanity_string)
                             # self.unet(noisy_latents, timesteps, encoder_hidden_states)
                             # self.unet.total_flops = self.unet.compute_average_flops_cost()[0]
                             # self.unet.reset_flops_count()
+
+                    self.unet.set_structure(arch_vectors_separated)
 
                     # Get the target for loss depending on the prediction type
                     if self.config.model.unet.prediction_type is not None:

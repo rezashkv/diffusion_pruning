@@ -2156,34 +2156,38 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         # Time_embedding
         for m in self.time_embedding.children():
             out_dict['total_flops'] += m.__flops__
+            out_dict['cur_total_flops'] += m.__flops__
 
         # conv_in
         out_dict['total_flops'] += self.conv_in.__flops__
+        out_dict['cur_total_flops'] += self.conv_in.__flops__
 
         # down_blocks
         for m in self.down_blocks:
             m_flops = m.calc_flops()
             for k in out_dict.keys():
-                out_dict[k] += m_flops[k]
+                out_dict[k] = out_dict[k] + m_flops[k]
 
         # mid_block
         if self.mid_block:
             m_flops = self.mid_block.calc_flops()
             for k in out_dict.keys():
-                out_dict[k] += m_flops[k]
+                out_dict[k] = out_dict[k] + m_flops[k]
 
         # up_blocks
         for m in self.up_blocks:
             m_flops = m.calc_flops()
             for k in out_dict.keys():
-                out_dict[k] += m_flops[k]
+                out_dict[k] = out_dict[k] + m_flops[k]
 
         # conv_norm_out
         if self.conv_norm_out:
             out_dict['total_flops'] += (self.conv_norm_out.__flops__ + self.conv_act.__flops__)
+            out_dict['cur_total_flops'] += (self.conv_norm_out.__flops__ + self.conv_act.__flops__)
 
         # conv_out
         out_dict['total_flops'] += self.conv_out.__flops__
+        out_dict['cur_total_flops'] += self.conv_out.__flops__
 
         return out_dict
 
