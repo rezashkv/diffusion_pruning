@@ -331,7 +331,7 @@ MODULES_MAPPING = {
 
     # Upscale
     nn.Upsample: upsample_flops_counter_hook,
-    Upsample2D: upsample_flops_counter_hook,
+    # Upsample2D: upsample_flops_counter_hook,
 
     # Deconvolution
     nn.ConvTranspose1d: conv_flops_counter_hook,

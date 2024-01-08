@@ -430,6 +430,9 @@ def main():
         mpnet_embeddings = mpnet_embeddings.to(memory_format=torch.contiguous_format).float()
         return {"pixel_values": pixel_values, "input_ids": input_ids, "mpnet_embeddings": mpnet_embeddings}
 
+    if config.data.prompts is None:
+        config.data.prompts = dataset["validation"][caption_column][:config.data.max_generated_samples]
+
     trainer = DiffPruningTrainer(config=config,
                                  hyper_net=hyper_net,
                                  quantizer=quantizer,

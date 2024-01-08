@@ -526,11 +526,19 @@ class DiffPruningTrainer:
 
                     # curr_flops, _ = self.unet.compute_average_flops_cost()
                     flops_dict = self.unet.calc_flops()
-                    curr_flops = flops_dict['cur_prunable_flops']
-
+                    curr_flops = flops_dict['cur_prunable_flops']  #TODO: .mean()
+                    
                     # resource_ratio = (curr_flops / self.unet.total_flops)
+
                     resource_ratio = (curr_flops / flops_dict['prunable_flops'])
                     resource_loss = self.resource_loss(resource_ratio)
+
+                    """
+                    prunable flops
+                    pr + rest = t
+                    x * pr + rest = p * t -> x = 0.85
+                    total flops -> 50%
+                    """
 
                     loss += self.config.training.losses.resource_loss.weight * resource_loss
                     loss += self.config.training.losses.quantization_loss.weight * q_loss
@@ -542,9 +550,9 @@ class DiffPruningTrainer:
 
                     # Back-propagate
                     self.accelerator.backward(loss)
-                    if self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(self.unet.parameters(),
-                                                         self.config.training.optim.max_grad_norm)
+                    # if self.accelerator.sync_gradients:
+                    #     self.accelerator.clip_grad_norm_(self.unet.parameters(),
+                    #                                      self.config.training.optim.max_grad_norm)
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad()
@@ -562,6 +570,8 @@ class DiffPruningTrainer:
                     self.accelerator.log({"commitment_loss": q_loss})
                     self.accelerator.log({"contrastive_loss": contrastive_loss})
                     self.accelerator.log({"lr": self.lr_scheduler.get_last_lr()[0]})
+                    # TODO: add all of the elements in the flops_dict.
+
 
                     # log the pairwise cosine similarity of the embeddings of the quantizer:
                     if hasattr(self.quantizer, "module"):
@@ -616,7 +626,7 @@ class DiffPruningTrainer:
                         "q_loss": q_loss.detach().item(), "contrastive_loss": contrastive_loss.detach().item(),
                         "resource_loss": resource_loss.detach().item()}
                 progress_bar.set_postfix(**logs)
-
+                
                 if global_step >= self.config.training.max_train_steps:
                     break
             if self.eval_dataset is not None:
