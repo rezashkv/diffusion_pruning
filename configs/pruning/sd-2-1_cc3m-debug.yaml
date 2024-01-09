@@ -65,7 +65,7 @@ data:
   max_generated_samples: 32
   dataloader:
     dataloader_num_workers: 0
-    train_batch_size: 36
+    train_batch_size: 16
     validation_batch_size: 16
     center_crop: false
     random_flip: true
@@ -74,7 +74,9 @@ data:
 training:
   num_train_epochs: 100
   max_train_steps: null
-  validation_epochs: 1
+  # validation_epochs: 1
+  validation_steps: 500
+  image_logging_steps: 500
   mixed_precision: null
   gradient_accumulation_steps: 1
   gradient_checkpointing: false
@@ -90,7 +92,7 @@ training:
     resource_loss:
       type: log
       weight: 1.0
-      pruning_target: 0.8
+      pruning_target: 0.7682
 
     quantization_loss:
       weight: 1.0

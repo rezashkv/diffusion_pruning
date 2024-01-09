@@ -328,8 +328,8 @@ def main():
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
-        for iii, ccc in enumerate(captions):
-            print(f"{iii}: {ccc}")
+        # for iii, ccc in enumerate(captions):
+        #     print(f"{iii}: {ccc}")
         inputs = tokenizer(
             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
@@ -358,8 +358,8 @@ def main():
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
-        for iii, ccc in enumerate(captions):
-            print(f"{iii}: {ccc}")
+        # for iii, ccc in enumerate(captions):
+        #     print(f"{iii}: {ccc}")
         encoded_input = mpnet_tokenizer(captions, padding=True, truncation=True, return_tensors="pt")
         # Compute token embeddings
         with torch.no_grad():

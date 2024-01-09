@@ -475,6 +475,7 @@ class DiffPruningTrainer:
                                          
                             logger.info("UNet's Params/MACs calculated by OpCounter:\tparams: {:.3f}M\t MACs: {:.3f}G".format(params/1e6, flops/1e9))
                             sanity_flops_dict = self.unet.calc_flops()
+                            self.unet.resource_info_dict = sanity_flops_dict
                             sanity_string = "Our MACs calculation:\t"
                             for k, v in sanity_flops_dict.items():
                                 if isinstance(v, torch.Tensor):
@@ -524,21 +525,11 @@ class DiffPruningTrainer:
                         loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                         loss = loss.mean()
 
-                    # curr_flops, _ = self.unet.compute_average_flops_cost()
                     flops_dict = self.unet.calc_flops()
-                    curr_flops = flops_dict['cur_prunable_flops']  #TODO: .mean()
+                    curr_flops = flops_dict['cur_prunable_flops'].mean()
                     
-                    # resource_ratio = (curr_flops / self.unet.total_flops)
-
-                    resource_ratio = (curr_flops / flops_dict['prunable_flops'])
+                    resource_ratio = (curr_flops / (self.unet.resource_info_dict['cur_prunable_flops'].squeeze()))  # The reason is that sanity['prunable_flops'] does not have depth-related pruning flops like skip connections of resnets in it.
                     resource_loss = self.resource_loss(resource_ratio)
-
-                    """
-                    prunable flops
-                    pr + rest = t
-                    x * pr + rest = p * t -> x = 0.85
-                    total flops -> 50%
-                    """
 
                     loss += self.config.training.losses.resource_loss.weight * resource_loss
                     loss += self.config.training.losses.quantization_loss.weight * q_loss
@@ -629,33 +620,38 @@ class DiffPruningTrainer:
                 
                 if global_step >= self.config.training.max_train_steps:
                     break
-            if self.eval_dataset is not None:
-                self.validate()
+                
+                if global_step % self.config.training.validation_steps == 0:
+                    if self.eval_dataset is not None:
+                        self.validate()
 
-            if self.accelerator.is_main_process:
+                if global_step % self.config.training.image_logging_steps == 0:
 
-                # generate some validation images
-                if self.config.data.prompts is not None and (epoch % self.config.training.validation_epochs == 0 or
-                                                             epoch == self.config.training.num_train_epochs - 1):
-                    if self.config.use_ema:
-                        # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                        self.ema_unet.store(self.unet.parameters())
-                        self.ema_unet.copy_to(self.unet.parameters())
-                    val_images = self.generate_samples_from_prompts(epoch)
-                    if self.config.use_ema:
-                        # Switch back to the original UNet parameters.
-                        self.ema_unet.restore(self.unet.parameters())
+                    if self.accelerator.is_main_process:
 
-                # log quantizer embeddings samples
-                if epoch % self.config.training.validation_epochs == 0 or epoch == self.config.training.num_train_epochs - 1:
-                    if self.config.use_ema:
-                        # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                        self.ema_unet.store(self.unet.parameters())
-                        self.ema_unet.copy_to(self.unet.parameters())
-                    self.log_quantizer_embedding_samples(epoch)
-                    if self.config.use_ema:
-                        # Switch back to the original UNet parameters.
-                        self.ema_unet.restore(self.unet.parameters())
+                        # generate some validation images
+                        if self.config.data.prompts is not None and (epoch % self.config.training.validation_epochs == 0 or
+                                                                    epoch == self.config.training.num_train_epochs - 1):
+                            if self.config.use_ema:
+                                # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                                self.ema_unet.store(self.unet.parameters())
+                                self.ema_unet.copy_to(self.unet.parameters())
+                            val_images = self.generate_samples_from_prompts(epoch)
+                            if self.config.use_ema:
+                                # Switch back to the original UNet parameters.
+                                self.ema_unet.restore(self.unet.parameters())
+
+                        # log quantizer embeddings samples
+                        if epoch % self.config.training.validation_epochs == 0 or epoch == self.config.training.num_train_epochs - 1:
+                            if self.config.use_ema:
+                                # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                                self.ema_unet.store(self.unet.parameters())
+                                self.ema_unet.copy_to(self.unet.parameters())
+                            self.log_quantizer_embedding_samples(epoch)
+                            if self.config.use_ema:
+                                # Switch back to the original UNet parameters.
+                                self.ema_unet.restore(self.unet.parameters())
+
         # Create the pipeline using the trained modules and save it.
         self.accelerator.wait_for_everyone()
 
@@ -691,7 +687,7 @@ class DiffPruningTrainer:
         self.quantizer.eval()
         self.unet.eval()
         for step, batch in enumerate(self.eval_dataloader):
-            self.unet.reset_flops_count()
+            # self.unet.reset_flops_count()
             # with self.accelerator.split_between_processes(batch) as batch:
             batch = {k: v.to(self.accelerator.device) for k, v in batch.items()}
             with torch.no_grad():
@@ -723,9 +719,16 @@ class DiffPruningTrainer:
 
                 # Get the text embedding for conditioning
                 encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
+                text_embeddings = batch["mpnet_embeddings"]
 
                 arch_vector = self.hyper_net(encoder_hidden_states)
                 arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
+                # gather the arch_vector_quantized across all processes to get large batch for contrastive loss
+                text_embeddings_list = self.accelerator.gather(text_embeddings)
+                arch_vector_quantized_list = self.accelerator.gather(arch_vector_quantized)
+                contrastive_loss = self.clip_loss(text_embeddings_list,
+                                                    arch_vector_quantized_list)
+                
                 arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
                 self.unet.set_structure(arch_vectors_separated)
 
@@ -764,6 +767,16 @@ class DiffPruningTrainer:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                     loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                     loss = loss.mean()
+
+                flops_dict = self.unet.calc_flops()
+                curr_flops = flops_dict['cur_prunable_flops'].mean()
+
+                resource_ratio = (curr_flops / (self.unet.resource_info_dict['cur_prunable_flops'].squeeze()))  # The reason is that sanity['prunable_flops'] does not have depth-related pruning flops like skip connections of resnets in it.
+                resource_loss = self.resource_loss(resource_ratio)
+
+                loss += self.config.training.losses.resource_loss.weight * resource_loss
+                loss += self.config.training.losses.quantization_loss.weight * q_loss
+                loss += self.config.training.losses.contrastive_clip_loss.weight * contrastive_loss
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = self.accelerator.gather(
@@ -998,12 +1011,12 @@ class DiffPruningTrainer:
         torch.cuda.empty_cache()
         return gen_images
 
-    def generate_samples_from_prompts(self, epoch):
+    def generate_samples_from_prompts(self, step):
         logger.info("Generating samples from the given prompts... ")
         pipeline = self.get_pipeline()
 
         image_output_dir = os.path.join(self.config.training.logging.logging_dir, "prompt_images",
-                                        f"epoch_{epoch}")
+                                        f"epoch_{step}")
         os.makedirs(image_output_dir, exist_ok=True)
         images = []
         for step in range(0, len(self.config.data.prompts),
@@ -1030,7 +1043,7 @@ class DiffPruningTrainer:
         for tracker in self.accelerator.trackers:
             if tracker.name == "tensorboard":
                 np_images = np.stack([np.asarray(img) for img in images])
-                tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+                tracker.writer.add_images("validation", np_images, step, dataformats="NHWC")
             elif tracker.name == "wandb":
                 tracker.log(
                     {
