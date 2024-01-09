@@ -640,7 +640,7 @@ class DiffPruningTrainer:
         self.quantizer.eval()
         self.unet.eval()
         for step, batch in enumerate(self.eval_dataloader):
-            self.unet.reset_flops_count()
+            # self.unet.reset_flops_count()
             # with self.accelerator.split_between_processes(batch) as batch:
             batch = {k: v.to(self.accelerator.device) for k, v in batch.items()}
             with torch.no_grad():
