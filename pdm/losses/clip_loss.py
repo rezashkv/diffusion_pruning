@@ -24,7 +24,7 @@ class ClipLoss(nn.Module):
         template = torch.repeat_interleave(template, template).type(torch.float32)
         self.template = (1.0 / template).requires_grad_(False)
 
-    def forward(self, prompt_embeddings, arch_vectors):
+    def forward(self, prompt_embeddings, arch_vectors, return_similarity=False):
         self.template = self.template.to(prompt_embeddings.device)
 
         # Multiply the slice of the arch_vectors defined by the start and end index of the width of the block with the
@@ -40,7 +40,11 @@ class ClipLoss(nn.Module):
 
         arch_vectors_normalized = arch_vectors_ / arch_vectors_.norm(dim=1, keepdim=True)
         prompt_embeddings = prompt_embeddings / prompt_embeddings.norm(dim=1, keepdim=True)
-        arch_vectors_similarity = F.softmax((arch_vectors_normalized @ arch_vectors_normalized.T) / self.temperature, dim=-1)
+        arch_vectors_similarity = F.softmax((arch_vectors_normalized @ arch_vectors_normalized.T) / self.temperature,
+                                            dim=-1)
         texts_similarity = F.softmax((prompt_embeddings @ prompt_embeddings.T) / self.temperature, dim=-1)
         loss = F.cross_entropy(arch_vectors_similarity.T, texts_similarity.T, reduction='mean')
-        return loss.mean()  #TODO: return arch_vectors_similarity.detach()
+        if return_similarity:
+            return loss, arch_vectors_similarity.detach().cpu().numpy()
+        else:
+            return loss

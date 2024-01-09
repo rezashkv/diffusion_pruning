@@ -42,7 +42,6 @@ from diffusers.models.embeddings import (
 )
 from diffusers.models.modeling_utils import ModelMixin, _LOW_CPU_MEM_USAGE_DEFAULT
 from diffusers.models.unet_2d_blocks import (
-    UNetMidBlock2DCrossAttn,
     UNetMidBlock2DSimpleCrossAttn, DownBlock2D, ResnetDownsampleBlock2D, AttnDownBlock2D, SimpleCrossAttnDownBlock2D,
     SkipDownBlock2D, CrossAttnDownBlock2D, AttnSkipDownBlock2D, DownEncoderBlock2D, AttnDownEncoderBlock2D,
     KDownBlock2D, KCrossAttnDownBlock2D, UpBlock2D, ResnetUpsampleBlock2D, CrossAttnUpBlock2D, SimpleCrossAttnUpBlock2D,
@@ -55,9 +54,6 @@ from .blocks import (CrossAttnDownBlock2DWidthDepthGated, CrossAttnUpBlock2DWidt
                      DownBlock2DWidthDepthGated, UpBlock2DWidthDepthGated, DownBlock2DWidthHalfDepthGated,
                      UpBlock2DWidthHalfDepthGated, UNetMidBlock2DCrossAttnWidthGated)
 
-# from pdm.models.diffusion.blocks import (CrossAttnDownBlock2DWidthDepthGated, CrossAttnUpBlock2DWidthDepthGated, CrossAttnUpBlock2DWidthHalfDepthGated,
-#                                          CrossAttnDownBlock2DWidthHalfDepthGated, DownBlock2DWidthDepthGated, UpBlock2DWidthDepthGated,
-#                                          DownBlock2DWidthHalfDepthGated, UpBlock2DWidthHalfDepthGated, UNetMidBlock2DCrossAttnWidthGated)
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -797,7 +793,6 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
             mid_block_only_cross_attention: Optional[bool] = None,
             cross_attention_norm: Optional[str] = None,
             addition_embed_type_num_heads=64,
-            total_flops=None,
             gated_ff: bool = True,
             ff_gate_width: Union[int, Tuple[int]] = 32,
     ):
@@ -1207,10 +1202,8 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
                 positive_len=positive_len, out_dim=cross_attention_dim, feature_type=feature_type
             )
 
-        # self.total_flops = total_flops
         self.structure = {'width': [], 'depth': []}
 
-        # self.t_flops, self.prunable_flops = [], []
         self.total_flops, self.prunable_flops = 0., 0.
 
     @property
@@ -1524,7 +1517,6 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         # 1. time
         timesteps = timestep
         if not torch.is_tensor(timesteps):
-            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
             # This would be a good case for the `match` statement (Python 3.10+)
             is_mps = sample.device.type == "mps"
             if isinstance(timestep, float):
@@ -2190,59 +2182,3 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         out_dict['cur_total_flops'] += self.conv_out.__flops__
 
         return out_dict
-
-    # def calc_flops(self):
-    #     if not self.t_flops:
-    #         # Time_embedding
-    #         t_embed_flops = 0
-    #         for m in self.time_embedding.children():
-    #             t_embed_flops += m.__flops__
-    #         self.t_flops.append(t_embed_flops)
-
-    #         # conv_in
-    #         self.t_flops.append(self.conv_in.__flops__)
-
-    #         # down_blocks
-    #         for m in self.down_blocks:
-    #             m_flops = m.calc_flops()
-    #             self.t_flops.append(m_flops["total_flops"])
-    #             self.prunable_flops.append(m_flops["prunable_flops"])
-
-    #         # mid_block
-    #         if self.mid_block:
-    #             m_flops = self.mid_block.calc_flops()
-    #             self.t_flops.append(m_flops["total_flops"])
-    #             self.prunable_flops.append(m_flops["prunable_flops"])
-
-    #         # up_blocks
-    #         for m in self.up_blocks:
-    #             m_flops = m.calc_flops()
-    #             self.t_flops.append(m_flops["total_flops"])
-    #             self.prunable_flops.append(m_flops["prunable_flops"])
-
-    #         # conv_norm_out
-    #         if self.conv_norm_out:
-    #             self.t_flops.append(self.conv_norm_out.__flops__ + self.conv_act.__flops__)
-
-    #         # conv_out
-    #         self.t_flops.append(self.conv_out.__flops__)
-
-    #     curr_prunable_flops = []
-    #     curr_total_flops = []
-    #     for m in self.down_blocks:
-    #         m_flops = m.calc_flops()
-    #         curr_total_flops.append(m_flops["cur_total_flops"])
-    #         curr_prunable_flops.append(m_flops["cur_prunable_flops"])
-    #     if self.mid_block:
-    #         m_flops = self.mid_block.calc_flops()
-    #         curr_total_flops.append(m_flops["cur_total_flops"])
-    #         curr_prunable_flops.append(m_flops["cur_prunable_flops"])
-    #     for m in self.up_blocks:
-    #         m_flops = m.calc_flops()
-    #         curr_total_flops.append(m_flops["cur_total_flops"])
-    #         curr_prunable_flops.append(m_flops["cur_prunable_flops"])
-
-    #     return {"prunable_flops": self.prunable_flops,
-    #             "total_flops": self.t_flops,
-    #             "cur_prunable_flops": curr_prunable_flops,
-    #             "cur_total_flops": curr_total_flops}
