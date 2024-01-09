@@ -464,8 +464,22 @@ class DiffPruningTrainer:
                         logger.info(sanity_string)
 
                 # gather the arch_vector_quantized across all processes to get large batch for contrastive loss
-                text_embeddings_list = self.accelerator.gather(text_embeddings)
-                arch_vector_quantized_list = self.accelerator.gather(arch_vector_quantized)
+                if self.accelerator.num_processes > 1:
+                    with torch.no_grad():
+                        text_embeddings_list = [torch.zeros_like(text_embeddings) for _ in
+                                                range(self.accelerator.num_processes)]
+                        arch_vector_quantized_list = [torch.zeros_like(arch_vector_quantized) for _ in
+                                                      range(self.accelerator.num_processes)]
+                        torch.distributed.all_gather(text_embeddings_list, text_embeddings)
+                        torch.distributed.all_gather(arch_vector_quantized_list, arch_vector_quantized)
+                    text_embeddings_list[self.accelerator.process_index] = text_embeddings
+                    arch_vector_quantized_list[self.accelerator.process_index] = arch_vector_quantized
+                    text_embeddings_list = torch.cat(text_embeddings_list, dim=0)
+                    arch_vector_quantized_list = torch.cat(arch_vector_quantized_list, dim=0)
+                else:
+                    text_embeddings_list = self.accelerator.gather(text_embeddings)
+                    arch_vector_quantized_list = self.accelerator.gather(arch_vector_quantized)
+
                 contrastive_loss, arch_vectors_similarity = self.clip_loss(text_embeddings_list,
                                                                            arch_vector_quantized_list,
                                                                            return_similarity=True)
@@ -544,9 +558,12 @@ class DiffPruningTrainer:
                     self.accelerator.log({"train_loss": train_loss})
                     train_loss = 0.0
                     self.accelerator.log({"resource_ratio": resource_ratio})
-                    self.accelerator.log({"resource_loss": resource_loss})
-                    self.accelerator.log({"commitment_loss": q_loss})
-                    self.accelerator.log({"contrastive_loss": contrastive_loss})
+                    self.accelerator.log({"resource_loss": self.accelerator.gather(resource_loss.repeat(
+                        self.config.data.dataloader.train_batch_size)).mean()})
+                    self.accelerator.log({"commitment_loss": self.accelerator.gather(q_loss.repeat(
+                        self.config.data.dataloader.train_batch_size)).mean()})
+                    self.accelerator.log({"contrastive_loss": self.accelerator.gather(contrastive_loss.repeat(
+                        self.config.data.dataloader.train_batch_size)).mean()})
                     self.accelerator.log({"lr": self.lr_scheduler.get_last_lr()[0]})
                     for k, v in flops_dict.items():
                         if isinstance(v, torch.Tensor):
@@ -575,43 +592,36 @@ class DiffPruningTrainer:
                                        os.path.join(logging_dir, f"arch_vector_quantized.pt"))
 
                 logs = {"step_loss": loss.detach().item(), "lr": self.lr_scheduler.get_last_lr()[0],
-                        "q_loss": q_loss.detach().item(), "contrastive_loss": contrastive_loss.detach().item(),
-                        "resource_loss": resource_loss.detach().item()}
+                        "q_loss": q_loss.detach().item(), "c_loss": contrastive_loss.detach().item(),
+                        "r_loss": resource_loss.detach().item()}
                 progress_bar.set_postfix(**logs)
-
-                if global_step >= self.config.training.max_train_steps:
-                    break
 
                 if global_step % self.config.training.validation_steps == 0:
                     if self.eval_dataset is not None:
                         self.validate()
 
-        if global_step % self.config.training.image_logging_steps == 0:
+                if (global_step % self.config.training.image_logging_steps == 0 or
+                        (epoch == self.config.training.num_train_epochs - 1 and step == len(self.train_dataloader) - 1)):
 
-            if self.accelerator.is_main_process:
+                    if self.accelerator.is_main_process:
+                        if self.config.use_ema:
+                            # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                            self.ema_unet.store(self.unet.parameters())
+                            self.ema_unet.copy_to(self.unet.parameters())
 
-                # generate some validation images
-                if self.config.data.prompts is not None and (epoch % self.config.training.validation_epochs == 0 or
-                                                             epoch == self.config.training.num_train_epochs - 1):
-                    if self.config.use_ema:
-                        # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                        self.ema_unet.store(self.unet.parameters())
-                        self.ema_unet.copy_to(self.unet.parameters())
-                    val_images = self.generate_samples_from_prompts(epoch)
-                    if self.config.use_ema:
-                        # Switch back to the original UNet parameters.
-                        self.ema_unet.restore(self.unet.parameters())
+                        # generate some validation images
+                        if self.config.data.prompts is not None:
+                            val_images = self.generate_samples_from_prompts(global_step)
 
-                # log quantizer embeddings samples
-                if epoch % self.config.training.validation_epochs == 0 or epoch == self.config.training.num_train_epochs - 1:
-                    if self.config.use_ema:
-                        # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                        self.ema_unet.store(self.unet.parameters())
-                        self.ema_unet.copy_to(self.unet.parameters())
-                    self.log_quantizer_embedding_samples(epoch)
-                    if self.config.use_ema:
-                        # Switch back to the original UNet parameters.
-                        self.ema_unet.restore(self.unet.parameters())
+                        # visualize the quantizer embeddings
+                        self.log_quantizer_embedding_samples(global_step)
+
+                        if self.config.use_ema:
+                            # Switch back to the original UNet parameters.
+                            self.ema_unet.restore(self.unet.parameters())
+
+                if global_step >= self.config.training.max_train_steps:
+                    break
 
         # Create the pipeline using the trained modules and save it.
         self.accelerator.wait_for_everyone()
@@ -684,11 +694,27 @@ class DiffPruningTrainer:
 
                 arch_vector = self.hyper_net(encoder_hidden_states)
                 arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
+
                 # gather the arch_vector_quantized across all processes to get large batch for contrastive loss
-                text_embeddings_list = self.accelerator.gather(text_embeddings)
-                arch_vector_quantized_list = self.accelerator.gather(arch_vector_quantized)
-                contrastive_loss = self.clip_loss(text_embeddings_list,
-                                                  arch_vector_quantized_list)
+                if self.accelerator.num_processes > 1:
+                    with torch.no_grad():
+                        text_embeddings_list = [torch.zeros_like(text_embeddings) for _ in
+                                                range(self.accelerator.num_processes)]
+                        arch_vector_quantized_list = [torch.zeros_like(arch_vector_quantized) for _ in
+                                                      range(self.accelerator.num_processes)]
+                        torch.distributed.all_gather(text_embeddings_list, text_embeddings)
+                        torch.distributed.all_gather(arch_vector_quantized_list, arch_vector_quantized)
+                    text_embeddings_list[self.accelerator.process_index] = text_embeddings
+                    arch_vector_quantized_list[self.accelerator.process_index] = arch_vector_quantized
+                    text_embeddings_list = torch.cat(text_embeddings_list, dim=0)
+                    arch_vector_quantized_list = torch.cat(arch_vector_quantized_list, dim=0)
+                else:
+                    text_embeddings_list = self.accelerator.gather(text_embeddings)
+                    arch_vector_quantized_list = self.accelerator.gather(arch_vector_quantized)
+
+                contrastive_loss, arch_vectors_similarity = self.clip_loss(text_embeddings_list,
+                                                                           arch_vector_quantized_list,
+                                                                           return_similarity=True)
 
                 arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
                 self.unet.set_structure(arch_vectors_separated)
@@ -745,9 +771,17 @@ class DiffPruningTrainer:
                     loss.repeat(self.config.data.dataloader.validation_batch_size)).mean()
                 val_loss = avg_loss.item() / len(self.eval_dataloader)
                 progress_bar.update(1)
-                step += 1
             self.accelerator.log({"val_loss": val_loss})
-            logs = {"val_step_loss": loss.detach().item()}
+            self.accelerator.log({"val resource_loss": self.accelerator.gather(resource_loss.repeat(
+                self.config.data.dataloader.validation_batch_size)).mean()})
+            self.accelerator.log({"val commitment_loss": self.accelerator.gather(q_loss.repeat(
+                self.config.data.dataloader.validation_batch_size)).mean()})
+            self.accelerator.log({"val contrastive_loss": self.accelerator.gather(contrastive_loss.repeat(
+                self.config.data.dataloader.validation_batch_size)).mean()})
+
+            logs = {"val step_loss": loss.detach().item(),
+                    "val q_loss": q_loss.detach().item(), "val c_loss": contrastive_loss.detach().item(),
+                    "val r_loss": resource_loss.detach().item()}
             progress_bar.set_postfix(**logs)
 
     def create_repo(self):
@@ -886,7 +920,7 @@ class DiffPruningTrainer:
         )
 
         pipeline = pipeline.to(self.accelerator.device)
-        pipeline.set_progress_bar_config()
+        pipeline.set_progress_bar_config(disable=True)
 
         if self.config.enable_xformers_memory_efficient_attention:
             pipeline.enable_xformers_memory_efficient_attention()
@@ -978,7 +1012,7 @@ class DiffPruningTrainer:
         pipeline = self.get_pipeline()
 
         image_output_dir = os.path.join(self.config.training.logging.logging_dir, "prompt_images",
-                                        f"epoch_{step}")
+                                        f"step_{step}")
         os.makedirs(image_output_dir, exist_ok=True)
         images = []
         for step in range(0, len(self.config.data.prompts),
@@ -1002,6 +1036,10 @@ class DiffPruningTrainer:
                         except Exception as e:
                             logger.error(f"Error saving image {batch[i]}: {e}")
 
+        # make a grid of images
+        image_grid = make_image_grid(images, len(images) // 4, 4)
+        image_grid.save(os.path.join(image_output_dir, "prompt_images_grid.png"))
+
         for tracker in self.accelerator.trackers:
             if tracker.name == "tensorboard":
                 np_images = np.stack([np.asarray(img) for img in images])
@@ -1012,7 +1050,8 @@ class DiffPruningTrainer:
                         "validation": [
                             wandb.Image(image, caption=f"{i}: {self.config.data.prompts[i]}")
                             for i, image in enumerate(images)
-                        ]
+                        ],
+                        "validation_grid": wandb.Image(image_grid)
                     }
                 )
             else:
@@ -1028,7 +1067,7 @@ class DiffPruningTrainer:
 
         pipeline = self.get_pipeline()
         image_output_dir = os.path.join(self.config.training.logging.logging_dir, "quantizer_embedding_images",
-                                        f"epoch_{epoch}")
+                                        f"step_{epoch}")
         os.makedirs(image_output_dir, exist_ok=True)
 
         images = []
@@ -1066,6 +1105,10 @@ class DiffPruningTrainer:
         torch.save(quantizer_embedding_gumbel_sigmoid, os.path.join(image_output_dir,
                                                                     "quantizer_embeddings_gumbel_sigmoid.pt"))
 
+        # make a grid of images
+        image_grid = make_image_grid(images, len(images) // 4, 4)
+        image_grid.save(os.path.join(image_output_dir, "quantizer_embedding_images_grid.png"))
+
         for tracker in self.accelerator.trackers:
             if tracker.name == "tensorboard":
                 np_images = np.stack([np.asarray(img) for img in images])
@@ -1076,7 +1119,8 @@ class DiffPruningTrainer:
                         "quantizer embedding images": [
                             wandb.Image(image, caption=f"Code: {i}")
                             for i, image in enumerate(images)
-                        ]
+                        ],
+                        "quantizer embedding images grid": wandb.Image(image_grid)
                     }
                 )
             else:
