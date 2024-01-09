@@ -8,10 +8,9 @@ from __future__ import absolute_import
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils.parametrizations import weight_norm
 from diffusers import ModelMixin, ConfigMixin
 from diffusers.configuration_utils import register_to_config
-
-from torch.nn.utils.parametrizations import weight_norm
 
 
 class SimpleGate(nn.Module):
@@ -34,7 +33,6 @@ class HyperStructure(ModelMixin, ConfigMixin):
         self.width_list = [w for sub_width_list in self.structure['width'] for w in sub_width_list]
         self.depth_list = [d for sub_depth_list in self.structure['depth'] for d in sub_depth_list]
 
-        # gru_hidden_dim = 2 * self.input_dim
         gru_hidden_dim = inner_dim
 
         self.Bi_GRU = nn.GRU(self.input_dim, gru_hidden_dim, bidirectional=True)
@@ -70,7 +68,6 @@ class HyperStructure(ModelMixin, ConfigMixin):
             x = x.cuda()
             self.h0 = self.h0.cuda()
         outputs, hn = self.Bi_GRU(x, self.h0)
-        # outputs = outputs.sum(dim=1).unsqueeze(1).expand(outputs.size(0), len(self.mh_fc), outputs.size(2))
         outputs = outputs.mean(dim=1).unsqueeze(1).expand(outputs.size(0), len(self.mh_fc), outputs.size(2))
         outputs = [F.relu(self.bn1(outputs[:, i, :])) for i in range(len(self.mh_fc))]
         outputs = [self.mh_fc[i](outputs[i]) for i in range(len(self.mh_fc))]

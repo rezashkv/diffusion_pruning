@@ -17,11 +17,11 @@ def vector_gumbel_softmax(logits, temperature, offset=0, force_width_non_zero=Fa
     if not force_width_non_zero:
         return y_out
     else:
-        if (hard_concrete(y_out).sum() > 0):
+        if (hard_concrete(y_out).sum(dim=1) > 0).all():
             return y_out
-        
         else:
-            return vector_gumbel_softmax(logits=logits, temperature=temperature, offset=offset, force_width_non_zero=force_width_non_zero)
+            return vector_gumbel_softmax(logits=logits, temperature=temperature, offset=offset,
+                                         force_width_non_zero=force_width_non_zero)
 
 
 def gumbel_softmax_sample(logits, temperature, offset=0, force_width_non_zero=False):
@@ -34,10 +34,7 @@ def gumbel_softmax_sample(logits, temperature, offset=0, force_width_non_zero=Fa
         return F.sigmoid(y / temperature)
 
     else:
-        y_out = torch.zeros_like(logits, device=logits.device)
-        for i in range(y_out.shape[0]):
-            y_out[i, :] = vector_gumbel_softmax(logits=logits[i, :], temperature=temperature, offset=offset, force_width_non_zero=True)
-        
+        y_out = vector_gumbel_softmax(logits=logits, temperature=temperature, offset=offset, force_width_non_zero=True)
         return y_out
 
 

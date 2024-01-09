@@ -9,21 +9,21 @@ Copyright (C) 2021 Sovrasov V. - All Rights Reserved
 '''
 
 import numpy as np
-import torch.nn as nn
 import torch
 
 from diffusers.models.attention_processor import SpatialNorm
 from diffusers.models.normalization import AdaGroupNorm
 # from diffusers.models.activations import GEGLU
-from diffusers.models.resnet import Upsample2D
 from diffusers.models.lora import (LoRACompatibleConv, LoRACompatibleLinear)
 from pdm.models.diffusion.blocks import GatedAttention
+import sys
+from functools import partial
+import torch.nn as nn
 
 
 @torch.no_grad()
 def count_ops_and_params(model, example_inputs):
     global CUSTOM_MODULES_MAPPING
-    # model = copy.deepcopy(model)
     flops_model = add_flops_counting_methods(model)
     flops_model.eval()
     flops_model.start_flops_count(ost=sys.stdout, verbose=False,
@@ -106,7 +106,7 @@ def conv_flops_counter_hook(conv_module, input, output):
 
     filters_per_channel = out_channels // groups
     conv_per_position_flops = int(np.prod(kernel_dims)) * \
-        in_channels * filters_per_channel
+                              in_channels * filters_per_channel
 
     active_elements_count = batch_size * int(np.prod(output_dims))
 
@@ -115,7 +115,6 @@ def conv_flops_counter_hook(conv_module, input, output):
     bias_flops = 0
 
     if conv_module.bias is not None:
-
         bias_flops = out_channels * active_elements_count
 
     overall_flops = overall_conv_flops + bias_flops
@@ -125,9 +124,9 @@ def conv_flops_counter_hook(conv_module, input, output):
 
 def rnn_flops(flops, rnn_module, w_ih, w_hh, input_size):
     # matrix matrix mult ih state and internal state
-    flops += w_ih.shape[0]*w_ih.shape[1]
+    flops += w_ih.shape[0] * w_ih.shape[1]
     # matrix matrix mult hh state and internal state
-    flops += w_hh.shape[0]*w_hh.shape[1]
+    flops += w_hh.shape[0] * w_hh.shape[1]
     if isinstance(rnn_module, (nn.RNN, nn.RNNCell)):
         # add both operations
         flops += rnn_module.hidden_size
@@ -135,12 +134,12 @@ def rnn_flops(flops, rnn_module, w_ih, w_hh, input_size):
         # hadamard of r
         flops += rnn_module.hidden_size
         # adding operations from both states
-        flops += rnn_module.hidden_size*3
+        flops += rnn_module.hidden_size * 3
         # last two hadamard product and add
-        flops += rnn_module.hidden_size*3
+        flops += rnn_module.hidden_size * 3
     elif isinstance(rnn_module, (nn.LSTM, nn.LSTMCell)):
         # adding operations from both states
-        flops += rnn_module.hidden_size*4
+        flops += rnn_module.hidden_size * 4
         # two hadamard product and add for C state
         flops += rnn_module.hidden_size + rnn_module.hidden_size + rnn_module.hidden_size
         # final hadamard
@@ -236,9 +235,9 @@ def multihead_attention_counter_hook(multihead_attention_module, input, output):
 
     # Initial projections
     flops += (
-        (qlen * qdim * qdim)  # QW
-        + (klen * kdim * kdim)  # KW
-        + (vlen * vdim * vdim)  # VW
+            (qlen * qdim * qdim)  # QW
+            + (klen * kdim * kdim)  # KW
+            + (vlen * vdim * vdim)  # VW
     )
 
     if multihead_attention_module.in_proj_bias is not None:
@@ -249,9 +248,9 @@ def multihead_attention_counter_hook(multihead_attention_module, input, output):
     v_head_dim = vdim // num_heads
 
     head_flops = (
-        (qlen * klen * qk_head_dim)  # QK^T
-        + (qlen * klen)  # softmax
-        + (qlen * klen * v_head_dim)  # AV
+            (qlen * klen * qk_head_dim)  # QK^T
+            + (qlen * klen)  # softmax
+            + (qlen * klen * v_head_dim)  # AV
     )
 
     flops += num_heads * head_flops
@@ -263,22 +262,52 @@ def multihead_attention_counter_hook(multihead_attention_module, input, output):
     multihead_attention_module.__flops__ += int(flops)
 
 
-def gated_qkv_attention_counter_hook(qkv_attention_module, input, output):
-    attn_flops = 0
-    batch_size, seq_len, dim = output.shape
-    num_heads, head_dim = qkv_attention_module.heads, dim // qkv_attention_module.heads
+def gated_attention_counter_hook(gated_attention_module, input, output):
+    if gated_attention_module.total_flops == 0.:
+        # SpatialNorm
+        if gated_attention_module.spatial_norm is not None:
+            gated_attention_module.total_flops += gated_attention_module.spatial_norm.__flops__
 
-    head_flops = (
-            (seq_len * seq_len * head_dim)  # QK^T
-            + (seq_len * seq_len)  # softmax
-            + (seq_len * seq_len * head_dim)  # AV
-    )
+        # GroupNorm
+        if gated_attention_module.group_norm is not None:
+            gated_attention_module.total_flops += gated_attention_module.group_norm.__flops__
 
-    attn_flops += num_heads * head_flops
+        # NormCross
+        if gated_attention_module.norm_cross:
+            gated_attention_module.total_flops += gated_attention_module.norm_cross.__flops__
 
-    attn_flops *= batch_size
+        # to_q
+        gated_attention_module.total_flops += gated_attention_module.to_q.__flops__
+        gated_attention_module.prunable_flops += gated_attention_module.to_q.__flops__
 
-    qkv_attention_module.__flops__ += attn_flops
+        # to_k
+        gated_attention_module.total_flops += gated_attention_module.to_k.__flops__
+        gated_attention_module.prunable_flops += gated_attention_module.to_k.__flops__
+
+        # to_v
+        gated_attention_module.total_flops += gated_attention_module.to_v.__flops__
+        gated_attention_module.prunable_flops += gated_attention_module.to_v.__flops__
+
+        attn_flops = 0
+        batch_size, seq_len, dim = output.shape
+        num_heads, head_dim = gated_attention_module.heads, dim // gated_attention_module.heads
+
+        head_flops = (
+                (seq_len * seq_len * head_dim)  # QK^T
+                + (seq_len * seq_len)  # softmax
+                + (seq_len * seq_len * head_dim)  # AV
+        )
+
+        attn_flops += num_heads * head_flops
+
+        gated_attention_module.total_flops += attn_flops
+        gated_attention_module.prunable_flops += attn_flops
+
+        # to_out
+        gated_attention_module.total_flops += gated_attention_module.to_out[0].__flops__
+        gated_attention_module.prunable_flops += gated_attention_module.to_out[0].__flops__
+
+    gated_attention_module.__flops__ = gated_attention_module.total_flops
 
 
 CUSTOM_MODULES_MAPPING = {}
@@ -331,7 +360,6 @@ MODULES_MAPPING = {
 
     # Upscale
     nn.Upsample: upsample_flops_counter_hook,
-    # Upsample2D: upsample_flops_counter_hook,
 
     # Deconvolution
     nn.ConvTranspose1d: conv_flops_counter_hook,
@@ -347,17 +375,12 @@ MODULES_MAPPING = {
     nn.GRUCell: rnn_cell_flops_counter_hook,
     nn.MultiheadAttention: multihead_attention_counter_hook,
 
-    GatedAttention: GatedAttention.calc_flops_hook,
+    GatedAttention: gated_attention_counter_hook,
 }
 
 if hasattr(nn, 'GELU'):
     MODULES_MAPPING[nn.GELU] = relu_flops_counter_hook
 
-
-import sys
-from functools import partial
-import torch.nn as nn
-import copy
 
 def accumulate_flops(self):
     if is_supported_instance(self):
@@ -382,7 +405,7 @@ def add_flops_counting_methods(net_main_module):
     net_main_module.stop_flops_count = stop_flops_count.__get__(net_main_module)
     net_main_module.reset_flops_count = reset_flops_count.__get__(net_main_module)
     net_main_module.compute_average_flops_cost = compute_average_flops_cost.__get__(
-                                                    net_main_module)
+        net_main_module)
 
     net_main_module.reset_flops_count()
 
@@ -430,14 +453,14 @@ def start_flops_count(self, **kwargs):
                 return
             if type(module) in CUSTOM_MODULES_MAPPING:
                 handle = module.register_forward_hook(
-                                        CUSTOM_MODULES_MAPPING[type(module)])
+                    CUSTOM_MODULES_MAPPING[type(module)])
             else:
                 handle = module.register_forward_hook(MODULES_MAPPING[type(module)])
             module.__flops_handle__ = handle
             seen_types.add(type(module))
         else:
             if verbose and not type(module) in (nn.Sequential, nn.ModuleList) and \
-               not type(module) in seen_types:
+                    not type(module) in seen_types:
                 print('Warning: module ' + type(module).__name__ +
                       ' is treated as a zero-op.', file=ost)
             seen_types.add(type(module))
@@ -482,7 +505,6 @@ def batch_counter_hook(module, input, output):
 
 
 def add_batch_counter_variables_or_reset(module):
-
     module.__batch_counter__ = 0
 
 
@@ -503,9 +525,9 @@ def remove_batch_counter_hook_function(module):
 def add_flops_counter_variable_or_reset(module):
     if is_supported_instance(module):
         if hasattr(module, '__flops__') or hasattr(module, '__params__'):
-            print('Warning: variables __flops__ or __params__ are already '
-                  'defined for the module' + type(module).__name__ +
-                  ' ptflops can affect your code!')
+            # print('Warning: variables __flops__ or __params__ are already '
+            #       'defined for the module' + type(module).__name__ +
+            #       ' ptflops can affect your code!')
             module.__ptflops_backup_flops__ = module.__flops__
             module.__ptflops_backup_params__ = module.__params__
         module.__flops__ = 0

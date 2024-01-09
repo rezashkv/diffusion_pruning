@@ -37,7 +37,6 @@ from packaging import version
 from torchvision import transforms
 from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, AutoModel
 from transformers.utils import ContextManagers
-from pdm.utils.op_counter import (add_flops_counting_methods)
 
 from diffusers import AutoencoderKL, DDIMScheduler
 from pdm.models.diffusion import UNet2DConditionModelGated
@@ -140,9 +139,9 @@ def main():
         config.pretrained_model_name_or_path,
         subfolder="unet",
         revision=config.non_ema_revision,
-        down_block_types=config.model.unet.unet_down_blocks,
+        down_block_types=tuple(config.model.unet.unet_down_blocks),
         mid_block_type=config.model.unet.unet_mid_block,
-        up_block_types=config.model.unet.unet_up_blocks,
+        up_block_types=tuple(config.model.unet.unet_up_blocks),
         gated_ff=config.model.unet.gated_ff,
         ff_gate_width=config.model.unet.ff_gate_width,
 
@@ -159,7 +158,7 @@ def main():
                                          beta=config.model.quantizer.arch_vq_beta,
                                          temperature=config.model.quantizer.quantizer_T,
                                          base=config.model.quantizer.quantizer_base,
-                                         depth_order=config.model.quantizer.depth_order,
+                                         depth_order=list(config.model.quantizer.depth_order),
                                          non_zero_width=config.model.quantizer.non_zero_width)
 
     r_loss = ResourceLoss(p=config.training.losses.resource_loss.pruning_target,
@@ -214,10 +213,6 @@ def main():
     if config.training.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    # unet = add_flops_counting_methods(unet)
-    # unet.start_flops_count(ost=sys.stdout, verbose=False, ignore_list=[])
-
-    # ##################################################################################################################
     # #################################################### Datasets ####################################################
 
     logging.info("Loading datasets...")
@@ -328,8 +323,6 @@ def main():
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
-        for iii, ccc in enumerate(captions):
-            print(f"{iii}: {ccc}")
         inputs = tokenizer(
             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
@@ -358,8 +351,6 @@ def main():
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
-        for iii, ccc in enumerate(captions):
-            print(f"{iii}: {ccc}")
         encoded_input = mpnet_tokenizer(captions, padding=True, truncation=True, return_tensors="pt")
         # Compute token embeddings
         with torch.no_grad():
