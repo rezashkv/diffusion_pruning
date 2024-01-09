@@ -516,8 +516,7 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         depth_ratio = depth_hard_gate.sum(dim=1, keepdim=True) / depth_hard_gate.shape[1]
         return {"prunable_flops": self.prunable_flops,
                 "total_flops": self.total_flops,
-                "cur_prunable_flops": ((ratio * self.prunable_flops) + (
-                        self.total_flops - self.prunable_flops)) * depth_ratio,
+                "cur_prunable_flops": ((ratio * self.prunable_flops) + ( self.total_flops - self.prunable_flops)) * depth_ratio,
                 "cur_total_flops": ((ratio.detach()) * self.prunable_flops + (
                         self.total_flops - self.prunable_flops)) * (depth_ratio.detach())}
 

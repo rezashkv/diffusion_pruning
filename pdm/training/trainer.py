@@ -454,6 +454,7 @@ class DiffPruningTrainer:
                             "UNet's Params/MACs calculated by OpCounter:\tparams: {:.3f}M\t MACs: {:.3f}G".format(
                                 params / 1e6, flops / 1e9))
                         sanity_flops_dict = self.unet.calc_flops()
+                        self.unet.resource_info_dict = sanity_flops_dict
                         sanity_string = "Our MACs calculation:\t"
                         for k, v in sanity_flops_dict.items():
                             if isinstance(v, torch.Tensor):
