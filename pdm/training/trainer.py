@@ -639,6 +639,7 @@ class DiffPruningTrainer:
 
         self.accelerator.end_training()
 
+    @torch.no_grad()
     def validate(self):
         self.init_weight_dtype()
         # Move text_encode and vae to gpu and cast to weight_dtype
