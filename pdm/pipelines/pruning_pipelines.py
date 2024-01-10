@@ -742,7 +742,10 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
 
         structure_vector = self.hyper_net(prompt_embeds)
         structure_vector_quantized, _, _ = self.quantizer(structure_vector)
-        arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
+        if hasattr(self.hyper_net, "module"):
+            arch_vectors_separated = self.hyper_net.module.transform_structure_vector(structure_vector_quantized)
+        else:
+            arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
         self.unet.set_structure(arch_vectors_separated)
 
         # For classifier free guidance, we need to do two forward passes.
@@ -958,7 +961,10 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
 
         structure_vector = self.hyper_net(prompt_embeds)
         structure_vector_quantized, _, _ = self.quantizer(structure_vector)
-        arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
+        if hasattr(self.hyper_net, "module"):
+            arch_vectors_separated = self.hyper_net.module.transform_structure_vector(structure_vector_quantized)
+        else:
+            arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
         self.unet.set_structure(arch_vectors_separated)
 
         # For classifier free guidance, we need to do two forward passes.
@@ -1182,8 +1188,10 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
             structure_vector_quantized = self.quantizer.module.get_codebook_entry_gumbel_sigmoid(indices)
         else:
             structure_vector_quantized = self.quantizer.get_codebook_entry_gumbel_sigmoid(indices)
-
-        arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
+        if hasattr(self.hyper_net, "module"):
+            arch_vectors_separated = self.hyper_net.module.transform_structure_vector(structure_vector_quantized)
+        else:
+            arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
         self.unet.set_structure(arch_vectors_separated)
 
         # For classifier free guidance, we need to do two forward passes.
