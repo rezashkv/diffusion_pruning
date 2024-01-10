@@ -82,8 +82,8 @@ def main():
                 " use `--variant=non_ema` instead."
             ),
         )
-
-    now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    # get current date only
+    now = datetime.datetime.now().strftime("%Y-%m-%dT%H")
 
     if config.name != "":
         nowname = now + f"_{config.name}"

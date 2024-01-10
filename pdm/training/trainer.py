@@ -441,8 +441,12 @@ class DiffPruningTrainer:
                 # Calculating the MACs of each module of the model in the first iteration.
                 if global_step == 0:
                     with torch.no_grad():
-                        arch_vecs_separated = self.hyper_net.transform_structure_vector(
-                            torch.ones((1, self.quantizer.vq_embed_dim), device=arch_vector_quantized.device))
+                        if self.accelerator.num_processes > 1:
+                            arch_vecs_separated = self.hyper_net.module.transform_structure_vector(
+                                torch.ones((1, self.quantizer.module.vq_embed_dim), device=arch_vector_quantized.device))
+                        else:
+                            arch_vecs_separated = self.hyper_net.transform_structure_vector(
+                                torch.ones((1, self.quantizer.vq_embed_dim), device=arch_vector_quantized.device))
                         self.unet.set_structure(arch_vecs_separated)
                         flops, params = count_ops_and_params(self.unet,
                                                              {'sample': noisy_latents[0].unsqueeze(0),
@@ -476,15 +480,19 @@ class DiffPruningTrainer:
                     arch_vector_quantized_list[self.accelerator.process_index] = arch_vector_quantized
                     text_embeddings_list = torch.cat(text_embeddings_list, dim=0)
                     arch_vector_quantized_list = torch.cat(arch_vector_quantized_list, dim=0)
+
+                    arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
+
                 else:
                     text_embeddings_list = self.accelerator.gather(text_embeddings)
                     arch_vector_quantized_list = self.accelerator.gather(arch_vector_quantized)
+
+                    arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
 
                 contrastive_loss, arch_vectors_similarity = self.clip_loss(text_embeddings_list,
                                                                            arch_vector_quantized_list,
                                                                            return_similarity=True)
 
-                arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
                 self.unet.set_structure(arch_vectors_separated)
 
                 # Get the target for loss depending on the prediction type
@@ -710,15 +718,18 @@ class DiffPruningTrainer:
                     arch_vector_quantized_list[self.accelerator.process_index] = arch_vector_quantized
                     text_embeddings_list = torch.cat(text_embeddings_list, dim=0)
                     arch_vector_quantized_list = torch.cat(arch_vector_quantized_list, dim=0)
+
+                    arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
                 else:
                     text_embeddings_list = self.accelerator.gather(text_embeddings)
                     arch_vector_quantized_list = self.accelerator.gather(arch_vector_quantized)
+
+                    arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
 
                 contrastive_loss, arch_vectors_similarity = self.clip_loss(text_embeddings_list,
                                                                            arch_vector_quantized_list,
                                                                            return_similarity=True)
 
-                arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
                 self.unet.set_structure(arch_vectors_separated)
 
                 # Get the target for loss depending on the prediction type
@@ -760,8 +771,10 @@ class DiffPruningTrainer:
                 flops_dict = self.unet.calc_flops()
                 curr_flops = flops_dict['cur_prunable_flops'].mean()
 
+                # The reason is that sanity['prunable_flops'] does not have depth-related pruning flops
+                # like skip connections of resnets in it.
                 resource_ratio = (curr_flops / (self.unet.resource_info_dict[
-                                                    'cur_prunable_flops'].squeeze()))  # The reason is that sanity['prunable_flops'] does not have depth-related pruning flops like skip connections of resnets in it.
+                                                    'cur_prunable_flops'].squeeze()))
                 resource_loss = self.resource_loss(resource_ratio)
 
                 loss += self.config.training.losses.resource_loss.weight * resource_loss
