@@ -39,17 +39,17 @@ from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, AutoModel
 from transformers.utils import ContextManagers
 
 from diffusers import AutoencoderKL, DDIMScheduler
-from pdm.models.diffusion import UNet2DConditionModelGated
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate
 from diffusers.utils.import_utils import is_xformers_available
+
+from pdm.models.diffusion import UNet2DConditionModelGated
 from pdm.models import HyperStructure
 from pdm.models import StructureVectorQuantizer
 from pdm.losses import ClipLoss, ResourceLoss
 from pdm.utils.arg_utils import parse_args
 from pdm.datasets.cc3m import load_cc3m_dataset
 from pdm.datasets.laion_aes import load_main_laion_dataset
-
 from pdm.training.trainer import DiffPruningTrainer
 
 
@@ -241,11 +241,11 @@ def main():
         dataset = load_dataset(
             dataset_name,
             dataset_config_name,
-            data_files=data_files,
             cache_dir=config.cache_dir,
-            data_dir=train_data_dir,
             ignore_verifications=True
         )
+
+
     else:
         if "aesthetics" in data_dir:
             if data_files is None:
@@ -324,8 +324,6 @@ def main():
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
 
-        # for iii, ccc in enumerate(captions):
-        #     print(f"{iii}: {ccc}")
         inputs = tokenizer(
             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
@@ -354,8 +352,6 @@ def main():
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
-        # for iii, ccc in enumerate(captions):
-        #     print(f"{iii}: {ccc}")
 
         encoded_input = mpnet_tokenizer(captions, padding=True, truncation=True, return_tensors="pt")
         # Compute token embeddings
@@ -394,12 +390,20 @@ def main():
         # check if image_column path exists:
         if isinstance(examples[image_column][0], str):
             if not os.path.exists(examples[image_column][0]):
-                examples[image_column] = [requests.get(image).content for image in examples[image_column]]
+                downloaded_images = []
+                for image in examples[image_column]:
+                    try:
+                        # download image and convert it to a PIL image
+                        downloaded_images.append(PIL.Image.open(requests.get(image, stream=True).raw))
+                    except:
+                        # remove the caption if the image is not found
+                        downloaded_images.append(None)
+                examples[image_column] = downloaded_images
             else:
                 examples[image_column] = [PIL.Image.open(image) for image in examples[image_column]]
 
-        images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [train_transforms(image) for image in images]
+        images = [image.convert("RGB") if image is not None else image for image in examples[image_column]]
+        examples["pixel_values"] = [train_transforms(image) if image is not None else image for image in images]
         examples["input_ids"] = tokenize_captions(examples)
         examples["mpnet_embeddings"] = get_mpnet_embeddings(examples, is_train=True)
         return examples
@@ -409,17 +413,26 @@ def main():
         # check if image_column path exists:
         if isinstance(examples[image_column][0], str):
             if not os.path.exists(examples[image_column][0]):
-                examples[image_column] = [requests.get(image).content for image in examples[image_column]]
+                downloaded_images = []
+                for image in examples[image_column]:
+                    try:
+                        # download image and convert it to a PIL image
+                        downloaded_images.append(PIL.Image.open(requests.get(image, stream=True).raw))
+                    except:
+                        # remove the caption if the image is not found
+                        downloaded_images.append(None)
+                examples[image_column] = downloaded_images
             else:
                 examples[image_column] = [PIL.Image.open(image) for image in examples[image_column]]
 
-        images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [validation_transforms(image) for image in images]
+        images = [image.convert("RGB") if image is not None else image for image in examples[image_column]]
+        examples["pixel_values"] = [validation_transforms(image) if image is not None else image for image in images]
         examples["input_ids"] = tokenize_captions(examples, is_train=False)
         examples["mpnet_embeddings"] = get_mpnet_embeddings(examples, is_train=False)
         return examples
 
     def collate_fn(examples):
+        examples = [example for example in examples if example["pixel_values"] is not None]
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
         input_ids = torch.stack([example["input_ids"] for example in examples])
@@ -429,6 +442,10 @@ def main():
 
     if config.data.prompts is None:
         config.data.prompts = dataset["validation"][caption_column][:config.data.max_generated_samples]
+
+    del args, data_dir, data_files, dataset_config_name, dataset_name, dataset_columns, \
+        train_data_dir, train_data_file, train_bad_images_path, max_train_samples, validation_data_dir, \
+        validation_data_file, validation_bad_images_path, max_validation_samples
 
     trainer = DiffPruningTrainer(config=config,
                                  hyper_net=hyper_net,

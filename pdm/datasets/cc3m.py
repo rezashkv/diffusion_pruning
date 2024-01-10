@@ -16,7 +16,7 @@ def load_cc3m_dataset(data_dir,  split="train", split_file="Train_GCC-training.t
                            sep="\t", header=None, names=["caption", "link"],
                            dtype={"caption": str, "link": str})
     # get parent of getcwd() to get to projects/diffusion_pruning/pdm
-    names_file = os.path.join(os.getcwd(), "data", f"{split}_cc3m_names.pkl")
+    names_file = os.path.join(os.getcwd(), "..", "data", f"{split}_cc3m_names.pkl")
     if os.path.isfile(names_file):
         with open(names_file, 'rb') as file:
             images = pickle.load(file)
@@ -31,7 +31,7 @@ def load_cc3m_dataset(data_dir,  split="train", split_file="Train_GCC-training.t
 
     images = [os.path.join(data_dir, split_dir, image) for image in images]
     if bad_images_path is None:
-        bad_images_path = os.path.join(os.getcwd(), "data", f"{split}_cc3m_bad_images.txt")
+        bad_images_path = os.path.join(os.getcwd(), "..", "data", f"{split}_cc3m_bad_images.txt")
     if os.path.exists(bad_images_path):
         with open(os.path.join(bad_images_path), "r") as f:
             bad_images = f.readlines()
