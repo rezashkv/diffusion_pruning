@@ -536,7 +536,7 @@ class DiffPruningTrainer:
                 if global_step == 0:
                     p = self.config.training.losses.resource_loss.pruning_target
                     p_actual = (1 - (1 - p) * self.unet.resource_info_dict['total_flops'] /
-                                self.unet.resource_info_dict['cur_prunable_flops'])
+                                self.unet.resource_info_dict['cur_prunable_flops']).item()
                     self.resource_loss.p = p_actual
 
                 curr_flops = flops_dict['cur_prunable_flops'].mean()
