@@ -17,11 +17,14 @@ def vector_gumbel_softmax(logits, temperature, offset=0, force_width_non_zero=Fa
     if not force_width_non_zero:
         return y_out
     else:
-        if (hard_concrete(y_out).sum(dim=1) > 0).all():
+        y_out_h = hard_concrete(y_out).sum(dim=1)
+        if (y_out_h > 0).all():
             return y_out
         else:
-            return vector_gumbel_softmax(logits=logits, temperature=temperature, offset=offset,
-                                         force_width_non_zero=force_width_non_zero)
+            y_out_h = hard_concrete(y_out).sum(dim=1)
+            ind = (y_out_h == 0)
+            y_out[ind, 0] += 0.99
+            return y_out
 
 
 def gumbel_softmax_sample(logits, temperature, offset=0, force_width_non_zero=False):
