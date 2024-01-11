@@ -612,28 +612,18 @@ class DiffPruningTrainer:
                         (epoch == self.config.training.num_train_epochs - 1 and step == len(
                             self.train_dataloader) - 1)):
 
-                    if self.accelerator.is_main_process:
-                        if self.config.use_ema:
-                            # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                            self.ema_unet.store(self.unet.parameters())
-                            self.ema_unet.copy_to(self.unet.parameters())
-
-                        # generate some validation images
-                        if self.config.data.prompts is not None:
-                            val_images = self.generate_samples_from_prompts(global_step)
-
-                        # visualize the quantizer embeddings
-                        self.log_quantizer_embedding_samples(global_step)
-
-                        if self.config.use_ema:
-                            # Switch back to the original UNet parameters.
-                            self.ema_unet.restore(self.unet.parameters())
+                    # generate some validation images
+                    if self.config.data.prompts is not None:
+                        val_images = self.generate_samples_from_prompts(global_step)
 
                 if global_step >= self.config.training.max_train_steps:
                     break
 
             # checkpoint at the end of each epoch
             if self.accelerator.is_main_process:
+                # visualize the quantizer embeddings
+                self.log_quantizer_embedding_samples(global_step)
+
                 self.save_checkpoint(logging_dir, global_step)
                 # save architecture vector quantized
                 torch.save(arch_vector_quantized_list,
@@ -947,7 +937,7 @@ class DiffPruningTrainer:
         )
 
         pipeline = pipeline.to(self.accelerator.device)
-        pipeline.set_progress_bar_config(disable=True)
+        pipeline.set_progress_bar_config(disable=False)
 
         if self.config.enable_xformers_memory_efficient_attention:
             pipeline.enable_xformers_memory_efficient_attention()
@@ -1054,20 +1044,15 @@ class DiffPruningTrainer:
                         generator = None
                     else:
                         generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
-
                     gen_images = pipeline(batch, num_inference_steps=self.config.training.num_inference_steps,
-                                          generator=generator).images
-                    gen_images = self.accelerator.gather(gen_images)
+                                          generator=generator, output_type="pt").images
+                    gen_images = self.accelerator.gather_for_metrics(gen_images)
                     images += gen_images
-                    for i, image in enumerate(gen_images):
-                        try:
-                            image.save(os.path.join(image_output_dir, f"{batch[i]}.png"))
-                        except Exception as e:
-                            logger.error(f"Error saving image {batch[i]}: {e}")
 
-        # make a grid of images
-        image_grid = make_image_grid(images, len(images) // 4, 4)
-        image_grid.save(os.path.join(image_output_dir, "prompt_images_grid.png"))
+        images = [torchvision.transforms.ToPILImage()(img) for img in images]
+        images = make_image_grid(images, len(images) // 4, 4)
+        if self.accelerator.is_main_process:
+            images.save(os.path.join(image_output_dir, "prompt_images.png"))
 
         for tracker in self.accelerator.trackers:
             if tracker.name == "tensorboard":
@@ -1076,11 +1061,7 @@ class DiffPruningTrainer:
             elif tracker.name == "wandb":
                 tracker.log(
                     {
-                        "validation": [
-                            wandb.Image(image, caption=f"{i}: {self.config.data.prompts[i]}")
-                            for i, image in enumerate(images)
-                        ],
-                        "validation_grid": wandb.Image(image_grid)
+                        "validation": wandb.Image(images)
                     }
                 )
             else:
@@ -1107,37 +1088,30 @@ class DiffPruningTrainer:
         else:
             n_e = pipeline.quantizer.n_e
         quantizer_embedding_gumbel_sigmoid = []
-        for step in range(0, n_e, self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes):
+        for step in range(0, n_e, self.config.data.dataloader.validation_batch_size):
             indices = torch.arange(step,
-                                   step + self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes,
+                                   step + self.config.data.dataloader.validation_batch_size,
                                    device=self.accelerator.device)
             with torch.autocast("cuda"):
-                with self.accelerator.split_between_processes(indices) as indices:
-                    if self.config.seed is None:
-                        generator = None
-                    else:
-                        generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
+                if self.config.seed is None:
+                    generator = None
+                else:
+                    generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
 
-                    gen_images, quantizer_embed_gs = pipeline.quantizer_samples(indices=indices,
-                                                                                num_inference_steps=self.config.training.num_inference_steps,
-                                                                                generator=generator)
-                    gen_images = gen_images.images.detach()
-                    gen_images = self.accelerator.gather(gen_images).detach().cpu()
-                    quantizer_embed_gs = self.accelerator.gather(quantizer_embed_gs).detach().cpu()
-                    quantizer_embedding_gumbel_sigmoid.append(quantizer_embed_gs)
-                    images += gen_images
-                    for i, image in enumerate(gen_images):
-                        try:
-                            image.save(os.path.join(image_output_dir, f"code-{step + i}.png"))
-                        except Exception as e:
-                            logger.error(f"Error saving image from code {step + i}: {e}")
+                gen_images, quantizer_embed_gs = pipeline.quantizer_samples(indices=indices,
+                                                                            num_inference_steps=self.config.training.num_inference_steps,
+                                                                            generator=generator, output_type="pt")
+                gen_images = gen_images.images
+                quantizer_embedding_gumbel_sigmoid.append(quantizer_embed_gs)
+                images += gen_images
+
         quantizer_embedding_gumbel_sigmoid = torch.cat(quantizer_embedding_gumbel_sigmoid, dim=0)
         torch.save(quantizer_embedding_gumbel_sigmoid, os.path.join(image_output_dir,
                                                                     "quantizer_embeddings_gumbel_sigmoid.pt"))
 
-        # make a grid of images
-        image_grid = make_image_grid(images, len(images) // 4, 4)
-        image_grid.save(os.path.join(image_output_dir, "quantizer_embedding_images_grid.png"))
+        images = [torchvision.transforms.ToPILImage()(img) for img in images]
+        images = make_image_grid(images, len(images) // 4, 4)
+        images.save(os.path.join(image_output_dir, "quantizer_embedding_images.png"))
 
         for tracker in self.accelerator.trackers:
             if tracker.name == "tensorboard":
@@ -1146,11 +1120,7 @@ class DiffPruningTrainer:
             elif tracker.name == "wandb":
                 tracker.log(
                     {
-                        "quantizer embedding images": [
-                            wandb.Image(image, caption=f"Code: {i}")
-                            for i, image in enumerate(images)
-                        ],
-                        "quantizer embedding images grid": wandb.Image(image_grid)
+                        "quantizer embedding images": wandb.Image(images)
                     }
                 )
             else:

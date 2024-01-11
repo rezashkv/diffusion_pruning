@@ -164,7 +164,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
     def get_codebook_entry_gumbel_sigmoid(self, indices: torch.LongTensor,
                                           shape: Tuple[int, ...] = None):
-        z_q = self.get_codebook_entry(indices, shape)
+        z_q = self.get_codebook_entry(indices, shape).contiguous()
         return self.gumbel_sigmoid_trick(z_q)
 
     def gumbel_sigmoid_trick(self, z_q: torch.FloatTensor):
