@@ -387,15 +387,15 @@ class DiffPruningTrainer:
         logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
         logger.info(f"  Gradient Accumulation steps = {self.config.training.gradient_accumulation_steps}")
         logger.info(f"  Total optimization steps = {self.config.training.max_train_steps}")
-        global_step = 0
-        initial_global_step, first_epoch = self.load_checkpoint()
 
+        initial_global_step, first_epoch = self.load_checkpoint()
+        global_step = initial_global_step
         progress_bar = tqdm(
             range(0, self.config.training.max_train_steps),
             initial=initial_global_step,
             desc="Steps",
             # Only show the progress bar once on each machine.
-            disable=not self.accelerator.is_local_main_process,
+            disable=not self.accelerator.is_main_process,
         )
 
         for epoch in range(first_epoch, self.config.training.num_train_epochs):
@@ -443,7 +443,8 @@ class DiffPruningTrainer:
                     with torch.no_grad():
                         if self.accelerator.num_processes > 1:
                             arch_vecs_separated = self.hyper_net.module.transform_structure_vector(
-                                torch.ones((1, self.quantizer.module.vq_embed_dim), device=arch_vector_quantized.device))
+                                torch.ones((1, self.quantizer.module.vq_embed_dim),
+                                           device=arch_vector_quantized.device))
                         else:
                             arch_vecs_separated = self.hyper_net.transform_structure_vector(
                                 torch.ones((1, self.quantizer.vq_embed_dim), device=arch_vector_quantized.device))
@@ -544,6 +545,7 @@ class DiffPruningTrainer:
                                                     'cur_prunable_flops'].squeeze()))  # The reason is that sanity['prunable_flops'] does not have depth-related pruning flops like skip connections of resnets in it.
                 resource_loss = self.resource_loss(resource_ratio)
 
+                diff_loss = loss.clone().detach().mean()
                 loss += self.config.training.losses.resource_loss.weight * resource_loss
                 loss += self.config.training.losses.quantization_loss.weight * q_loss
                 loss += self.config.training.losses.contrastive_clip_loss.weight * contrastive_loss
@@ -567,38 +569,35 @@ class DiffPruningTrainer:
                     self.accelerator.log({"train_loss": train_loss})
                     train_loss = 0.0
                     self.accelerator.log({"resource_ratio": resource_ratio})
-                    self.accelerator.log({"resource_loss": self.accelerator.gather(resource_loss.repeat(
+                    self.accelerator.log({"diffusion loss": self.accelerator.gather(diff_loss.detach().repeat(
                         self.config.data.dataloader.train_batch_size)).mean()})
-                    self.accelerator.log({"commitment_loss": self.accelerator.gather(q_loss.repeat(
+                    self.accelerator.log({"resource_loss": self.accelerator.gather(resource_loss.detach().repeat(
                         self.config.data.dataloader.train_batch_size)).mean()})
-                    self.accelerator.log({"contrastive_loss": self.accelerator.gather(contrastive_loss.repeat(
+                    self.accelerator.log({"commitment_loss": self.accelerator.gather(q_loss.detach().repeat(
                         self.config.data.dataloader.train_batch_size)).mean()})
+                    self.accelerator.log(
+                        {"contrastive_loss": self.accelerator.gather(contrastive_loss.detach().repeat(
+                            self.config.data.dataloader.train_batch_size)).mean()})
                     self.accelerator.log({"lr": self.lr_scheduler.get_last_lr()[0]})
                     for k, v in flops_dict.items():
                         if isinstance(v, torch.Tensor):
-                            self.accelerator.log({k: v.mean().item()})
+                            self.accelerator.log({k: v.detach().cpu().mean().item()})
                         else:
                             self.accelerator.log({k: v})
 
                     # log the pairwise cosine similarity of the embeddings of the quantizer:
                     if hasattr(self.quantizer, "module"):
-                        quantizer_embeddings = self.quantizer.module.embedding.weight.data.cpu().numpy()
+                        quantizer_embeddings = self.quantizer.module.embedding.weight.data.detach().cpu().numpy()
                     else:
-                        quantizer_embeddings = self.quantizer.embedding.weight.data.cpu().numpy()
+                        quantizer_embeddings = self.quantizer.embedding.weight.data.detach().cpu().numpy()
                     quantizer_embeddings = quantizer_embeddings / np.linalg.norm(quantizer_embeddings, axis=1,
                                                                                  keepdims=True)
                     quantizer_embeddings = quantizer_embeddings @ quantizer_embeddings.T
                     self.accelerator.log(
                         {"quantizer embeddings pairwise similarity": wandb.Image(quantizer_embeddings)})
 
-                    self.accelerator.log({"arch vector pairwise similarity": wandb.Image(arch_vectors_similarity)})
-
-                    if global_step % self.config.training.logging.checkpointing_steps == 0:
-                        if self.accelerator.is_main_process:
-                            self.save_checkpoint(logging_dir, global_step)
-                            # save architecture vector quantized
-                            torch.save(arch_vector_quantized_list,
-                                       os.path.join(logging_dir, f"arch_vector_quantized.pt"))
+                    self.accelerator.log({"arch vector pairwise similarity":
+                                              wandb.Image(arch_vectors_similarity)})
 
                 logs = {"step_loss": loss.detach().item(), "lr": self.lr_scheduler.get_last_lr()[0],
                         "q_loss": q_loss.detach().item(), "c_loss": contrastive_loss.detach().item(),
@@ -610,7 +609,8 @@ class DiffPruningTrainer:
                         self.validate()
 
                 if (global_step % self.config.training.image_logging_steps == 0 or
-                        (epoch == self.config.training.num_train_epochs - 1 and step == len(self.train_dataloader) - 1)):
+                        (epoch == self.config.training.num_train_epochs - 1 and step == len(
+                            self.train_dataloader) - 1)):
 
                     if self.accelerator.is_main_process:
                         if self.config.use_ema:
@@ -632,6 +632,12 @@ class DiffPruningTrainer:
                 if global_step >= self.config.training.max_train_steps:
                     break
 
+            # checkpoint at the end of each epoch
+            if self.accelerator.is_main_process:
+                self.save_checkpoint(logging_dir, global_step)
+                # save architecture vector quantized
+                torch.save(arch_vector_quantized_list,
+                           os.path.join(logging_dir, f"arch_vector_quantized.pt"))
         # Create the pipeline using the trained modules and save it.
         self.accelerator.wait_for_everyone()
 
@@ -651,8 +657,8 @@ class DiffPruningTrainer:
     def validate(self):
         self.init_weight_dtype()
         # Move text_encode and vae to gpu and cast to weight_dtype
-        self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
-        self.vae.to(self.accelerator.device, dtype=self.weight_dtype)
+        # self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
+        # self.vae.to(self.accelerator.device, dtype=self.weight_dtype)
         if len(self.accelerator.trackers) == 0:
             self.init_trackers()
 
@@ -661,7 +667,7 @@ class DiffPruningTrainer:
             initial=0,
             desc="Val Steps",
             # Only show the progress bar once on each machine.
-            disable=not self.accelerator.is_local_main_process,
+            disable=not self.accelerator.is_main_process,
         )
 
         self.hyper_net.eval()
@@ -777,6 +783,7 @@ class DiffPruningTrainer:
                                                     'cur_prunable_flops'].squeeze()))
                 resource_loss = self.resource_loss(resource_ratio)
 
+                diff_loss = loss.clone().detach().mean()
                 loss += self.config.training.losses.resource_loss.weight * resource_loss
                 loss += self.config.training.losses.quantization_loss.weight * q_loss
                 loss += self.config.training.losses.contrastive_clip_loss.weight * contrastive_loss
@@ -784,20 +791,25 @@ class DiffPruningTrainer:
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = self.accelerator.gather(
                     loss.repeat(self.config.data.dataloader.validation_batch_size)).mean()
-                val_loss = avg_loss.item() / len(self.eval_dataloader)
+                val_loss = avg_loss.item()
                 progress_bar.update(1)
+
             self.accelerator.log({"val_loss": val_loss})
-            self.accelerator.log({"val resource_loss": self.accelerator.gather(resource_loss.repeat(
+            self.accelerator.log({"diffusion loss": self.accelerator.gather(diff_loss.detach().repeat(
                 self.config.data.dataloader.validation_batch_size)).mean()})
-            self.accelerator.log({"val commitment_loss": self.accelerator.gather(q_loss.repeat(
+            self.accelerator.log({"val resource_loss": self.accelerator.gather(resource_loss.detach().repeat(
                 self.config.data.dataloader.validation_batch_size)).mean()})
-            self.accelerator.log({"val contrastive_loss": self.accelerator.gather(contrastive_loss.repeat(
+            self.accelerator.log({"val commitment_loss": self.accelerator.gather(q_loss.detach().repeat(
+                self.config.data.dataloader.validation_batch_size)).mean()})
+            self.accelerator.log({"val contrastive_loss": self.accelerator.gather(contrastive_loss.detach().repeat(
                 self.config.data.dataloader.validation_batch_size)).mean()})
 
             logs = {"val step_loss": loss.detach().item(),
                     "val q_loss": q_loss.detach().item(), "val c_loss": contrastive_loss.detach().item(),
                     "val r_loss": resource_loss.detach().item()}
             progress_bar.set_postfix(**logs)
+
+            torch.cuda.empty_cache()
 
     def create_repo(self):
         logging_dir = self.config.training.logging.logging_dir
@@ -941,6 +953,7 @@ class DiffPruningTrainer:
             pipeline.enable_xformers_memory_efficient_attention()
         return pipeline
 
+    @torch.no_grad()
     def depth_analysis(self):
         logger.info("Generating depth analysis samples from the given prompts... ")
         pipeline = self.get_pipeline()
@@ -960,7 +973,7 @@ class DiffPruningTrainer:
                 initial=0,
                 desc="Depth Analysis Steps",
                 # Only show the progress bar once on each machine.
-                disable=not self.accelerator.is_local_main_process,
+                disable=not self.accelerator.is_main_process,
             )
             for step in range(0, len(self.config.data.prompts),
                               self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes):
@@ -1022,6 +1035,7 @@ class DiffPruningTrainer:
         torch.cuda.empty_cache()
         return gen_images
 
+    @torch.no_grad()
     def generate_samples_from_prompts(self, step):
         logger.info("Generating samples from the given prompts... ")
         pipeline = self.get_pipeline()
@@ -1077,6 +1091,7 @@ class DiffPruningTrainer:
 
         return images
 
+    @torch.no_grad()
     def log_quantizer_embedding_samples(self, epoch):
         logger.info("Sampling from quantizer... ")
 
@@ -1106,9 +1121,9 @@ class DiffPruningTrainer:
                     gen_images, quantizer_embed_gs = pipeline.quantizer_samples(indices=indices,
                                                                                 num_inference_steps=self.config.training.num_inference_steps,
                                                                                 generator=generator)
-                    gen_images = gen_images.images
-                    gen_images = self.accelerator.gather(gen_images)
-                    quantizer_embed_gs = self.accelerator.gather(quantizer_embed_gs)
+                    gen_images = gen_images.images.detach()
+                    gen_images = self.accelerator.gather(gen_images).detach().cpu()
+                    quantizer_embed_gs = self.accelerator.gather(quantizer_embed_gs).detach().cpu()
                     quantizer_embedding_gumbel_sigmoid.append(quantizer_embed_gs)
                     images += gen_images
                     for i, image in enumerate(gen_images):
