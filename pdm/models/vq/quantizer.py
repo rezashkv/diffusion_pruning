@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from diffusers.configuration_utils import register_to_config, ConfigMixin
 from torch import nn
-from pdm.utils.estimation_utils import gumbel_softmax_sample, hard_concrete, importance_gumble_softmax_sample
+from pdm.utils.estimation_utils import gumbel_softmax_sample, hard_concrete, importance_gumbel_softmax_sample
 from diffusers import ModelMixin
 
 
@@ -29,7 +29,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
             beta: float = 0.25,
             remap=None,
             unknown_index: str = "random",
-            sane_index_shape: bool = False,
+            sane_index_shape: bool = True,
             temperature: float = 0.4,
             base: int = 2,
             depth_order: list = [],
@@ -172,7 +172,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         z_q_width = z_q[:, :num_width]
         z_q_depth = z_q[:, num_width:]
 
-        z_q_depth_b_ = importance_gumble_softmax_sample(z_q_depth, temperature=self.temperature, offset=self.base)
+        z_q_depth_b_ = importance_gumbel_softmax_sample(z_q_depth, temperature=self.temperature, offset=self.base)
         z_q_depth_b = torch.zeros_like(z_q_depth_b_, device=z_q_depth_b_.device)
         z_q_depth_b[:, self.depth_order] = z_q_depth_b_
 

@@ -23,7 +23,8 @@ def vector_gumbel_softmax(logits, temperature, offset=0, force_width_non_zero=Fa
         else:
             y_out_h = hard_concrete(y_out).sum(dim=1)
             ind = (y_out_h == 0)
-            y_out[ind, 0] += 0.99
+            new_y_out = y_out.clone()
+            new_y_out[ind, :] = y_out[ind, :] + 0.99
             return y_out
 
 
@@ -41,14 +42,14 @@ def gumbel_softmax_sample(logits, temperature, offset=0, force_width_non_zero=Fa
         return y_out
 
 
-def importance_gumble_softmax_sample(logits, temperature, offset=0):
+def importance_gumbel_softmax_sample(logits, temperature, offset=0):
     x = torch.softmax(logits, dim=1)
     x = torch.cumsum(x, dim=1)
     x = torch.flip(x, dims=[1])
 
     eps = 1e-6
     # inverse sigmoid function. add eps to avoid numerical instability.
-    x = torch.log(x - eps) - torch.log1p(-(x - eps))
+    x = torch.log(x + eps) - torch.log1p(-(x - eps))
 
     gumbel_sample = sample_gumbel(x.size())
     if logits.is_cuda:

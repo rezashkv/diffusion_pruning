@@ -635,6 +635,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
             callback_steps: int = 1,
             cross_attention_kwargs: Optional[Dict[str, Any]] = None,
             guidance_rescale: float = 0.0,
+            return_mapped_indices: bool = False
     ):
         r"""
         The call function to the pipeline for generation.
@@ -741,7 +742,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
         )
 
         structure_vector = self.hyper_net(prompt_embeds)
-        structure_vector_quantized, _, _ = self.quantizer(structure_vector)
+        structure_vector_quantized, _, (_, _, min_encoding_indices) = self.quantizer(structure_vector)
         if hasattr(self.hyper_net, "module"):
             arch_vectors_separated = self.hyper_net.module.transform_structure_vector(structure_vector_quantized)
         else:
@@ -827,9 +828,15 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return (image, has_nsfw_concept)
-
-        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+            if return_mapped_indices:
+                return image, has_nsfw_concept, min_encoding_indices
+            else:
+                return image, has_nsfw_concept
+        if return_mapped_indices:
+            return (StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept),
+                    min_encoding_indices)
+        else:
+            return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)

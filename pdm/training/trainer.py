@@ -32,6 +32,7 @@ from packaging import version
 import accelerate
 
 from pdm.utils.op_counter_orig import count_ops_and_params
+from pdm.utils.logging_utils import create_image_grid_from_indices
 
 logger = get_logger(__name__)
 
@@ -987,6 +988,7 @@ class DiffPruningTrainer:
                                         f"step_{global_step}")
         os.makedirs(image_output_dir, exist_ok=True)
         images = []
+        embedding_indices = []
         for step in range(0, len(self.config.data.prompts),
                           self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes):
             batch = self.config.data.prompts[
@@ -997,25 +999,31 @@ class DiffPruningTrainer:
                         generator = None
                     else:
                         generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
-                    gen_images = pipeline(batch, num_inference_steps=self.config.training.num_inference_steps,
-                                          generator=generator, output_type="pt").images
+                    gen_images, batch_embedding_indices = pipeline(batch,
+                                                                   num_inference_steps=self.config.training.num_inference_steps,
+                                                                   generator=generator, output_type="pt",
+                                                                   return_mapped_indices=True)
+                    gen_images = gen_images.images
                     gen_images = self.accelerator.gather_for_metrics(gen_images)
+                    batch_embedding_indices = self.accelerator.gather_for_metrics(batch_embedding_indices)
                     images += gen_images
+                    embedding_indices += batch_embedding_indices
 
+        min_encoding_indices_image = create_image_grid_from_indices([x.item() for x in embedding_indices],
+                                                                    grid_size=(4, len(images) // 4))
         images = [torchvision.transforms.ToPILImage()(img) for img in images]
         images = make_image_grid(images, len(images) // 4, 4)
+
         if self.accelerator.is_main_process:
             images.save(os.path.join(image_output_dir, "prompt_images.png"))
+            min_encoding_indices_image.save(os.path.join(image_output_dir, "min_encoding_indices.png"))
 
-        for tracker in self.accelerator.trackers:
-            if tracker.name == "wandb":
-                tracker.log(
-                    {
-                        "images/prompt_samples": wandb.Image(images)
-                    },
-                )
-            else:
-                logger.warn(f"image logging not implemented for {tracker.name}")
+        self.accelerator.log(
+            {
+                "images/prompt images": wandb.Image(images),
+                "images/min encoding indices": wandb.Image(min_encoding_indices_image)
+            },
+        )
 
         del pipeline
         torch.cuda.empty_cache()

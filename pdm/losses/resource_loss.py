@@ -14,6 +14,8 @@ class ResourceLoss(nn.Module):
             if resource_ratio > self.p:
                 resource_loss = torch.log(resource_ratio / self.p)
             else:
+                # TODO check if this is correct
+                resource_ratio = torch.clamp(resource_ratio, min=1e-6)
                 resource_loss = torch.log(self.p / resource_ratio)
         elif self.loss_type == "mae":
             resource_loss = torch.abs(resource_ratio - self.p)
