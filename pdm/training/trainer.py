@@ -615,7 +615,7 @@ class DiffPruningTrainer:
                 train_loss += avg_loss.item() / self.config.training.gradient_accumulation_steps
 
                 # Back-propagate
-                self.accelerator.backward(contrastive_loss)
+                self.accelerator.backward(loss)
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad()
