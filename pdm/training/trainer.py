@@ -316,6 +316,52 @@ class DiffPruningTrainer:
                                            init_kwargs={"wandb": {"name": self.config.wandb_run_name,
                                                                   "resume": resume}})
 
+    def init_prompts(self):
+        if os.path.isfile(self.config.data.prompts[0]):
+            with open(self.config.data.prompts[0], "r") as f:
+                self.config.data.prompts = [line.strip() for line in f.readlines()]
+        elif os.path.isdir(self.config.data.prompts[0]):
+            validation_prompts_dir = self.config.data.prompts[0]
+            prompts = []
+            for d in validation_prompts_dir:
+                files = [os.path.join(d, caption_file) for caption_file in os.listdir(d) if f.endswith(".txt")]
+                for f in files:
+                    with open(f, "r") as f:
+                        prompts.extend([line.strip() for line in f.readlines()])
+
+            self.config.data.prompts = prompts
+
+        if self.config.data.max_generated_samples is not None:
+            self.config.data.prompts = self.config.data.prompts[
+                                       :self.config.data.max_generated_samples]
+
+    def save_checkpoint(self, logging_dir, global_step):
+        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+        if self.config.training.logging.checkpoints_total_limit is not None:
+            checkpoints = os.listdir(logging_dir)
+            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+
+            # before we save the new checkpoint, we need to have at _most_
+            # `checkpoints_total_limit - 1` checkpoints
+            if len(checkpoints) >= self.config.training.logging.checkpoints_total_limit:
+                num_to_remove = len(
+                    checkpoints) - self.config.training.logging.checkpoints_total_limit + 1
+                removing_checkpoints = checkpoints[0:num_to_remove]
+
+                logger.info(
+                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                )
+                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+                for removing_checkpoint in removing_checkpoints:
+                    removing_checkpoint = os.path.join(logging_dir, removing_checkpoint)
+                    shutil.rmtree(removing_checkpoint)
+
+        save_path = os.path.join(logging_dir, f"checkpoint-{global_step}")
+        self.accelerator.save_state(save_path)
+        logger.info(f"Saved state to {save_path}")
+
     def load_checkpoint(self):
         first_epoch = 0
         logging_dir = self.config.training.logging.logging_dir
@@ -564,7 +610,8 @@ class DiffPruningTrainer:
                 loss += self.config.training.losses.contrastive_clip_loss.weight * contrastive_loss
 
                 # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = self.accelerator.gather(loss.repeat(self.config.data.dataloader.train_batch_size)).mean()
+                avg_loss = self.accelerator.gather(
+                    loss.repeat(self.config.data.dataloader.train_batch_size)).detach().mean()
                 train_loss += avg_loss.item() / self.config.training.gradient_accumulation_steps
 
                 # Back-propagate
@@ -579,35 +626,24 @@ class DiffPruningTrainer:
                         self.ema_unet.step(self.unet.parameters())
                     progress_bar.update(1)
                     global_step += 1
-                    self.accelerator.log({
-                        "train_loss": train_loss,
-                        "diffusion loss": diff_loss,
-                        "resource_loss": resource_loss,
-                        "commitment_loss": q_loss,
-                        "contrastive_loss": contrastive_loss,
-                        "hyper_net lr": self.lr_scheduler.get_last_lr()[0],
-                        "quantizer lr": self.lr_scheduler.get_last_lr()[1],
-                        "resource_ratio": resource_ratio,
-                    }, step=global_step)
+                    log_dict = {
+                        "train/loss": train_loss,
+                        "train/diffusion_loss": diff_loss,
+                        "train/resource_loss": resource_loss.detach().item(),
+                        "train/commitment_loss": q_loss.detach().item(),
+                        "train/contrastive_loss": contrastive_loss.detach().item(),
+                        "train/hyper_net_lr": self.lr_scheduler.get_last_lr()[0],
+                        "train/quantizer_lr": self.lr_scheduler.get_last_lr()[1],
+                        "train/resource_ratio": resource_ratio.detach().item(),
+                    }
                     for k, v in flops_dict.items():
                         if isinstance(v, torch.Tensor):
-                            self.accelerator.log({k: v.detach().cpu().mean().item()}, step=global_step)
+                            log_dict[f"train/{k}"] = v.detach().mean().item()
                         else:
-                            self.accelerator.log({k: v}, step=global_step)
+                            log_dict[f"train/{k}"] = v
 
-                    # log the pairwise cosine similarity of the embeddings of the quantizer:
-                    if hasattr(self.quantizer, "module"):
-                        quantizer_embeddings = self.quantizer.module.embedding.weight.data.detach().cpu().numpy()
-                    else:
-                        quantizer_embeddings = self.quantizer.embedding.weight.data.detach().cpu().numpy()
-                    quantizer_embeddings = quantizer_embeddings / np.linalg.norm(quantizer_embeddings, axis=1,
-                                                                                 keepdims=True)
-                    quantizer_embeddings = quantizer_embeddings @ quantizer_embeddings.T
-                    self.accelerator.log({
-                        "quantizer embeddings pairwise similarity": wandb.Image(quantizer_embeddings),
-                        "arch vector pairwise similarity image": wandb.Image(arch_vectors_similarity),
-                        "arch vector pairwise similarity": wandb.Table(arch_vectors_similarity)
-                    }, step=global_step)
+                    log_dict["images/arch vector pairwise similarity image"] = wandb.Image(arch_vectors_similarity)
+                    self.accelerator.log(log_dict)
 
                 logs = {"diff_loss": diff_loss.detach().item(),
                         "q_loss": q_loss.detach().item(),
@@ -621,7 +657,7 @@ class DiffPruningTrainer:
 
                 if global_step % self.config.training.validation_steps == 0:
                     if self.eval_dataset is not None:
-                        self.validate(global_step)
+                        self.validate()
 
                 if (global_step % self.config.training.image_logging_steps == 0 or
                         (epoch == self.config.training.num_train_epochs - 1 and step == len(
@@ -659,7 +695,7 @@ class DiffPruningTrainer:
         self.accelerator.end_training()
 
     @torch.no_grad()
-    def validate(self, global_step=None):
+    def validate(self):
         self.init_weight_dtype()
         # Move text_encode and vae to gpu and cast to weight_dtype
         self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
@@ -798,16 +834,16 @@ class DiffPruningTrainer:
                 progress_bar.update(1)
 
             self.accelerator.log({
-                "val_loss": val_loss,
-                "val diffusion loss": self.accelerator.gather(
+                "validation/loss": val_loss,
+                "validation/diffusion_loss": self.accelerator.gather(
                     diff_loss.detach().repeat(self.config.data.dataloader.validation_batch_size)).mean(),
-                "val resource_loss": self.accelerator.gather(
+                "validation/resource_loss": self.accelerator.gather(
                     resource_loss.detach().repeat(self.config.data.dataloader.validation_batch_size)).mean(),
-                "val commitment_loss": self.accelerator.gather(
+                "validation/commitment_loss": self.accelerator.gather(
                     q_loss.detach().repeat(self.config.data.dataloader.validation_batch_size)).mean(),
-                "val contrastive_loss": self.accelerator.gather(
+                "validation/contrastive_loss": self.accelerator.gather(
                     contrastive_loss.detach().repeat(self.config.data.dataloader.validation_batch_size)).mean(),
-            }, step=(global_step // self.config.training.validation_steps - 1) * len(self.eval_dataloader) + step)
+            })
 
             logs = {"val diff_loss": diff_loss,
                     "val q_loss": q_loss.detach().item(), "val c_loss": contrastive_loss.detach().item(),
@@ -833,100 +869,6 @@ class DiffPruningTrainer:
                     repo_id=self.config.training.hf_hub.hub_model_id or Path(logging_dir).name, exist_ok=True,
                     token=self.config.training.hf_hub.hub_token
                 ).repo_id
-
-    def save_model_card(
-            self,
-            repo_id: str,
-            images=None,
-            repo_folder=None,
-    ):
-        img_str = ""
-        if len(images) > 0:
-            image_grid = make_image_grid(images, 1, len(self.config.data.prompts))
-            image_grid.save(os.path.join(repo_folder, "val_imgs_grid.png"))
-            img_str += "![val_imgs_grid](./val_imgs_grid.png)\n"
-
-        yaml = f"""
-    ---
-    license: creativeml-openrail-m
-    base_model: {self.config.pretrained_model_name_or_path}
-    datasets:
-    - {self.config.data.dataset_name}
-    tags:
-    - stable-diffusion
-    - stable-diffusion-diffusers
-    - text-to-image
-    - diffusers
-    inference: true
-    ---
-        """
-        model_card = f"""
-    # Text-to-image finetuning - {repo_id}
-
-    This pipeline was pruned from **{self.config.pretrained_model_name_or_path}** on the **{self.config.data.dataset_name}** dataset. Below are some example images generated with the finetuned pipeline using the following prompts: {self.config.data.prompts}: \n
-    {img_str}
-
-    ## Pipeline usage
-
-    You can use the pipeline like so:
-
-    ```python
-    from diffusers import DiffusionPipeline
-    import torch
-
-    pipeline = DiffusionPipeline.from_pretrained("{repo_id}", torch_dtype=torch.float16)
-    prompt = "{self.config.data.prompts[0]}"
-    image = pipeline(prompt).images[0]
-    image.save("my_image.png")
-    ```
-
-    ## Training info
-
-    These are the key hyperparameters used during training:
-
-    * Epochs: {self.config.training.num_train_epochs}
-    * Hypernet Learning rate: {self.config.training.optim.hypernet_learning_rate}
-    * Quantizer Learning rate: {self.config.training.optim.quantizer_learning_rate}
-    * Batch size: {self.config.data.dataloader.train_batch_size}
-    * Gradient accumulation steps: {self.config.training.gradient_accumulation_steps}
-    * Image resolution: {self.config.model.unet.resolution}
-    * Mixed-precision: {self.config.mixed_precision}
-
-    """
-        wandb_info = ""
-        if is_wandb_available():
-            wandb_run_url = None
-            if wandb.run is not None:
-                wandb_run_url = wandb.run.url
-
-        if self.config.wandb_run_url is not None:
-            wandb_info = f"""
-    More information on all the CLI arguments and the environment are available on your [`wandb` run page]({self.config.wandb_run_url}).
-    """
-
-        model_card += wandb_info
-
-        with open(os.path.join(repo_folder, "../README.md"), "w") as f:
-            f.write(yaml + model_card)
-
-    def init_prompts(self):
-        if os.path.isfile(self.config.data.prompts[0]):
-            with open(self.config.data.prompts[0], "r") as f:
-                self.config.data.prompts = [line.strip() for line in f.readlines()]
-        elif os.path.isdir(self.config.data.prompts[0]):
-            validation_prompts_dir = self.config.data.prompts[0]
-            prompts = []
-            for d in validation_prompts_dir:
-                files = [os.path.join(d, caption_file) for caption_file in os.listdir(d) if f.endswith(".txt")]
-                for f in files:
-                    with open(f, "r") as f:
-                        prompts.extend([line.strip() for line in f.readlines()])
-
-            self.config.data.prompts = prompts
-
-        if self.config.data.max_generated_samples is not None:
-            self.config.data.prompts = self.config.data.prompts[
-                                       :self.config.data.max_generated_samples]
 
     def get_pipeline(self):
         self.init_weight_dtype()
@@ -1069,9 +1011,8 @@ class DiffPruningTrainer:
             if tracker.name == "wandb":
                 tracker.log(
                     {
-                        "validation": wandb.Image(images)
+                        "images/prompt_samples": wandb.Image(images)
                     },
-                    step=global_step
                 )
             else:
                 logger.warn(f"image logging not implemented for {tracker.name}")
@@ -1126,9 +1067,8 @@ class DiffPruningTrainer:
             if tracker.name == "wandb":
                 tracker.log(
                     {
-                        "quantizer embedding images": wandb.Image(images)
+                        "images/quantizer embedding images": wandb.Image(images)
                     },
-                    step=step
                 )
             else:
                 logger.warn(f"image logging not implemented for {tracker.name}")
@@ -1138,29 +1078,77 @@ class DiffPruningTrainer:
 
         return images
 
-    def save_checkpoint(self, logging_dir, global_step):
-        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-        if self.config.training.logging.checkpoints_total_limit is not None:
-            checkpoints = os.listdir(logging_dir)
-            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+    def save_model_card(
+            self,
+            repo_id: str,
+            images=None,
+            repo_folder=None,
+    ):
+        img_str = ""
+        if len(images) > 0:
+            image_grid = make_image_grid(images, 1, len(self.config.data.prompts))
+            image_grid.save(os.path.join(repo_folder, "val_imgs_grid.png"))
+            img_str += "![val_imgs_grid](./val_imgs_grid.png)\n"
 
-            # before we save the new checkpoint, we need to have at _most_
-            # `checkpoints_total_limit - 1` checkpoints
-            if len(checkpoints) >= self.config.training.logging.checkpoints_total_limit:
-                num_to_remove = len(
-                    checkpoints) - self.config.training.logging.checkpoints_total_limit + 1
-                removing_checkpoints = checkpoints[0:num_to_remove]
+        yaml = f"""
+        ---
+        license: creativeml-openrail-m
+        base_model: {self.config.pretrained_model_name_or_path}
+        datasets:
+        - {self.config.data.dataset_name}
+        tags:
+        - stable-diffusion
+        - stable-diffusion-diffusers
+        - text-to-image
+        - diffusers
+        inference: true
+        ---
+            """
+        model_card = f"""
+        # Text-to-image finetuning - {repo_id}
+    
+        This pipeline was pruned from **{self.config.pretrained_model_name_or_path}** on the **{self.config.data.dataset_name}** dataset. Below are some example images generated with the finetuned pipeline using the following prompts: {self.config.data.prompts}: \n
+        {img_str}
+    
+        ## Pipeline usage
+    
+        You can use the pipeline like so:
+    
+        ```python
+        from diffusers import DiffusionPipeline
+        import torch
+    
+        pipeline = DiffusionPipeline.from_pretrained("{repo_id}", torch_dtype=torch.float16)
+        prompt = "{self.config.data.prompts[0]}"
+        image = pipeline(prompt).images[0]
+        image.save("my_image.png")
+        ```
+    
+        ## Training info
+    
+        These are the key hyperparameters used during training:
+    
+        * Epochs: {self.config.training.num_train_epochs}
+        * Hypernet Learning rate: {self.config.training.optim.hypernet_learning_rate}
+        * Quantizer Learning rate: {self.config.training.optim.quantizer_learning_rate}
+        * Batch size: {self.config.data.dataloader.train_batch_size}
+        * Gradient accumulation steps: {self.config.training.gradient_accumulation_steps}
+        * Image resolution: {self.config.model.unet.resolution}
+        * Mixed-precision: {self.config.mixed_precision}
+    
+        """
+        wandb_info = ""
+        if is_wandb_available():
+            wandb_run_url = None
+            if wandb.run is not None:
+                wandb_run_url = wandb.run.url
 
-                logger.info(
-                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                )
-                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+        if self.config.wandb_run_url is not None:
+            wandb_info = f"""
+        More information on all the CLI arguments and the environment are available on your [`wandb` run page]({self.config.wandb_run_url}).
+        """
 
-                for removing_checkpoint in removing_checkpoints:
-                    removing_checkpoint = os.path.join(logging_dir, removing_checkpoint)
-                    shutil.rmtree(removing_checkpoint)
+        model_card += wandb_info
 
-        save_path = os.path.join(logging_dir, f"checkpoint-{global_step}")
-        self.accelerator.save_state(save_path)
-        logger.info(f"Saved state to {save_path}")
+        with open(os.path.join(repo_folder, "../README.md"), "w") as f:
+            f.write(yaml + model_card)
