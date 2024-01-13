@@ -17,6 +17,7 @@ import logging
 import os
 import random
 import sys
+
 sys.path.append(os.getcwd())
 import datetime
 
@@ -29,7 +30,6 @@ import numpy as np
 import requests
 import torch
 import torch.utils.checkpoint
-import torch.nn.functional as F
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from datasets import load_dataset, Dataset, concatenate_datasets
@@ -51,7 +51,6 @@ from pdm.utils.arg_utils import parse_args
 from pdm.datasets.cc3m import load_cc3m_dataset
 from pdm.datasets.laion_aes import load_main_laion_dataset
 from pdm.training.trainer import DiffPruningTrainer
-
 
 DATASET_NAME_MAPPING = {
     "lambdalabs/pokemon-blip-captions": ("image", "text"),
@@ -146,12 +145,14 @@ def main():
         ff_gate_width=config.model.unet.ff_gate_width,
 
     )
+
+    mpnet_tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-mpnet-base-v2')
+    mpnet_model = AutoModel.from_pretrained('sentence-transformers/all-mpnet-base-v2')
+
     unet_structure = unet.get_structure()
-    hyper_net = HyperStructure(input_dim=text_encoder.config.hidden_size,
-                               seq_len=text_encoder.config.max_position_embeddings,
+    hyper_net = HyperStructure(input_dim=mpnet_model.config.hidden_size,
                                structure=unet_structure,
-                               wn_flag=config.model.hypernet.weight_norm,
-                               inner_dim=config.model.hypernet.inner_dim)
+                               wn_flag=config.model.hypernet.weight_norm)
 
     quantizer = StructureVectorQuantizer(n_e=config.model.quantizer.num_arch_vq_codebook_embeddings,
                                          structure=unet_structure,
@@ -329,11 +330,7 @@ def main():
         )
         return inputs.input_ids
 
-
-    mpnet_tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-mpnet-base-v2')
-    mpnet_model = AutoModel.from_pretrained('sentence-transformers/all-mpnet-base-v2')
-
-    def get_mpnet_embeddings(examples, is_train=True):
+    def get_mpnet_embeddings(capts, is_train=True):
         # Mean Pooling - Take attention mask into account for correct averaging
         def mean_pooling(model_output, attention_mask):
             token_embeddings = model_output[0]  # First element of model_output contains all token embeddings
@@ -342,7 +339,7 @@ def main():
                                                                                       min=1e-9)
 
         captions = []
-        for caption in examples[caption_column]:
+        for caption in capts:
             if isinstance(caption, str):
                 captions.append(caption)
             elif isinstance(caption, (list, np.ndarray)):
@@ -358,7 +355,7 @@ def main():
         with torch.no_grad():
             model_output = mpnet_model(**encoded_input)
         sentence_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
-        sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
+        # sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
         return sentence_embeddings
 
     # Preprocessing the datasets.
@@ -405,7 +402,7 @@ def main():
         images = [image.convert("RGB") if image is not None else image for image in examples[image_column]]
         examples["pixel_values"] = [train_transforms(image) if image is not None else image for image in images]
         examples["input_ids"] = tokenize_captions(examples)
-        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples, is_train=True)
+        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples[caption_column], is_train=True)
         return examples
 
     def preprocess_validation(examples):
@@ -443,6 +440,8 @@ def main():
     if config.data.prompts is None:
         config.data.prompts = dataset["validation"][caption_column][:config.data.max_generated_samples]
 
+    prompt_embeddings = get_mpnet_embeddings(config.data.prompts, is_train=False)
+
     del args, data_dir, data_files, dataset_config_name, dataset_name, dataset_columns, \
         train_data_dir, train_data_file, train_bad_images_path, max_train_samples, validation_data_dir, \
         validation_data_file, validation_bad_images_path, max_validation_samples
@@ -463,6 +462,7 @@ def main():
                                  ema_unet=ema_unet,
                                  eval_dataset=dataset["validation"],
                                  tokenizer=tokenizer,
+                                 prompt_embeddings=prompt_embeddings,
                                  )
 
     trainer.train()

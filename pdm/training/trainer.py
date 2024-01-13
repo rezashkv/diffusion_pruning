@@ -55,7 +55,9 @@ class DiffPruningTrainer:
                  ema_unet: nn.Module = None,
                  eval_dataset: Dataset = None,
                  tokenizer: Optional[PreTrainedTokenizerBase] = None,
-                 optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None)):
+                 optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
+                 prompt_embeddings: Optional[list] = None,
+                 ):
 
         self.config = config
         self.accelerator = self.create_accelerator()
@@ -72,6 +74,7 @@ class DiffPruningTrainer:
         self.prepare_datasets(preprocess_train, preprocess_eval)
         self.tokenizer = tokenizer
         self.configure_logging()
+        self.prompt_embeddings = prompt_embeddings
 
         self.create_repo()
 
@@ -492,7 +495,7 @@ class DiffPruningTrainer:
                 encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
                 text_embeddings = batch["mpnet_embeddings"]
 
-                arch_vector = self.hyper_net(encoder_hidden_states)
+                arch_vector = self.hyper_net(text_embeddings)
                 arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
 
                 # Calculating the MACs of each module of the model in the first iteration.
@@ -750,7 +753,7 @@ class DiffPruningTrainer:
                 encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
                 text_embeddings = batch["mpnet_embeddings"]
 
-                arch_vector = self.hyper_net(encoder_hidden_states)
+                arch_vector = self.hyper_net(text_embeddings)
                 arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
 
                 # gather the arch_vector_quantized across all processes to get large batch for contrastive loss
@@ -1002,7 +1005,9 @@ class DiffPruningTrainer:
                     gen_images, batch_embedding_indices = pipeline(batch,
                                                                    num_inference_steps=self.config.training.num_inference_steps,
                                                                    generator=generator, output_type="pt",
-                                                                   return_mapped_indices=True)
+                                                                   return_mapped_indices=True,
+                                                                   hyper_net_input=self.prompt_embeddings
+                                                                   )
                     gen_images = gen_images.images
                     gen_images = self.accelerator.gather_for_metrics(gen_images)
                     batch_embedding_indices = self.accelerator.gather_for_metrics(batch_embedding_indices)

@@ -635,7 +635,8 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
             callback_steps: int = 1,
             cross_attention_kwargs: Optional[Dict[str, Any]] = None,
             guidance_rescale: float = 0.0,
-            return_mapped_indices: bool = False
+            return_mapped_indices: bool = False,
+            hyper_net_input: Optional[torch.FloatTensor] = None,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -741,7 +742,11 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
             lora_scale=text_encoder_lora_scale,
         )
 
-        structure_vector = self.hyper_net(prompt_embeds)
+        if hyper_net_input is None:
+            structure_vector = self.hyper_net(prompt_embeds.mean(dim=1))
+        else:
+            structure_vector = self.hyper_net(hyper_net_input)
+
         structure_vector_quantized, _, (_, _, min_encoding_indices) = self.quantizer(structure_vector)
         if hasattr(self.hyper_net, "module"):
             arch_vectors_separated = self.hyper_net.module.transform_structure_vector(structure_vector_quantized)
@@ -860,6 +865,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
             callback_steps: int = 1,
             cross_attention_kwargs: Optional[Dict[str, Any]] = None,
             guidance_rescale: float = 0.0,
+            hyper_net_input: Optional[torch.FloatTensor] = None,
     ):
 
         r"""
@@ -966,7 +972,10 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
             lora_scale=text_encoder_lora_scale,
         )
 
-        structure_vector = self.hyper_net(prompt_embeds)
+        if hyper_net_input is None:
+            structure_vector = self.hyper_net(prompt_embeds.mean(dim=1))
+        else:
+            structure_vector = self.hyper_net(hyper_net_input)
         structure_vector_quantized, _, _ = self.quantizer(structure_vector)
         if hasattr(self.hyper_net, "module"):
             arch_vectors_separated = self.hyper_net.module.transform_structure_vector(structure_vector_quantized)
