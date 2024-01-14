@@ -8,7 +8,6 @@ from typing import Optional, Tuple, Dict, Callable
 
 import diffusers
 import math
-import numpy as np
 import torch
 import torchvision
 import transformers
@@ -243,12 +242,12 @@ class DiffPruningTrainer:
 
         optimizer = optimizer_cls(
             [
-                {"params": self.hyper_net.parameters(), "lr": self.config.training.optim.hypernet_learning_rate},
-                {"params": self.quantizer.parameters(), "lr": self.config.training.optim.quantizer_learning_rate},
+                {"params": self.hyper_net.parameters(), "lr": self.config.training.optim.hypernet_learning_rate,
+                 "weight_decay": self.config.training.optim.hypernet_weight_decay},
+                {"params": self.quantizer.parameters(), "lr": self.config.training.optim.quantizer_learning_rate,
+                 "weight_decay": self.config.training.optim.quantizer_weight_decay},
             ],
-            lr=self.config.training.optim.hypernet_learning_rate,
             betas=(self.config.training.optim.adam_beta1, self.config.training.optim.adam_beta2),
-            weight_decay=self.config.training.optim.adam_weight_decay,
             eps=self.config.training.optim.adam_epsilon,
         )
         return optimizer
@@ -313,7 +312,6 @@ class DiffPruningTrainer:
                 self.config.wandb_run_name = (
                     f"{self.config.data.dataset_name if self.config.data.dataset_name else self.config.data.data_dir.split('/')[-1]}-"
                     f"{self.config.data.max_train_samples}-steps:{self.config.training.max_train_steps}-"
-                    f"clip_temp:{self.config.training.losses.contrastive_clip_loss.temperature}-"
                     f"h_lr:{self.config.training.optim.hypernet_learning_rate}-"
                     f"q_lr:{self.config.training.optim.quantizer_learning_rate}-seed:{self.config.seed}")
             self.accelerator.init_trackers(self.config.tracker_project_name, tracker_config,
@@ -671,18 +669,17 @@ class DiffPruningTrainer:
                     if self.config.data.prompts is not None:
                         val_images = self.generate_samples_from_prompts(global_step)
 
+                    # visualize the quantizer embeddings
+                    self.log_quantizer_embedding_samples(global_step)
+
                 if global_step >= self.config.training.max_train_steps:
                     break
 
             # checkpoint at the end of each epoch
             if self.accelerator.is_main_process:
-                # visualize the quantizer embeddings
-                self.log_quantizer_embedding_samples(global_step)
-
                 self.save_checkpoint(logging_dir, global_step)
                 # save architecture vector quantized
-                torch.save(arch_vector_quantized_list,
-                           os.path.join(logging_dir, f"arch_vector_quantized.pt"))
+                torch.save(arch_vector_quantized_list, os.path.join(logging_dir, f"arch_vector_quantized.pt"))
 
         # Create the pipeline using the trained modules and save it.
         self.accelerator.wait_for_everyone()
@@ -985,6 +982,7 @@ class DiffPruningTrainer:
     @torch.no_grad()
     def generate_samples_from_prompts(self, global_step):
         logger.info("Generating samples from the given prompts... ")
+
         pipeline = self.get_pipeline()
 
         image_output_dir = os.path.join(self.config.training.logging.logging_dir, "prompt_images",
@@ -1040,6 +1038,7 @@ class DiffPruningTrainer:
         logger.info("Sampling from quantizer... ")
 
         pipeline = self.get_pipeline()
+
         image_output_dir = os.path.join(self.config.training.logging.logging_dir, "quantizer_embedding_images",
                                         f"step_{step}")
         os.makedirs(image_output_dir, exist_ok=True)
@@ -1051,40 +1050,36 @@ class DiffPruningTrainer:
         else:
             n_e = pipeline.quantizer.n_e
         quantizer_embedding_gumbel_sigmoid = []
-        for step in range(0, n_e, self.config.data.dataloader.validation_batch_size):
+        for step in range(0, n_e, self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes):
             indices = torch.arange(step,
-                                   step + self.config.data.dataloader.validation_batch_size,
+                                   step + self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes,
                                    device=self.accelerator.device)
             with torch.autocast("cuda"):
-                if self.config.seed is None:
-                    generator = None
-                else:
-                    generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
+                with self.accelerator.split_between_processes(indices) as indices:
+                    if self.config.seed is None:
+                        generator = None
+                    else:
+                        generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
 
-                gen_images, quantizer_embed_gs = pipeline.quantizer_samples(indices=indices,
-                                                                            num_inference_steps=self.config.training.num_inference_steps,
-                                                                            generator=generator, output_type="pt")
-                gen_images = gen_images.images
-                quantizer_embedding_gumbel_sigmoid.append(quantizer_embed_gs)
-                images += gen_images
+                    gen_images, quantizer_embed_gs = pipeline.quantizer_samples(indices=indices,
+                                                                                num_inference_steps=self.config.training.num_inference_steps,
+                                                                                generator=generator, output_type="pt")
+                    gen_images = gen_images.images
+                    gen_images = self.accelerator.gather_for_metrics(gen_images)
+                    quantizer_embed_gs = self.accelerator.gather_for_metrics(quantizer_embed_gs)
+                    quantizer_embedding_gumbel_sigmoid += quantizer_embed_gs
+                    images += gen_images
 
         quantizer_embedding_gumbel_sigmoid = torch.cat(quantizer_embedding_gumbel_sigmoid, dim=0)
-        torch.save(quantizer_embedding_gumbel_sigmoid, os.path.join(image_output_dir,
-                                                                    "quantizer_embeddings_gumbel_sigmoid.pt"))
-
         images = [torchvision.transforms.ToPILImage()(img) for img in images]
         images = make_image_grid(images, len(images) // 4, 4)
-        images.save(os.path.join(image_output_dir, "quantizer_embedding_images.png"))
 
-        for tracker in self.accelerator.trackers:
-            if tracker.name == "wandb":
-                tracker.log(
-                    {
-                        "images/quantizer embedding images": wandb.Image(images)
-                    },
-                )
-            else:
-                logger.warn(f"image logging not implemented for {tracker.name}")
+        if self.accelerator.is_main_process:
+            images.save(os.path.join(image_output_dir, "quantizer_embedding_images.png"))
+            torch.save(quantizer_embedding_gumbel_sigmoid, os.path.join(image_output_dir,
+                                                                        "quantizer_embeddings_gumbel_sigmoid.pt"))
+
+        self.accelerator.log({"images/quantizer embedding images": wandb.Image(images)})
 
         del pipeline
         torch.cuda.empty_cache()

@@ -16,9 +16,6 @@
 import logging
 import os
 import random
-import sys
-
-sys.path.append(os.getcwd())
 import datetime
 
 from accelerate.utils import set_seed
@@ -166,7 +163,8 @@ def main():
                           loss_type=config.training.losses.resource_loss.type)
 
     clip_loss = ClipLoss(structure=unet_structure,
-                         temperature=config.training.losses.contrastive_clip_loss.temperature)
+                         arch_vector_temperature=config.training.losses.contrastive_clip_loss.arch_vector_temperature,
+                         prompt_embedding_temperature=config.training.losses.contrastive_clip_loss.prompt_embedding_temperature)
 
     # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
@@ -425,7 +423,7 @@ def main():
         images = [image.convert("RGB") if image is not None else image for image in examples[image_column]]
         examples["pixel_values"] = [validation_transforms(image) if image is not None else image for image in images]
         examples["input_ids"] = tokenize_captions(examples, is_train=False)
-        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples, is_train=False)
+        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples[caption_column], is_train=False)
         return examples
 
     def collate_fn(examples):
