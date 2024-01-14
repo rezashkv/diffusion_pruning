@@ -25,9 +25,8 @@ model:
     ff_gate_width: 32
 
   hypernet:
-    hypernet_sparsity: 0
-    weight_norm: true
-    inner_dim: 1024
+    weight_norm: false
+    linear_bias: true
 
   quantizer:
     quantizer_T: 0.4
@@ -125,7 +124,6 @@ training:
     # logging_dir: "/path/to/logs/"
     logging_dir: "/fs/cbcb-scratch/aliganj/results"
     report_to: "wandb"
-    checkpointing_steps: 1000
     checkpoints_total_limit: 1
     resume_from_checkpoint: "latest"
     tracker_project_name: "text2image-dynamic-pruning"

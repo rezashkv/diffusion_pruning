@@ -313,7 +313,7 @@ class DiffPruningTrainer:
                     f"{self.config.data.dataset_name if self.config.data.dataset_name else self.config.data.data_dir.split('/')[-1]}-"
                     f"{self.config.data.max_train_samples}-steps:{self.config.training.max_train_steps}-"
                     f"h_lr:{self.config.training.optim.hypernet_learning_rate}-"
-                    f"q_lr:{self.config.training.optim.quantizer_learning_rate}-seed:{self.config.seed}")
+                    f"q_lr:{self.config.training.optim.quantizer_learning_rate}")
             self.accelerator.init_trackers(self.config.tracker_project_name, tracker_config,
                                            init_kwargs={"wandb": {"name": self.config.wandb_run_name,
                                                                   "resume": resume}})

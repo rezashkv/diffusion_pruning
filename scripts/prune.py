@@ -149,7 +149,8 @@ def main():
     unet_structure = unet.get_structure()
     hyper_net = HyperStructure(input_dim=mpnet_model.config.hidden_size,
                                structure=unet_structure,
-                               wn_flag=config.model.hypernet.weight_norm)
+                               wn_flag=config.model.hypernet.weight_norm,
+                               linear_bias=config.model.hypernet.linear_bias)
 
     quantizer = StructureVectorQuantizer(n_e=config.model.quantizer.num_arch_vq_codebook_embeddings,
                                          structure=unet_structure,
