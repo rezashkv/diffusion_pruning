@@ -82,7 +82,9 @@ class DiffPruningTrainer:
         if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
             self.init_accelerate_customized_saving_hooks()
 
-        self.train_dataloader, self.eval_dataloader = self.initialize_dataloaders(data_collator)
+        (self.train_dataloader, self.eval_dataloader,
+         self.prompt_dataloader, self.quantizer_embeddings_dataloader) = self.initialize_dataloaders(data_collator)
+
         self.overrode_max_train_steps = False
         self.update_config_params()
 
@@ -183,14 +185,19 @@ class DiffPruningTrainer:
     def prepare_with_accelerator(self):
         # Prepare everything with our `accelerator`.
         if self.eval_dataloader is not None:
-            (self.unet, self.optimizer, self.train_dataloader, self.eval_dataloader, self.lr_scheduler, self.hyper_net,
+            (self.unet, self.optimizer, self.train_dataloader, self.eval_dataloader, self.prompt_dataloader,
+             self.quantizer_embeddings_dataloader, self.lr_scheduler, self.hyper_net,
              self.quantizer) = (self.accelerator.prepare(self.unet, self.optimizer, self.train_dataloader,
-                                                         self.eval_dataloader, self.lr_scheduler, self.hyper_net,
+                                                         self.eval_dataloader, self.prompt_dataloader,
+                                                         self.quantizer_embeddings_dataloader, self.lr_scheduler,
+                                                         self.hyper_net,
                                                          self.quantizer
                                                          ))
         else:
-            self.unet, self.optimizer, self.train_dataloader, self.lr_scheduler, self.hyper_net, self.quantizer = (
-                self.accelerator.prepare(self.unet, self.optimizer, self.train_dataloader, self.lr_scheduler,
+            (self.unet, self.optimizer, self.train_dataloader, self.prompt_dataloader,
+             self.quantizer_embeddings_dataloader, self.lr_scheduler, self.hyper_net, self.quantizer) = (
+                self.accelerator.prepare(self.unet, self.optimizer, self.train_dataloader, self.prompt_dataloader,
+                                         self.quantizer_embeddings_dataloader, self.lr_scheduler,
                                          self.hyper_net, self.quantizer
                                          ))
 
@@ -271,7 +278,27 @@ class DiffPruningTrainer:
             )
         else:
             eval_dataloader = None
-        return train_dataloader, eval_dataloader
+
+        if self.config.data.prompts is None:
+            self.config.data.prompts = []
+
+        # create a torch dataloader from self.config.data.prompts
+        prompt_dataloader = torch.utils.data.DataLoader(self.config.data.prompts,
+                                                        batch_size=self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes,
+                                                        shuffle=False,
+                                                        num_workers=self.config.data.dataloader.dataloader_num_workers)
+
+        if hasattr(self.quantizer, "module"):
+            n_e = self.quantizer.module.n_e
+        else:
+            n_e = self.quantizer.n_e
+
+        q_embedding_dataloader = torch.utils.data.DataLoader(torch.arange(n_e),
+                                                             batch_size=self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes,
+                                                             shuffle=False,
+                                                             num_workers=self.config.data.dataloader.dataloader_num_workers)
+
+        return train_dataloader, eval_dataloader, prompt_dataloader, q_embedding_dataloader
 
     def update_config_params(self):
         self.num_update_steps_per_epoch = math.ceil(
@@ -990,27 +1017,24 @@ class DiffPruningTrainer:
         os.makedirs(image_output_dir, exist_ok=True)
         images = []
         embedding_indices = []
-        for step in range(0, len(self.config.data.prompts),
-                          self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes):
-            batch = self.config.data.prompts[
-                    step:step + self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes]
+
+        for step, batch in enumerate(self.prompt_dataloader):
             with torch.autocast("cuda"):
-                with self.accelerator.split_between_processes(batch) as batch:
-                    if self.config.seed is None:
-                        generator = None
-                    else:
-                        generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
-                    gen_images, batch_embedding_indices = pipeline(batch,
-                                                                   num_inference_steps=self.config.training.num_inference_steps,
-                                                                   generator=generator, output_type="pt",
-                                                                   return_mapped_indices=True,
-                                                                   hyper_net_input=self.prompt_embeddings
-                                                                   )
-                    gen_images = gen_images.images
-                    gen_images = self.accelerator.gather_for_metrics(gen_images)
-                    batch_embedding_indices = self.accelerator.gather_for_metrics(batch_embedding_indices)
-                    images += gen_images
-                    embedding_indices += batch_embedding_indices
+                if self.config.seed is None:
+                    generator = None
+                else:
+                    generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
+                gen_images, batch_embedding_indices = pipeline(batch,
+                                                               num_inference_steps=self.config.training.num_inference_steps,
+                                                               generator=generator, output_type="pt",
+                                                               return_mapped_indices=True,
+                                                               hyper_net_input=self.prompt_embeddings
+                                                               )
+                gen_images = gen_images.images
+                gen_images = self.accelerator.gather_for_metrics(gen_images)
+                batch_embedding_indices = self.accelerator.gather_for_metrics(batch_embedding_indices)
+                images += gen_images
+                embedding_indices += batch_embedding_indices
 
         min_encoding_indices_image = create_image_grid_from_indices([x.item() for x in embedding_indices],
                                                                     grid_size=(4, len(images) // 4))
@@ -1045,30 +1069,23 @@ class DiffPruningTrainer:
 
         images = []
 
-        if hasattr(pipeline.quantizer, "module"):
-            n_e = pipeline.quantizer.module.n_e
-        else:
-            n_e = pipeline.quantizer.n_e
         quantizer_embedding_gumbel_sigmoid = []
-        for step in range(0, n_e, self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes):
-            indices = torch.arange(step,
-                                   step + self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes,
-                                   device=self.accelerator.device)
-            with torch.autocast("cuda"):
-                with self.accelerator.split_between_processes(indices) as indices:
-                    if self.config.seed is None:
-                        generator = None
-                    else:
-                        generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
 
-                    gen_images, quantizer_embed_gs = pipeline.quantizer_samples(indices=indices,
-                                                                                num_inference_steps=self.config.training.num_inference_steps,
-                                                                                generator=generator, output_type="pt")
-                    gen_images = gen_images.images
-                    gen_images = self.accelerator.gather_for_metrics(gen_images)
-                    quantizer_embed_gs = self.accelerator.gather_for_metrics(quantizer_embed_gs)
-                    quantizer_embedding_gumbel_sigmoid += quantizer_embed_gs
-                    images += gen_images
+        for step, indices in enumerate(self.quantizer_embeddings_dataloader):
+            with torch.autocast("cuda"):
+                if self.config.seed is None:
+                    generator = None
+                else:
+                    generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
+
+                gen_images, quantizer_embed_gs = pipeline.quantizer_samples(indices=indices,
+                                                                            num_inference_steps=self.config.training.num_inference_steps,
+                                                                            generator=generator, output_type="pt")
+                gen_images = gen_images.images
+                gen_images = self.accelerator.gather_for_metrics(gen_images)
+                quantizer_embed_gs = self.accelerator.gather_for_metrics(quantizer_embed_gs)
+                quantizer_embedding_gumbel_sigmoid += quantizer_embed_gs
+                images += gen_images
 
         quantizer_embedding_gumbel_sigmoid = torch.cat(quantizer_embedding_gumbel_sigmoid, dim=0)
         images = [torchvision.transforms.ToPILImage()(img) for img in images]
@@ -1099,52 +1116,52 @@ class DiffPruningTrainer:
             img_str += "![val_imgs_grid](./val_imgs_grid.png)\n"
 
         yaml = f"""
-        ---
-        license: creativeml-openrail-m
-        base_model: {self.config.pretrained_model_name_or_path}
-        datasets:
-        - {self.config.data.dataset_name}
-        tags:
-        - stable-diffusion
-        - stable-diffusion-diffusers
-        - text-to-image
-        - diffusers
-        inference: true
-        ---
-            """
+            ---
+            license: creativeml-openrail-m
+            base_model: {self.config.pretrained_model_name_or_path}
+            datasets:
+            - {self.config.data.dataset_name}
+            tags:
+            - stable-diffusion
+            - stable-diffusion-diffusers
+            - text-to-image
+            - diffusers
+            inference: true
+            ---
+                """
         model_card = f"""
-        # Text-to-image finetuning - {repo_id}
-    
-        This pipeline was pruned from **{self.config.pretrained_model_name_or_path}** on the **{self.config.data.dataset_name}** dataset. Below are some example images generated with the finetuned pipeline using the following prompts: {self.config.data.prompts}: \n
-        {img_str}
-    
-        ## Pipeline usage
-    
-        You can use the pipeline like so:
-    
-        ```python
-        from diffusers import DiffusionPipeline
-        import torch
-    
-        pipeline = DiffusionPipeline.from_pretrained("{repo_id}", torch_dtype=torch.float16)
-        prompt = "{self.config.data.prompts[0]}"
-        image = pipeline(prompt).images[0]
-        image.save("my_image.png")
-        ```
-    
-        ## Training info
-    
-        These are the key hyperparameters used during training:
-    
-        * Epochs: {self.config.training.num_train_epochs}
-        * Hypernet Learning rate: {self.config.training.optim.hypernet_learning_rate}
-        * Quantizer Learning rate: {self.config.training.optim.quantizer_learning_rate}
-        * Batch size: {self.config.data.dataloader.train_batch_size}
-        * Gradient accumulation steps: {self.config.training.gradient_accumulation_steps}
-        * Image resolution: {self.config.model.unet.resolution}
-        * Mixed-precision: {self.config.mixed_precision}
-    
-        """
+            # Text-to-image finetuning - {repo_id}
+        
+            This pipeline was pruned from **{self.config.pretrained_model_name_or_path}** on the **{self.config.data.dataset_name}** dataset. Below are some example images generated with the finetuned pipeline using the following prompts: {self.config.data.prompts}: \n
+            {img_str}
+        
+            ## Pipeline usage
+        
+            You can use the pipeline like so:
+        
+            ```python
+            from diffusers import DiffusionPipeline
+            import torch
+        
+            pipeline = DiffusionPipeline.from_pretrained("{repo_id}", torch_dtype=torch.float16)
+            prompt = "{self.config.data.prompts[0]}"
+            image = pipeline(prompt).images[0]
+            image.save("my_image.png")
+            ```
+        
+            ## Training info
+        
+            These are the key hyperparameters used during training:
+        
+            * Epochs: {self.config.training.num_train_epochs}
+            * Hypernet Learning rate: {self.config.training.optim.hypernet_learning_rate}
+            * Quantizer Learning rate: {self.config.training.optim.quantizer_learning_rate}
+            * Batch size: {self.config.data.dataloader.train_batch_size}
+            * Gradient accumulation steps: {self.config.training.gradient_accumulation_steps}
+            * Image resolution: {self.config.model.unet.resolution}
+            * Mixed-precision: {self.config.mixed_precision}
+        
+            """
         wandb_info = ""
         if is_wandb_available():
             wandb_run_url = None
@@ -1153,8 +1170,8 @@ class DiffPruningTrainer:
 
         if self.config.wandb_run_url is not None:
             wandb_info = f"""
-        More information on all the CLI arguments and the environment are available on your [`wandb` run page]({self.config.wandb_run_url}).
-        """
+            More information on all the CLI arguments and the environment are available on your [`wandb` run page]({self.config.wandb_run_url}).
+            """
 
         model_card += wandb_info
 
