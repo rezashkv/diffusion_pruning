@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pdm.utils.estimation_utils import hard_concrete
 
 
 class ClipLoss(nn.Module):
@@ -30,7 +31,8 @@ class ClipLoss(nn.Module):
 
         # Multiply the slice of the arch_vectors defined by the start and end index of the width of the block with the
         # corresponding depth element of the arch_vectors.
-        arch_vectors_clone = arch_vectors.clone()
+        arch_vectors_clone = hard_concrete(arch_vectors.clone())
+
         for i, elem in enumerate(self.depth_list):
             if elem != 0:
                 arch_vectors_clone[:, self.width_intervals[i][0]:self.width_intervals[i][1]] = (
