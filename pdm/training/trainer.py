@@ -50,12 +50,13 @@ class DiffPruningTrainer:
                  train_dataset: Dataset,
                  preprocess_train: Optional[Callable] = None,
                  preprocess_eval: Optional[Callable] = None,
+                 preprocess_prompts: Optional[Callable] = None,
                  data_collator: Optional[DataCollator] = None,
+                 prompts_collator: Optional[DataCollator] = None,
                  ema_unet: nn.Module = None,
                  eval_dataset: Dataset = None,
                  tokenizer: Optional[PreTrainedTokenizerBase] = None,
                  optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
-                 prompt_embeddings: Optional[list] = None,
                  ):
 
         self.config = config
@@ -70,12 +71,11 @@ class DiffPruningTrainer:
         self.clip_loss = clip_loss
         self.resource_loss = resource_loss
         self.eval_dataset = eval_dataset
-        self.prepare_datasets(preprocess_train, preprocess_eval)
+        self.prepare_datasets(preprocess_train, preprocess_eval, preprocess_prompts)
         self.tokenizer = tokenizer
         self.configure_logging()
-        self.prompt_embeddings = prompt_embeddings
 
-        self.create_repo()
+        self.create_logging_dir()
 
         if config.use_ema:
             self.ema_unet = ema_unet
@@ -83,7 +83,8 @@ class DiffPruningTrainer:
             self.init_accelerate_customized_saving_hooks()
 
         (self.train_dataloader, self.eval_dataloader,
-         self.prompt_dataloader, self.quantizer_embeddings_dataloader) = self.initialize_dataloaders(data_collator)
+         self.prompt_dataloader, self.quantizer_embeddings_dataloader) = self.initialize_dataloaders(data_collator,
+                                                                                                     prompts_collator)
 
         self.overrode_max_train_steps = False
         self.update_config_params()
@@ -116,17 +117,6 @@ class DiffPruningTrainer:
             log_with=self.config.training.logging.report_to,
             project_config=accelerator_project_config,
         )
-
-    def configure_logging(self):
-        logger.info(self.accelerator.state, main_process_only=False)
-        if self.accelerator.is_local_main_process:
-            set_verbosity_warning()
-            transformers.utils.logging.set_verbosity_warning()
-            diffusers.utils.logging.set_verbosity_info()
-        else:
-            set_verbosity_error()
-            transformers.utils.logging.set_verbosity_error()
-            diffusers.utils.logging.set_verbosity_error()
 
     def init_accelerate_customized_saving_hooks(self):
 
@@ -182,6 +172,46 @@ class DiffPruningTrainer:
         self.accelerator.register_save_state_pre_hook(save_model_hook)
         self.accelerator.register_load_state_pre_hook(load_model_hook)
 
+    def init_trackers(self, resume=False):
+        # We need to initialize the trackers we use, and also store our configuration.
+        # The trackers initialize automatically on the main process.
+        if self.accelerator.is_main_process:
+            def cfg2dict(cfg: DictConfig) -> Dict:
+                """
+                Recursively convert OmegaConf to vanilla dict
+                :param cfg:
+                :return:
+                """
+                cfg_dict = {}
+                for k, v in cfg.items():
+                    if type(v) == DictConfig:
+                        cfg_dict[k] = cfg2dict(v)
+                    else:
+                        cfg_dict[k] = v
+                return cfg_dict
+
+            tracker_config = cfg2dict(self.config)
+            if self.config.wandb_run_name is None:
+                self.config.wandb_run_name = (
+                    f"{self.config.data.dataset_name if self.config.data.dataset_name else self.config.data.data_dir.split('/')[-1]}-"
+                    f"{self.config.data.max_train_samples}-steps:{self.config.training.max_train_steps}-"
+                    f"h_lr:{self.config.training.optim.hypernet_learning_rate}-"
+                    f"q_lr:{self.config.training.optim.quantizer_learning_rate}")
+            self.accelerator.init_trackers(self.config.tracker_project_name, tracker_config,
+                                           init_kwargs={"wandb": {"name": self.config.wandb_run_name,
+                                                                  "resume": resume}})
+
+    def configure_logging(self):
+        logger.info(self.accelerator.state, main_process_only=False)
+        if self.accelerator.is_local_main_process:
+            set_verbosity_warning()
+            transformers.utils.logging.set_verbosity_warning()
+            diffusers.utils.logging.set_verbosity_info()
+        else:
+            set_verbosity_error()
+            transformers.utils.logging.set_verbosity_error()
+            diffusers.utils.logging.set_verbosity_error()
+
     def prepare_with_accelerator(self):
         # Prepare everything with our `accelerator`.
         if self.eval_dataloader is not None:
@@ -204,7 +234,26 @@ class DiffPruningTrainer:
         if self.config.use_ema:
             self.ema_unet.to(self.accelerator.device)
 
-    def prepare_datasets(self, preprocess_train, preprocess_eval):
+    def init_prompts(self):
+        if os.path.isfile(self.config.data.prompts[0]):
+            with open(self.config.data.prompts[0], "r") as f:
+                self.config.data.prompts = [line.strip() for line in f.readlines()]
+        elif os.path.isdir(self.config.data.prompts[0]):
+            validation_prompts_dir = self.config.data.prompts[0]
+            prompts = []
+            for d in validation_prompts_dir:
+                files = [os.path.join(d, caption_file) for caption_file in os.listdir(d) if f.endswith(".txt")]
+                for f in files:
+                    with open(f, "r") as f:
+                        prompts.extend([line.strip() for line in f.readlines()])
+
+            self.config.data.prompts = prompts
+
+        if self.config.data.max_generated_samples is not None:
+            self.config.data.prompts = self.config.data.prompts[
+                                       :self.config.data.max_generated_samples]
+
+    def prepare_datasets(self, preprocess_train, preprocess_eval, preprocess_prompts):
         with self.accelerator.main_process_first():
             if self.config.data.max_train_samples is not None:
                 self.train_dataset = self.train_dataset.select(
@@ -218,6 +267,52 @@ class DiffPruningTrainer:
                         range(self.config.data.max_validation_samples))
                     # Set the validation transforms
                 self.eval_dataset = self.eval_dataset.with_transform(preprocess_eval)
+
+            if self.config.data.prompts is not None:
+                self.prompt_dataset = Dataset.from_dict({"prompts": self.config.data.prompts}).with_transform(
+                    preprocess_prompts)
+
+    def initialize_dataloaders(self, data_collate_fn, prompts_collate_fn):
+        train_dataloader = torch.utils.data.DataLoader(
+            self.train_dataset,
+            shuffle=True,
+            collate_fn=data_collate_fn,
+            batch_size=self.config.data.dataloader.train_batch_size,
+            num_workers=self.config.data.dataloader.dataloader_num_workers,
+        )
+
+        if self.eval_dataset is not None:
+            eval_dataloader = torch.utils.data.DataLoader(
+                self.eval_dataset,
+                shuffle=False,
+                collate_fn=data_collate_fn,
+                batch_size=self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes,
+                num_workers=self.config.data.dataloader.dataloader_num_workers,
+            )
+        else:
+            eval_dataloader = None
+
+        if self.config.data.prompts is None:
+            self.config.data.prompts = []
+
+        # create a torch dataloader from given prompts
+        prompt_dataloader = torch.utils.data.DataLoader(self.prompt_dataset,
+                                                        batch_size=self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes,
+                                                        shuffle=False,
+                                                        collate_fn=prompts_collate_fn,
+                                                        num_workers=self.config.data.dataloader.dataloader_num_workers)
+
+        if hasattr(self.quantizer, "module"):
+            n_e = self.quantizer.module.n_e
+        else:
+            n_e = self.quantizer.n_e
+
+        q_embedding_dataloader = torch.utils.data.DataLoader(torch.arange(n_e),
+                                                             batch_size=self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes,
+                                                             shuffle=False,
+                                                             num_workers=self.config.data.dataloader.dataloader_num_workers)
+
+        return train_dataloader, eval_dataloader, prompt_dataloader, q_embedding_dataloader
 
     def initialize_optimizer(self):
         if self.config.training.optim.scale_lr:
@@ -259,54 +354,6 @@ class DiffPruningTrainer:
         )
         return optimizer
 
-    def initialize_dataloaders(self, collate_fn):
-        train_dataloader = torch.utils.data.DataLoader(
-            self.train_dataset,
-            shuffle=True,
-            collate_fn=collate_fn,
-            batch_size=self.config.data.dataloader.train_batch_size,
-            num_workers=self.config.data.dataloader.dataloader_num_workers,
-        )
-
-        if self.eval_dataset is not None:
-            eval_dataloader = torch.utils.data.DataLoader(
-                self.eval_dataset,
-                shuffle=False,
-                collate_fn=collate_fn,
-                batch_size=self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes,
-                num_workers=self.config.data.dataloader.dataloader_num_workers,
-            )
-        else:
-            eval_dataloader = None
-
-        if self.config.data.prompts is None:
-            self.config.data.prompts = []
-
-        # create a torch dataloader from self.config.data.prompts
-        prompt_dataloader = torch.utils.data.DataLoader(self.config.data.prompts,
-                                                        batch_size=self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes,
-                                                        shuffle=False,
-                                                        num_workers=self.config.data.dataloader.dataloader_num_workers)
-
-        if hasattr(self.quantizer, "module"):
-            n_e = self.quantizer.module.n_e
-        else:
-            n_e = self.quantizer.n_e
-
-        q_embedding_dataloader = torch.utils.data.DataLoader(torch.arange(n_e),
-                                                             batch_size=self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes,
-                                                             shuffle=False,
-                                                             num_workers=self.config.data.dataloader.dataloader_num_workers)
-
-        return train_dataloader, eval_dataloader, prompt_dataloader, q_embedding_dataloader
-
-    def update_config_params(self):
-        self.num_update_steps_per_epoch = math.ceil(
-            len(self.train_dataloader) / self.config.training.gradient_accumulation_steps)
-        if self.config.training.max_train_steps is None:
-            self.config.training.max_train_steps = self.config.training.num_train_epochs * self.num_update_steps_per_epoch
-            self.overrode_max_train_steps = True
-
     def initialize_lr_scheduler(self):
         lr_scheduler = get_scheduler(
             self.config.training.optim.lr_scheduler,
@@ -316,53 +363,12 @@ class DiffPruningTrainer:
         )
         return lr_scheduler
 
-    def init_trackers(self, resume=False):
-        # We need to initialize the trackers we use, and also store our configuration.
-        # The trackers initialize automatically on the main process.
-        if self.accelerator.is_main_process:
-            def cfg2dict(cfg: DictConfig) -> Dict:
-                """
-                Recursively convert OmegaConf to vanilla dict
-                :param cfg:
-                :return:
-                """
-                cfg_dict = {}
-                for k, v in cfg.items():
-                    if type(v) == DictConfig:
-                        cfg_dict[k] = cfg2dict(v)
-                    else:
-                        cfg_dict[k] = v
-                return cfg_dict
-
-            tracker_config = cfg2dict(self.config)
-            if self.config.wandb_run_name is None:
-                self.config.wandb_run_name = (
-                    f"{self.config.data.dataset_name if self.config.data.dataset_name else self.config.data.data_dir.split('/')[-1]}-"
-                    f"{self.config.data.max_train_samples}-steps:{self.config.training.max_train_steps}-"
-                    f"h_lr:{self.config.training.optim.hypernet_learning_rate}-"
-                    f"q_lr:{self.config.training.optim.quantizer_learning_rate}")
-            self.accelerator.init_trackers(self.config.tracker_project_name, tracker_config,
-                                           init_kwargs={"wandb": {"name": self.config.wandb_run_name,
-                                                                  "resume": resume}})
-
-    def init_prompts(self):
-        if os.path.isfile(self.config.data.prompts[0]):
-            with open(self.config.data.prompts[0], "r") as f:
-                self.config.data.prompts = [line.strip() for line in f.readlines()]
-        elif os.path.isdir(self.config.data.prompts[0]):
-            validation_prompts_dir = self.config.data.prompts[0]
-            prompts = []
-            for d in validation_prompts_dir:
-                files = [os.path.join(d, caption_file) for caption_file in os.listdir(d) if f.endswith(".txt")]
-                for f in files:
-                    with open(f, "r") as f:
-                        prompts.extend([line.strip() for line in f.readlines()])
-
-            self.config.data.prompts = prompts
-
-        if self.config.data.max_generated_samples is not None:
-            self.config.data.prompts = self.config.data.prompts[
-                                       :self.config.data.max_generated_samples]
+    def update_config_params(self):
+        self.num_update_steps_per_epoch = math.ceil(
+            len(self.train_dataloader) / self.config.training.gradient_accumulation_steps)
+        if self.config.training.max_train_steps is None:
+            self.config.training.max_train_steps = self.config.training.num_train_epochs * self.num_update_steps_per_epoch
+            self.overrode_max_train_steps = True
 
     def save_checkpoint(self, logging_dir, global_step):
         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
@@ -488,8 +494,6 @@ class DiffPruningTrainer:
                 train_loss = 0.0
                 self.hyper_net.train()
                 self.quantizer.train()
-                # self.unet.reset_flops_count()
-                # with self.accelerator.accumulate(self.unet):
                 # Convert images to latent space
                 latents = self.vae.encode(batch["pixel_values"].to(self.weight_dtype)).latent_dist.sample()
                 latents = latents * self.vae.config.scaling_factor
@@ -656,20 +660,20 @@ class DiffPruningTrainer:
                     progress_bar.update(1)
                     global_step += 1
                     log_dict = {
-                        "train/loss": train_loss,
-                        "train/diffusion_loss": diff_loss,
-                        "train/resource_loss": resource_loss.detach().item(),
-                        "train/commitment_loss": q_loss.detach().item(),
-                        "train/contrastive_loss": contrastive_loss.detach().item(),
-                        "train/hyper_net_lr": self.lr_scheduler.get_last_lr()[0],
-                        "train/quantizer_lr": self.lr_scheduler.get_last_lr()[1],
-                        "train/resource_ratio": resource_ratio.detach().item(),
+                        "training/loss": train_loss,
+                        "training/diffusion_loss": diff_loss,
+                        "training/resource_loss": resource_loss.detach().item(),
+                        "training/commitment_loss": q_loss.detach().item(),
+                        "training/contrastive_loss": contrastive_loss.detach().item(),
+                        "training/hyper_net_lr": self.lr_scheduler.get_last_lr()[0],
+                        "training/quantizer_lr": self.lr_scheduler.get_last_lr()[1],
+                        "training/resource_ratio": resource_ratio.detach().item(),
                     }
                     for k, v in flops_dict.items():
                         if isinstance(v, torch.Tensor):
-                            log_dict[f"train/{k}"] = v.detach().mean().item()
+                            log_dict[f"training/{k}"] = v.detach().mean().item()
                         else:
-                            log_dict[f"train/{k}"] = v
+                            log_dict[f"training/{k}"] = v
 
                     log_dict["images/arch vector pairwise similarity image"] = wandb.Image(arch_vectors_similarity)
                     self.accelerator.log(log_dict)
@@ -742,9 +746,8 @@ class DiffPruningTrainer:
         self.hyper_net.eval()
         self.quantizer.eval()
         self.unet.eval()
+        total_val_loss, total_diff_loss, total_q_loss, total_c_loss, total_r_loss = 0.0, 0.0, 0.0, 0.0, 0.0
         for step, batch in enumerate(self.eval_dataloader):
-            # self.unet.reset_flops_count()
-            # with self.accelerator.split_between_processes(batch) as batch:
             batch = {k: v.to(self.accelerator.device) for k, v in batch.items()}
             with torch.no_grad():
                 # Convert images to latent space
@@ -856,77 +859,135 @@ class DiffPruningTrainer:
                 loss += self.config.training.losses.contrastive_clip_loss.weight * contrastive_loss
 
                 # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = self.accelerator.gather(
-                    loss.repeat(self.config.data.dataloader.validation_batch_size)).mean()
-                val_loss = avg_loss.item()
+                total_val_loss = self.accelerator.gather(
+                    loss.repeat(self.config.data.dataloader.validation_batch_size)).detach().mean().item()
+                total_diff_loss += self.accelerator.gather(
+                    diff_loss.repeat(self.config.data.dataloader.validation_batch_size)).detach().mean().item()
+                total_q_loss += self.accelerator.gather(
+                    q_loss.repeat(self.config.data.dataloader.validation_batch_size)).detach().mean().item()
+                total_c_loss += self.accelerator.gather(
+                    contrastive_loss.repeat(self.config.data.dataloader.validation_batch_size)).detach().mean().item()
+                total_r_loss += self.accelerator.gather(
+                    resource_loss.repeat(self.config.data.dataloader.validation_batch_size)).detach().mean().item()
+
                 progress_bar.update(1)
 
-            self.accelerator.log({
-                "validation/loss": val_loss,
-                "validation/diffusion_loss": self.accelerator.gather(
-                    diff_loss.detach().repeat(self.config.data.dataloader.validation_batch_size)).mean(),
-                "validation/resource_loss": self.accelerator.gather(
-                    resource_loss.detach().repeat(self.config.data.dataloader.validation_batch_size)).mean(),
-                "validation/commitment_loss": self.accelerator.gather(
-                    q_loss.detach().repeat(self.config.data.dataloader.validation_batch_size)).mean(),
-                "validation/contrastive_loss": self.accelerator.gather(
-                    contrastive_loss.detach().repeat(self.config.data.dataloader.validation_batch_size)).mean(),
-            })
+        total_val_loss /= len(self.eval_dataloader)
+        total_diff_loss /= len(self.eval_dataloader)
+        total_q_loss /= len(self.eval_dataloader)
+        total_c_loss /= len(self.eval_dataloader)
+        total_r_loss /= len(self.eval_dataloader)
 
-            logs = {"val diff_loss": diff_loss,
-                    "val q_loss": q_loss.detach().item(), "val c_loss": contrastive_loss.detach().item(),
-                    "val r_loss": resource_loss.detach().item()}
-            progress_bar.set_postfix(**logs)
+        self.accelerator.log({
+            "validation/loss": total_val_loss,
+            "validation/diffusion_loss": total_diff_loss,
+            "validation/resource_loss": total_r_loss,
+            "validation/commitment_loss": total_q_loss,
+            "validation/contrastive_loss": total_c_loss,
+        },
+            log_kwargs={"wandb": {"commit": False}})
 
-            torch.cuda.empty_cache()
+        del loss, diff_loss, q_loss, contrastive_loss, resource_loss
+        torch.cuda.empty_cache()
 
-    def create_repo(self):
-        logging_dir = self.config.training.logging.logging_dir
-        # Handle the repository creation
+    @torch.no_grad()
+    def generate_samples_from_prompts(self, global_step):
+        logger.info("Generating samples from the given prompts... ")
+
+        pipeline = self.get_pipeline()
+
+        image_output_dir = os.path.join(self.config.training.logging.logging_dir, "prompt_images",
+                                        f"step_{global_step}")
+        os.makedirs(image_output_dir, exist_ok=True)
+        images = []
+        embedding_indices = []
+
+        for step, batch in enumerate(self.prompt_dataloader):
+            with torch.autocast("cuda"):
+                if self.config.seed is None:
+                    generator = None
+                else:
+                    generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
+                gen_images, batch_embedding_indices = pipeline(batch["prompts"],
+                                                               num_inference_steps=self.config.training.num_inference_steps,
+                                                               generator=generator, output_type="pt",
+                                                               return_mapped_indices=True,
+                                                               hyper_net_input=batch["mpnet_embeddings"]
+                                                               )
+                gen_images = gen_images.images
+                gen_images = self.accelerator.gather_for_metrics(gen_images)
+                batch_embedding_indices = self.accelerator.gather_for_metrics(batch_embedding_indices)
+                images += gen_images
+                embedding_indices += batch_embedding_indices
+
+        min_encoding_indices_image = create_image_grid_from_indices([x.item() for x in embedding_indices],
+                                                                    grid_size=(4, len(images) // 4))
+        images = [torchvision.transforms.ToPILImage()(img) for img in images]
+        images = make_image_grid(images, len(images) // 4, 4)
+
         if self.accelerator.is_main_process:
-            if self.config.training.logging.logging_dir is not None:
-                os.makedirs(self.config.training.logging.logging_dir, exist_ok=True)
+            images.save(os.path.join(image_output_dir, "prompt_images.png"))
+            min_encoding_indices_image.save(os.path.join(image_output_dir, "min_encoding_indices.png"))
 
-                # dump the args to a yaml file
-                logging.info("Project config")
-                print(OmegaConf.to_yaml(self.config))
-                OmegaConf.save(self.config, os.path.join(self.config.training.logging.logging_dir, "config.yaml"))
-
-            if self.config.training.hf_hub.push_to_hub:
-                self.repo_id = create_repo(
-                    repo_id=self.config.training.hf_hub.hub_model_id or Path(logging_dir).name, exist_ok=True,
-                    token=self.config.training.hf_hub.hub_token
-                ).repo_id
-
-    def get_pipeline(self):
-        self.init_weight_dtype()
-        # Move text_encode and vae to gpu and cast to weight_dtype
-        self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
-        self.vae.to(self.accelerator.device, dtype=self.weight_dtype)
-        if len(self.accelerator.trackers) == 0:
-            self.init_trackers()
-
-        self.hyper_net.eval()
-        self.quantizer.eval()
-        pipeline = StableDiffusionPruningPipeline.from_pretrained(
-            self.config.pretrained_model_name_or_path,
-            vae=self.accelerator.unwrap_model(self.vae),
-            text_encoder=self.accelerator.unwrap_model(self.text_encoder),
-            tokenizer=self.tokenizer,
-            unet=self.accelerator.unwrap_model(self.unet),
-            safety_checker=None,
-            revision=self.config.revision,
-            torch_dtype=self.weight_dtype,
-            hyper_net=self.hyper_net,
-            quantizer=self.quantizer,
+        self.accelerator.log(
+            {
+                "images/prompt images": wandb.Image(images),
+                "images/min encoding indices": wandb.Image(min_encoding_indices_image)
+            },
+            log_kwargs={"wandb": {"commit": False}}
         )
 
-        pipeline = pipeline.to(self.accelerator.device)
-        pipeline.set_progress_bar_config(disable=not self.accelerator.is_main_process)
+        del pipeline
+        torch.cuda.empty_cache()
 
-        if self.config.enable_xformers_memory_efficient_attention:
-            pipeline.enable_xformers_memory_efficient_attention()
-        return pipeline
+        return images
+
+    @torch.no_grad()
+    def log_quantizer_embedding_samples(self, step):
+        logger.info("Sampling from quantizer... ")
+
+        pipeline = self.get_pipeline()
+
+        image_output_dir = os.path.join(self.config.training.logging.logging_dir, "quantizer_embedding_images",
+                                        f"step_{step}")
+        os.makedirs(image_output_dir, exist_ok=True)
+
+        images = []
+
+        quantizer_embedding_gumbel_sigmoid = []
+
+        for step, indices in enumerate(self.quantizer_embeddings_dataloader):
+            with torch.autocast("cuda"):
+                if self.config.seed is None:
+                    generator = None
+                else:
+                    generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
+
+                gen_images, quantizer_embed_gs = pipeline.quantizer_samples(indices=indices,
+                                                                            num_inference_steps=self.config.training.num_inference_steps,
+                                                                            generator=generator, output_type="pt")
+                gen_images = gen_images.images
+                gen_images = self.accelerator.gather_for_metrics(gen_images)
+                quantizer_embed_gs = self.accelerator.gather_for_metrics(quantizer_embed_gs)
+                quantizer_embedding_gumbel_sigmoid += quantizer_embed_gs
+                images += gen_images
+
+        quantizer_embedding_gumbel_sigmoid = torch.cat(quantizer_embedding_gumbel_sigmoid, dim=0)
+        images = [torchvision.transforms.ToPILImage()(img) for img in images]
+        images = make_image_grid(images, len(images) // 4, 4)
+
+        if self.accelerator.is_main_process:
+            images.save(os.path.join(image_output_dir, "quantizer_embedding_images.png"))
+            torch.save(quantizer_embedding_gumbel_sigmoid, os.path.join(image_output_dir,
+                                                                        "quantizer_embeddings_gumbel_sigmoid.pt"))
+
+        self.accelerator.log({"images/quantizer embedding images": wandb.Image(images)},
+                             log_kwargs={"wandb": {"commit": False}})
+
+        del pipeline
+        torch.cuda.empty_cache()
+
+        return images
 
     @torch.no_grad()
     def depth_analysis(self):
@@ -1006,102 +1067,53 @@ class DiffPruningTrainer:
         torch.cuda.empty_cache()
         return gen_images
 
-    @torch.no_grad()
-    def generate_samples_from_prompts(self, global_step):
-        logger.info("Generating samples from the given prompts... ")
-
-        pipeline = self.get_pipeline()
-
-        image_output_dir = os.path.join(self.config.training.logging.logging_dir, "prompt_images",
-                                        f"step_{global_step}")
-        os.makedirs(image_output_dir, exist_ok=True)
-        images = []
-        embedding_indices = []
-
-        for step, batch in enumerate(self.prompt_dataloader):
-            with torch.autocast("cuda"):
-                if self.config.seed is None:
-                    generator = None
-                else:
-                    generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
-                gen_images, batch_embedding_indices = pipeline(batch,
-                                                               num_inference_steps=self.config.training.num_inference_steps,
-                                                               generator=generator, output_type="pt",
-                                                               return_mapped_indices=True,
-                                                               hyper_net_input=self.prompt_embeddings
-                                                               )
-                gen_images = gen_images.images
-                gen_images = self.accelerator.gather_for_metrics(gen_images)
-                batch_embedding_indices = self.accelerator.gather_for_metrics(batch_embedding_indices)
-                images += gen_images
-                embedding_indices += batch_embedding_indices
-
-        min_encoding_indices_image = create_image_grid_from_indices([x.item() for x in embedding_indices],
-                                                                    grid_size=(4, len(images) // 4))
-        images = [torchvision.transforms.ToPILImage()(img) for img in images]
-        images = make_image_grid(images, len(images) // 4, 4)
-
+    def create_logging_dir(self):
+        logging_dir = self.config.training.logging.logging_dir
+        # Handle the repository creation
         if self.accelerator.is_main_process:
-            images.save(os.path.join(image_output_dir, "prompt_images.png"))
-            min_encoding_indices_image.save(os.path.join(image_output_dir, "min_encoding_indices.png"))
+            if self.config.training.logging.logging_dir is not None:
+                os.makedirs(self.config.training.logging.logging_dir, exist_ok=True)
 
-        self.accelerator.log(
-            {
-                "images/prompt images": wandb.Image(images),
-                "images/min encoding indices": wandb.Image(min_encoding_indices_image)
-            },
+                # dump the args to a yaml file
+                logging.info("Project config")
+                print(OmegaConf.to_yaml(self.config))
+                OmegaConf.save(self.config, os.path.join(self.config.training.logging.logging_dir, "config.yaml"))
+
+            if self.config.training.hf_hub.push_to_hub:
+                self.repo_id = create_repo(
+                    repo_id=self.config.training.hf_hub.hub_model_id or Path(logging_dir).name, exist_ok=True,
+                    token=self.config.training.hf_hub.hub_token
+                ).repo_id
+
+    def get_pipeline(self):
+        self.init_weight_dtype()
+        # Move text_encode and vae to gpu and cast to weight_dtype
+        self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
+        self.vae.to(self.accelerator.device, dtype=self.weight_dtype)
+        if len(self.accelerator.trackers) == 0:
+            self.init_trackers()
+
+        self.hyper_net.eval()
+        self.quantizer.eval()
+        pipeline = StableDiffusionPruningPipeline.from_pretrained(
+            self.config.pretrained_model_name_or_path,
+            vae=self.accelerator.unwrap_model(self.vae),
+            text_encoder=self.accelerator.unwrap_model(self.text_encoder),
+            tokenizer=self.tokenizer,
+            unet=self.accelerator.unwrap_model(self.unet),
+            safety_checker=None,
+            revision=self.config.revision,
+            torch_dtype=self.weight_dtype,
+            hyper_net=self.hyper_net,
+            quantizer=self.quantizer,
         )
 
-        del pipeline
-        torch.cuda.empty_cache()
+        pipeline = pipeline.to(self.accelerator.device)
+        pipeline.set_progress_bar_config(disable=not self.accelerator.is_main_process)
 
-        return images
-
-    @torch.no_grad()
-    def log_quantizer_embedding_samples(self, step):
-        logger.info("Sampling from quantizer... ")
-
-        pipeline = self.get_pipeline()
-
-        image_output_dir = os.path.join(self.config.training.logging.logging_dir, "quantizer_embedding_images",
-                                        f"step_{step}")
-        os.makedirs(image_output_dir, exist_ok=True)
-
-        images = []
-
-        quantizer_embedding_gumbel_sigmoid = []
-
-        for step, indices in enumerate(self.quantizer_embeddings_dataloader):
-            with torch.autocast("cuda"):
-                if self.config.seed is None:
-                    generator = None
-                else:
-                    generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
-
-                gen_images, quantizer_embed_gs = pipeline.quantizer_samples(indices=indices,
-                                                                            num_inference_steps=self.config.training.num_inference_steps,
-                                                                            generator=generator, output_type="pt")
-                gen_images = gen_images.images
-                gen_images = self.accelerator.gather_for_metrics(gen_images)
-                quantizer_embed_gs = self.accelerator.gather_for_metrics(quantizer_embed_gs)
-                quantizer_embedding_gumbel_sigmoid += quantizer_embed_gs
-                images += gen_images
-
-        quantizer_embedding_gumbel_sigmoid = torch.cat(quantizer_embedding_gumbel_sigmoid, dim=0)
-        images = [torchvision.transforms.ToPILImage()(img) for img in images]
-        images = make_image_grid(images, len(images) // 4, 4)
-
-        if self.accelerator.is_main_process:
-            images.save(os.path.join(image_output_dir, "quantizer_embedding_images.png"))
-            torch.save(quantizer_embedding_gumbel_sigmoid, os.path.join(image_output_dir,
-                                                                        "quantizer_embeddings_gumbel_sigmoid.pt"))
-
-        self.accelerator.log({"images/quantizer embedding images": wandb.Image(images)})
-
-        del pipeline
-        torch.cuda.empty_cache()
-
-        return images
+        if self.config.enable_xformers_memory_efficient_attention:
+            pipeline.enable_xformers_memory_efficient_attention()
+        return pipeline
 
     def save_model_card(
             self,

@@ -427,6 +427,10 @@ def main():
         examples["mpnet_embeddings"] = get_mpnet_embeddings(examples[caption_column], is_train=False)
         return examples
 
+    def preprocess_prompts(examples):
+        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples["prompts"], is_train=False)
+        return examples
+
     def collate_fn(examples):
         examples = [example for example in examples if example["pixel_values"] is not None]
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
@@ -436,10 +440,14 @@ def main():
         mpnet_embeddings = mpnet_embeddings.to(memory_format=torch.contiguous_format).float()
         return {"pixel_values": pixel_values, "input_ids": input_ids, "mpnet_embeddings": mpnet_embeddings}
 
+    def prompts_collate_fn(examples):
+        prompts = [example["prompts"] for example in examples]
+        prompt_embdeddings = torch.stack([example["mpnet_embeddings"] for example in examples])
+        prompt_embdeddings = prompt_embdeddings.to(memory_format=torch.contiguous_format).float()
+        return {"prompts": prompts, "mpnet_embeddings": prompt_embdeddings}
+
     if config.data.prompts is None:
         config.data.prompts = dataset["validation"][caption_column][:config.data.max_generated_samples]
-
-    prompt_embeddings = get_mpnet_embeddings(config.data.prompts, is_train=False)
 
     del args, data_dir, data_files, dataset_config_name, dataset_name, dataset_columns, \
         train_data_dir, train_data_file, train_bad_images_path, max_train_samples, validation_data_dir, \
@@ -457,11 +465,12 @@ def main():
                                  train_dataset=dataset["train"],
                                  preprocess_train=preprocess_train,
                                  preprocess_eval=preprocess_validation,
+                                 preprocess_prompts=preprocess_prompts,
                                  data_collator=collate_fn,
+                                 prompts_collator=prompts_collate_fn,
                                  ema_unet=ema_unet,
                                  eval_dataset=dataset["validation"],
                                  tokenizer=tokenizer,
-                                 prompt_embeddings=prompt_embeddings,
                                  )
 
     trainer.train()
