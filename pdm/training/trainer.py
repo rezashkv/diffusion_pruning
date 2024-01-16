@@ -494,153 +494,17 @@ class DiffPruningTrainer:
                 train_loss = 0.0
                 self.hyper_net.train()
                 self.quantizer.train()
-                # Convert images to latent space
-                latents = self.vae.encode(batch["pixel_values"].to(self.weight_dtype)).latent_dist.sample()
-                latents = latents * self.vae.config.scaling_factor
-
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                if self.config.model.unet.noise_offset:
-                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                    noise += self.config.model.unet.noise_offset * torch.randn(
-                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
-                    )
-                if self.config.model.unet.input_perturbation:
-                    new_noise = noise + self.config.model.unet.input_perturbation * torch.randn_like(noise)
-                bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,),
-                                          device=latents.device)
-                timesteps = timesteps.long()
-
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                if self.config.model.unet.input_perturbation:
-                    noisy_latents = self.noise_scheduler.add_noise(latents, new_noise, timesteps)
-                else:
-                    noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
-
-                # Get the text embedding for conditioning
-                encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
-                text_embeddings = batch["mpnet_embeddings"]
-
-                arch_vector = self.hyper_net(text_embeddings)
-                arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
 
                 # Calculating the MACs of each module of the model in the first iteration.
                 if global_step == initial_global_step:
-                    with torch.no_grad():
-                        if self.accelerator.num_processes > 1:
-                            arch_vecs_separated = self.hyper_net.module.transform_structure_vector(
-                                torch.ones((1, self.quantizer.module.vq_embed_dim),
-                                           device=arch_vector_quantized.device))
-                        else:
-                            arch_vecs_separated = self.hyper_net.transform_structure_vector(
-                                torch.ones((1, self.quantizer.vq_embed_dim), device=arch_vector_quantized.device))
-                        self.unet.set_structure(arch_vecs_separated)
-                        flops, params = count_ops_and_params(self.unet,
-                                                             {'sample': noisy_latents[0].unsqueeze(0),
-                                                              'timestep': timesteps[0].unsqueeze(0),
-                                                              'encoder_hidden_states': encoder_hidden_states[
-                                                                  0].unsqueeze(0)})
+                    self.count_flops(batch)
 
-                        logger.info(
-                            "UNet's Params/MACs calculated by OpCounter:\tparams: {:.3f}M\t MACs: {:.3f}G".format(
-                                params / 1e6, flops / 1e9))
-                        sanity_flops_dict = self.unet.calc_flops()
-                        self.unet.resource_info_dict = sanity_flops_dict
-                        sanity_string = "Our MACs calculation:\t"
-                        for k, v in sanity_flops_dict.items():
-                            if isinstance(v, torch.Tensor):
-                                sanity_string += f" {k}: {v.item() / 1e9:.3f}\t"
-                            else:
-                                sanity_string += f" {k}: {v / 1e9:.3f}\t"
-                        logger.info(sanity_string)
+                # pruning target is for total flops. we calculate loss for prunable flops.
+                if global_step == 0:
+                    self.update_pruning_target()
 
-                        # pruning target is for total flops. we calculate loss for prunable flops.
-                        if global_step == 0:
-                            p = self.config.training.losses.resource_loss.pruning_target
-                            p_actual = (1 - (1 - p) * self.unet.resource_info_dict['total_flops'] /
-                                        self.unet.resource_info_dict['cur_prunable_flops']).item()
-                            self.resource_loss.p = p_actual
-
-                # gather the arch_vector_quantized across all processes to get large batch for contrastive loss
-                if self.accelerator.num_processes > 1:
-                    with torch.no_grad():
-                        text_embeddings_list = [torch.zeros_like(text_embeddings) for _ in
-                                                range(self.accelerator.num_processes)]
-                        arch_vector_quantized_list = [torch.zeros_like(arch_vector_quantized) for _ in
-                                                      range(self.accelerator.num_processes)]
-                        torch.distributed.all_gather(text_embeddings_list, text_embeddings)
-                        torch.distributed.all_gather(arch_vector_quantized_list, arch_vector_quantized)
-                    text_embeddings_list[self.accelerator.process_index] = text_embeddings
-                    arch_vector_quantized_list[self.accelerator.process_index] = arch_vector_quantized
-                    text_embeddings_list = torch.cat(text_embeddings_list, dim=0)
-                    arch_vector_quantized_list = torch.cat(arch_vector_quantized_list, dim=0)
-
-                    arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
-
-                else:
-                    text_embeddings_list = self.accelerator.gather(text_embeddings)
-                    arch_vector_quantized_list = self.accelerator.gather(arch_vector_quantized)
-
-                    arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
-
-                contrastive_loss, arch_vectors_similarity = self.clip_loss(text_embeddings_list,
-                                                                           arch_vector_quantized_list,
-                                                                           return_similarity=True)
-
-                self.unet.set_structure(arch_vectors_separated)
-
-                # Get the target for loss depending on the prediction type
-                if self.config.model.unet.prediction_type is not None:
-                    # set prediction_type of scheduler if defined
-                    self.noise_scheduler.register_to_config(prediction_type=self.config.model.unet.prediction_type)
-
-                if self.noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif self.noise_scheduler.config.prediction_type == "v_prediction":
-                    target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
-
-                # Predict the noise residual and compute loss
-                model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
-
-                if self.config.training.losses.diffusion_loss.snr_gamma is None:
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                else:
-                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                    # This is discussed in Section 4.2 of the same paper.
-                    snr = compute_snr(self.noise_scheduler, timesteps)
-                    if self.noise_scheduler.config.prediction_type == "v_prediction":
-                        # Velocity objective requires that we add one to SNR values before we divide by them.
-                        snr = snr + 1
-                    mse_loss_weights = (
-                            torch.stack(
-                                [snr,
-                                 self.config.training.losses.diffusion_loss.snr_gamma * torch.ones_like(timesteps)],
-                                dim=1).min(dim=1)[0] / snr
-                    )
-
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                    loss = loss.mean()
-
-                flops_dict = self.unet.calc_flops()
-
-                curr_flops = flops_dict['cur_prunable_flops'].mean()
-
-                # The reason is that sanity['prunable_flops'] does not have depth-related pruning flops like
-                # skip connections of resnets in it.
-                resource_ratio = (curr_flops / (self.unet.resource_info_dict['cur_prunable_flops'].squeeze()))
-                resource_loss = self.resource_loss(resource_ratio)
-
-                diff_loss = loss.clone().detach().mean()
-                loss += self.config.training.losses.resource_loss.weight * resource_loss
-                loss += self.config.training.losses.quantization_loss.weight * q_loss
-                loss += self.config.training.losses.contrastive_clip_loss.weight * contrastive_loss
+                loss, diff_loss, q_loss, contrastive_loss, resource_loss, arch_vectors_similarity, resource_ratio, \
+                    flops_dict, arch_vector_quantized = self.step(batch)
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = self.accelerator.gather(
@@ -709,6 +573,7 @@ class DiffPruningTrainer:
             # checkpoint at the end of each epoch
             if self.accelerator.is_main_process:
                 self.save_checkpoint(logging_dir, global_step)
+                arch_vector_quantized_list = self.accelerator.gather(arch_vector_quantized).detach()
                 # save architecture vector quantized
                 torch.save(arch_vector_quantized_list, os.path.join(logging_dir, f"arch_vector_quantized.pt"))
 
@@ -750,114 +615,7 @@ class DiffPruningTrainer:
         for step, batch in enumerate(self.eval_dataloader):
             batch = {k: v.to(self.accelerator.device) for k, v in batch.items()}
             with torch.no_grad():
-                # Convert images to latent space
-                latents = self.vae.encode(batch["pixel_values"].to(self.weight_dtype)).latent_dist.sample()
-                latents = latents * self.vae.config.scaling_factor
-
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                if self.config.model.unet.noise_offset:
-                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                    noise += self.config.model.unet.noise_offset * torch.randn(
-                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
-                    )
-                if self.config.model.unet.input_perturbation:
-                    new_noise = noise + self.config.model.unet.input_perturbation * torch.randn_like(noise)
-                bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,),
-                                          device=latents.device)
-                timesteps = timesteps.long()
-
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                if self.config.model.unet.input_perturbation:
-                    noisy_latents = self.noise_scheduler.add_noise(latents, new_noise, timesteps)
-                else:
-                    noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
-
-                # Get the text embedding for conditioning
-                encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
-                text_embeddings = batch["mpnet_embeddings"]
-
-                arch_vector = self.hyper_net(text_embeddings)
-                arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
-
-                # gather the arch_vector_quantized across all processes to get large batch for contrastive loss
-                if self.accelerator.num_processes > 1:
-                    with torch.no_grad():
-                        text_embeddings_list = [torch.zeros_like(text_embeddings) for _ in
-                                                range(self.accelerator.num_processes)]
-                        arch_vector_quantized_list = [torch.zeros_like(arch_vector_quantized) for _ in
-                                                      range(self.accelerator.num_processes)]
-                        torch.distributed.all_gather(text_embeddings_list, text_embeddings)
-                        torch.distributed.all_gather(arch_vector_quantized_list, arch_vector_quantized)
-                    text_embeddings_list[self.accelerator.process_index] = text_embeddings
-                    arch_vector_quantized_list[self.accelerator.process_index] = arch_vector_quantized
-                    text_embeddings_list = torch.cat(text_embeddings_list, dim=0)
-                    arch_vector_quantized_list = torch.cat(arch_vector_quantized_list, dim=0)
-                    arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
-                else:
-                    text_embeddings_list = self.accelerator.gather(text_embeddings)
-                    arch_vector_quantized_list = self.accelerator.gather(arch_vector_quantized)
-
-                    arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
-
-                contrastive_loss, arch_vectors_similarity = self.clip_loss(text_embeddings_list,
-                                                                           arch_vector_quantized_list,
-                                                                           return_similarity=True)
-
-                self.unet.set_structure(arch_vectors_separated)
-
-                # Get the target for loss depending on the prediction type
-                if self.config.model.unet.prediction_type is not None:
-                    # set prediction_type of scheduler if defined
-                    self.noise_scheduler.register_to_config(prediction_type=self.config.model.unet.prediction_type)
-
-                if self.noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif self.noise_scheduler.config.prediction_type == "v_prediction":
-                    target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
-
-                # Predict the noise residual and compute loss
-                model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
-
-                if self.config.training.losses.diffusion_loss.snr_gamma is None:
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                else:
-                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                    # This is discussed in Section 4.2 of the same paper.
-                    snr = compute_snr(self.noise_scheduler, timesteps)
-                    if self.noise_scheduler.config.prediction_type == "v_prediction":
-                        # Velocity objective requires that we add one to SNR values before we divide by them.
-                        snr = snr + 1
-                    mse_loss_weights = (
-                            torch.stack(
-                                [snr,
-                                 self.config.training.losses.diffusion_loss.snr_gamma * torch.ones_like(timesteps)],
-                                dim=1).min(dim=1)[0] / snr
-                    )
-
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                    loss = loss.mean()
-
-                flops_dict = self.unet.calc_flops()
-                curr_flops = flops_dict['cur_prunable_flops'].mean()
-
-                # The reason is that sanity['prunable_flops'] does not have depth-related pruning flops
-                # like skip connections of resnets in it.
-                resource_ratio = (curr_flops / (self.unet.resource_info_dict['cur_prunable_flops'].squeeze()))
-                resource_loss = self.resource_loss(resource_ratio)
-
-                diff_loss = loss.clone().detach().mean()
-                loss += self.config.training.losses.resource_loss.weight * resource_loss
-                loss += self.config.training.losses.quantization_loss.weight * q_loss
-                loss += self.config.training.losses.contrastive_clip_loss.weight * contrastive_loss
-
+                loss, diff_loss, q_loss, contrastive_loss, resource_loss, _, _, _, _ = self.step(batch)
                 # Gather the losses across all processes for logging (if we use distributed training).
                 total_val_loss = self.accelerator.gather(
                     loss.repeat(self.config.data.dataloader.validation_batch_size)).detach().mean().item()
@@ -889,6 +647,160 @@ class DiffPruningTrainer:
 
         del loss, diff_loss, q_loss, contrastive_loss, resource_loss
         torch.cuda.empty_cache()
+
+    def step(self, batch):
+        latents = self.vae.encode(batch["pixel_values"].to(self.weight_dtype)).latent_dist.sample()
+        latents = latents * self.vae.config.scaling_factor
+
+        # Sample noise that we'll add to the latents
+        noise = torch.randn_like(latents)
+        if self.config.model.unet.noise_offset:
+            # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+            noise += self.config.model.unet.noise_offset * torch.randn(
+                (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+            )
+        if self.config.model.unet.input_perturbation:
+            new_noise = noise + self.config.model.unet.input_perturbation * torch.randn_like(noise)
+        bsz = latents.shape[0]
+        # Sample a random timestep for each image
+        timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,),
+                                  device=latents.device)
+        timesteps = timesteps.long()
+
+        # Add noise to the latents according to the noise magnitude at each timestep
+        # (this is the forward diffusion process)
+        if self.config.model.unet.input_perturbation:
+            noisy_latents = self.noise_scheduler.add_noise(latents, new_noise, timesteps)
+        else:
+            noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+
+        # Get the text embedding for conditioning
+        encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
+        text_embeddings = batch["mpnet_embeddings"]
+
+        arch_vector = self.hyper_net(text_embeddings)
+        arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
+
+        if self.accelerator.num_processes > 1:
+            with torch.no_grad():
+                text_embeddings_list = [torch.zeros_like(text_embeddings) for _ in
+                                        range(self.accelerator.num_processes)]
+                arch_vector_list = [torch.zeros_like(arch_vector) for _ in
+                                    range(self.accelerator.num_processes)]
+                torch.distributed.all_gather(text_embeddings_list, text_embeddings)
+                torch.distributed.all_gather(arch_vector_list, arch_vector)
+            text_embeddings_list[self.accelerator.process_index] = text_embeddings
+            arch_vector_list[self.accelerator.process_index] = arch_vector
+            text_embeddings_list = torch.cat(text_embeddings_list, dim=0)
+            arch_vector_list = torch.cat(arch_vector_list, dim=0)
+
+            arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
+
+        else:
+            text_embeddings_list = self.accelerator.gather(text_embeddings)
+            arch_vector_list = self.accelerator.gather(arch_vector)
+
+            arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
+
+        contrastive_loss, arch_vectors_similarity = self.clip_loss(text_embeddings_list,
+                                                                   arch_vector_list,
+                                                                   return_similarity=True)
+
+        self.unet.set_structure(arch_vectors_separated)
+
+        # Get the target for loss depending on the prediction type
+        if self.config.model.unet.prediction_type is not None:
+            # set prediction_type of scheduler if defined
+            self.noise_scheduler.register_to_config(prediction_type=self.config.model.unet.prediction_type)
+
+        if self.noise_scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif self.noise_scheduler.config.prediction_type == "v_prediction":
+            target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
+        else:
+            raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
+
+        # Predict the noise residual and compute loss
+        model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+        if self.config.training.losses.diffusion_loss.snr_gamma is None:
+            loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+        else:
+            # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+            # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+            # This is discussed in Section 4.2 of the same paper.
+            snr = compute_snr(self.noise_scheduler, timesteps)
+            if self.noise_scheduler.config.prediction_type == "v_prediction":
+                # Velocity objective requires that we add one to SNR values before we divide by them.
+                snr = snr + 1
+            mse_loss_weights = (
+                    torch.stack(
+                        [snr,
+                         self.config.training.losses.diffusion_loss.snr_gamma * torch.ones_like(timesteps)],
+                        dim=1).min(dim=1)[0] / snr
+            )
+
+            loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+            loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+            loss = loss.mean()
+
+        flops_dict = self.unet.calc_flops()
+        curr_flops = flops_dict['cur_prunable_flops'].mean()
+
+        # The reason is that sanity['prunable_flops'] does not have depth-related pruning flops
+        # like skip connections of resnets in it.
+        resource_ratio = (curr_flops / (self.unet.resource_info_dict['cur_prunable_flops'].squeeze()))
+        resource_loss = self.resource_loss(resource_ratio)
+
+        diff_loss = loss.clone().detach().mean()
+        loss += self.config.training.losses.resource_loss.weight * resource_loss
+        loss += self.config.training.losses.quantization_loss.weight * q_loss
+        loss += self.config.training.losses.contrastive_clip_loss.weight * contrastive_loss
+
+        return (loss, diff_loss, q_loss, contrastive_loss, resource_loss, arch_vectors_similarity,
+                resource_ratio, flops_dict, arch_vector_quantized)
+
+    @torch.no_grad()
+    def count_flops(self, batch):
+        with torch.no_grad():
+            if self.accelerator.num_processes > 1:
+                arch_vecs_separated = self.hyper_net.module.transform_structure_vector(
+                    torch.ones((1, self.quantizer.module.vq_embed_dim),
+                               device=self.accelerator.device))
+            else:
+                arch_vecs_separated = self.hyper_net.transform_structure_vector(
+                    torch.ones((1, self.quantizer.vq_embed_dim), device=self.accelerator.device))
+            self.unet.set_structure(arch_vecs_separated)
+
+            latents = self.vae.encode(batch["pixel_values"][:1].to(self.weight_dtype)).latent_dist.sample()
+            timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (1,),
+                                      device=self.accelerator.device).long()
+            encoder_hidden_states = self.text_encoder(batch["input_ids"][:1])[0]
+
+            flops, params = count_ops_and_params(self.unet,
+                                                 {'sample': latents,
+                                                  'timestep': timesteps,
+                                                  'encoder_hidden_states': encoder_hidden_states})
+
+            logger.info(
+                "UNet's Params/MACs calculated by OpCounter:\tparams: {:.3f}M\t MACs: {:.3f}G".format(
+                    params / 1e6, flops / 1e9))
+            sanity_flops_dict = self.unet.calc_flops()
+            self.unet.resource_info_dict = sanity_flops_dict
+            sanity_string = "Our MACs calculation:\t"
+            for k, v in sanity_flops_dict.items():
+                if isinstance(v, torch.Tensor):
+                    sanity_string += f" {k}: {v.item() / 1e9:.3f}\t"
+                else:
+                    sanity_string += f" {k}: {v / 1e9:.3f}\t"
+            logger.info(sanity_string)
+
+    @torch.no_grad()
+    def update_pruning_target(self):
+        p = self.config.training.losses.resource_loss.pruning_target
+        p_actual = (1 - (1 - p) * self.unet.resource_info_dict['total_flops'] /
+                    self.unet.resource_info_dict['cur_prunable_flops']).item()
+        self.resource_loss.p = p_actual
 
     @torch.no_grad()
     def generate_samples_from_prompts(self, global_step):

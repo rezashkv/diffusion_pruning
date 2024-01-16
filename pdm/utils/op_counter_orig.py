@@ -499,7 +499,7 @@ def batch_counter_hook(module, input, output):
         batch_size = len(input)
     else:
         pass
-        print('Warning! No positional inputs found for a module,'
+        print('\nWarning! No positional inputs found for a module,'
               ' assuming batch size is 1.')
     module.__batch_counter__ += batch_size
 

@@ -115,7 +115,11 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         z_flattened = z.view(-1, self.vq_embed_dim)
 
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
-        min_encoding_indices = torch.argmin(torch.cdist(z_flattened, self.embedding.weight), dim=1)
+        u = hard_concrete(self.gumbel_sigmoid_trick(z_flattened)).detach()
+        u = u / u.norm(dim=-1, keepdim=True)
+        v = hard_concrete(self.gumbel_sigmoid_trick(self.embedding.weight)).detach()
+        v = v / v.norm(dim=-1, keepdim=True)
+        min_encoding_indices = torch.argmax(u @ v.t(), dim=-1)
 
         z_q = self.embedding(min_encoding_indices).view(z.shape)
         perplexity = None
