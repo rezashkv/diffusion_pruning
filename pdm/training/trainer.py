@@ -702,8 +702,7 @@ class DiffPruningTrainer:
 
             arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
 
-        contrastive_loss, arch_vectors_similarity = self.clip_loss(text_embeddings_list,
-                                                                   arch_vector_list,
+        contrastive_loss, arch_vectors_similarity = self.clip_loss(text_embeddings_list, arch_vector_list,
                                                                    return_similarity=True)
 
         self.unet.set_structure(arch_vectors_separated)

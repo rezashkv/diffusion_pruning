@@ -6,6 +6,7 @@ from diffusers.configuration_utils import register_to_config, ConfigMixin
 from torch import nn
 from pdm.utils.estimation_utils import gumbel_softmax_sample, hard_concrete, importance_gumbel_softmax_sample
 from diffusers import ModelMixin
+import torch.distributed as dist
 
 
 # DEPTH_ORDER = [-1, -2, -3, -4, -5, 0, 1, 2, -6, -7, 3, 4]
@@ -24,7 +25,6 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
     def __init__(
             self,
             n_e: int,
-            # structure: list[dict],
             structure: dict,
             beta: float = 0.25,
             remap=None,
@@ -33,7 +33,9 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
             temperature: float = 0.4,
             base: int = 2,
             depth_order: list = [],
-            non_zero_width: bool = True
+            non_zero_width: bool = True,
+            sinkhorn_epsilon: float = 0.05,
+            sinkhorn_iterations: int = 3,
     ):
         super().__init__()
 
@@ -85,6 +87,9 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         # we don't actually want to remove the whole block.
         self.non_zero_width = non_zero_width
 
+        self.sinkhorn_epsilon = sinkhorn_epsilon
+        self.sinkhorn_iterations = sinkhorn_iterations
+
     def remap_to_used(self, inds: torch.LongTensor) -> torch.LongTensor:
         ishape = inds.shape
         assert len(ishape) > 1
@@ -109,27 +114,23 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         back = torch.gather(used[None, :][inds.shape[0] * [0], :], 1, inds)
         return back.reshape(ishape)
 
-    def forward(self, z: torch.FloatTensor) -> Tuple[torch.FloatTensor, torch.FloatTensor, Tuple]:
+    def forward(self, z: torch.FloatTensor) -> Tuple[torch.Tensor, torch.Tensor, Tuple]:
         # reshape z -> (batch, dim) and flatten
         z = z.contiguous()
         z_flattened = z.view(-1, self.vq_embed_dim)
 
-        # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
-        u = hard_concrete(self.gumbel_sigmoid_trick(z_flattened)).detach()
-        u = u / u.norm(dim=-1, keepdim=True)
-        v = hard_concrete(self.gumbel_sigmoid_trick(self.embedding.weight)).detach()
-        v = v / v.norm(dim=-1, keepdim=True)
-        min_encoding_indices = torch.argmax(u @ v.t(), dim=-1)
+        min_encoding_indices = self.get_optimal_transport_min_encoding_indices(z_flattened)
 
         z_q = self.embedding(min_encoding_indices).view(z.shape)
         perplexity = None
         min_encodings = None
 
         # compute loss for embedding
-        loss = self.beta * torch.mean((z_q.detach() - z) ** 2) + torch.mean((z_q - z.detach()) ** 2)
+        # loss = self.beta * torch.mean((z_q.detach() - z) ** 2) + torch.mean((z_q - z.detach()) ** 2)
+        loss = torch.tensor(0.0, device=z.device)
 
         # preserve gradients
-        z_q: torch.FloatTensor = z + (z_q - z).detach()
+        # z_q: torch.FloatTensor = z + (z_q - z).detach()
 
         # reshape back to match original input shape
         z_q = z_q.contiguous()
@@ -203,3 +204,45 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
             start = end
 
         return arch_vector
+
+    @torch.no_grad()
+    def get_cosine_sim_min_encoding_indices(self, z: torch.FloatTensor) -> torch.Tensor:
+        # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
+        u = hard_concrete(self.gumbel_sigmoid_trick(z)).detach()
+        u = u / u.norm(dim=-1, keepdim=True)
+        v = hard_concrete(self.gumbel_sigmoid_trick(self.embedding.weight)).detach()
+        v = v / v.norm(dim=-1, keepdim=True)
+        min_encoding_indices = torch.argmax(u @ v.t(), dim=-1)
+        return min_encoding_indices
+
+    @torch.no_grad()
+    def get_optimal_transport_min_encoding_indices(self, z: torch.FloatTensor) -> torch.Tensor:
+        @torch.no_grad()
+        def distributed_sinkhorn(out):
+            Q = torch.exp(out / self.sinkhorn_epsilon).t()  # Q is K-by-B for consistency with notations from the paper
+            B = Q.shape[1] * dist.get_world_size()
+            K = Q.shape[0]
+
+            # make the matrix sums to 1
+            sum_Q = torch.sum(Q)
+            dist.all_reduce(sum_Q)
+            Q /= sum_Q
+
+            for it in range(self.sinkhorn_iterations):
+                # normalize each row: total weight per prototype must be 1/K
+                sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
+                dist.all_reduce(sum_of_rows)
+                Q /= sum_of_rows
+                Q /= K
+
+                # normalize each column: total weight per sample must be 1/B
+                Q /= torch.sum(Q, dim=0, keepdim=True)
+                Q /= B
+
+            Q *= B  # the colomns must sum to 1 so that Q is an assignment
+            return Q.t()
+
+        out = z @ self.embedding.weight.t()
+        Q = distributed_sinkhorn(out)
+        min_encoding_indices = torch.argmax(Q, dim=-1)
+        return min_encoding_indices
