@@ -242,7 +242,33 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
             Q *= B  # the colomns must sum to 1 so that Q is an assignment
             return Q.t()
 
+        @torch.no_grad()
+        def sinkhorn(out):
+            Q = torch.exp(out / self.sinkhorn_epsilon).t()  # Q is K-by-B for consistency with notations from the paper
+            B = Q.shape[1]
+            K = Q.shape[0]
+
+            # make the matrix sums to 1
+            sum_Q = torch.sum(Q)
+            Q /= sum_Q
+
+            for it in range(self.sinkhorn_iterations):
+                # normalize each row: total weight per prototype must be 1/K
+                sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
+                Q /= sum_of_rows
+                Q /= K
+
+                # normalize each column: total weight per sample must be 1/B
+                Q /= torch.sum(Q, dim=0, keepdim=True)
+                Q /= B
+
+            Q *= B  # the colomns must sum to 1 so that Q is an assignment
+            return Q.t()
+
         out = z @ self.embedding.weight.t()
-        Q = distributed_sinkhorn(out)
+        if dist.is_initialized():
+            Q = distributed_sinkhorn(out)
+        else:
+            Q = sinkhorn(out)
         min_encoding_indices = torch.argmax(Q, dim=-1)
         return min_encoding_indices

@@ -573,9 +573,9 @@ class DiffPruningTrainer:
             # checkpoint at the end of each epoch
             if self.accelerator.is_main_process:
                 self.save_checkpoint(logging_dir, global_step)
-                arch_vector_quantized_list = self.accelerator.gather(arch_vector_quantized).detach()
+                # arch_vector_quantized_list = self.accelerator.gather(arch_vector_quantized)
                 # save architecture vector quantized
-                torch.save(arch_vector_quantized_list, os.path.join(logging_dir, f"arch_vector_quantized.pt"))
+                # torch.save(arch_vector_quantized_list, os.path.join(logging_dir, f"arch_vector_quantized.pt"))
 
         # Create the pipeline using the trained modules and save it.
         self.accelerator.wait_for_everyone()
@@ -753,7 +753,7 @@ class DiffPruningTrainer:
 
         diff_loss = loss.clone().detach().mean()
         loss += self.config.training.losses.resource_loss.weight * resource_loss
-        loss += self.config.training.losses.quantization_loss.weight * q_loss
+        # loss += self.config.training.losses.quantization_loss.weight * q_loss
         loss += self.config.training.losses.contrastive_clip_loss.weight * contrastive_loss
 
         return (loss, diff_loss, q_loss, contrastive_loss, resource_loss, arch_vectors_similarity,
