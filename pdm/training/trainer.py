@@ -506,9 +506,7 @@ class DiffPruningTrainer:
                 loss, diff_loss, q_loss, contrastive_loss, resource_loss, arch_vectors_similarity, resource_ratio, \
                     flops_dict, arch_vector_quantized = self.step(batch)
 
-                # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = self.accelerator.gather(
-                    loss.repeat(self.config.data.dataloader.train_batch_size)).detach().mean()
+                avg_loss = self.accelerator.reduce(loss, "mean")
                 train_loss += avg_loss.item() / self.config.training.gradient_accumulation_steps
 
                 # Back-propagate
@@ -552,6 +550,10 @@ class DiffPruningTrainer:
                         }
                 progress_bar.set_postfix(**logs)
 
+                del loss, diff_loss, q_loss, contrastive_loss, resource_loss, arch_vectors_similarity, resource_ratio, \
+                    flops_dict, avg_loss, train_loss
+                torch.cuda.empty_cache()
+
                 if global_step % self.config.training.validation_steps == 0:
                     if self.eval_dataset is not None:
                         self.validate()
@@ -559,7 +561,6 @@ class DiffPruningTrainer:
                 if (global_step % self.config.training.image_logging_steps == 0 or
                         (epoch == self.config.training.num_train_epochs - 1 and step == len(
                             self.train_dataloader) - 1)):
-
                     # generate some validation images
                     if self.config.data.prompts is not None:
                         val_images = self.generate_samples_from_prompts(global_step)
@@ -613,28 +614,26 @@ class DiffPruningTrainer:
         self.unet.eval()
         total_val_loss, total_diff_loss, total_q_loss, total_c_loss, total_r_loss = 0.0, 0.0, 0.0, 0.0, 0.0
         for step, batch in enumerate(self.eval_dataloader):
-            batch = {k: v.to(self.accelerator.device) for k, v in batch.items()}
-            with torch.no_grad():
-                loss, diff_loss, q_loss, contrastive_loss, resource_loss, _, _, _, _ = self.step(batch)
-                # Gather the losses across all processes for logging (if we use distributed training).
-                total_val_loss = self.accelerator.gather(
-                    loss.repeat(self.config.data.dataloader.validation_batch_size)).detach().mean().item()
-                total_diff_loss += self.accelerator.gather(
-                    diff_loss.repeat(self.config.data.dataloader.validation_batch_size)).detach().mean().item()
-                total_q_loss += self.accelerator.gather(
-                    q_loss.repeat(self.config.data.dataloader.validation_batch_size)).detach().mean().item()
-                total_c_loss += self.accelerator.gather(
-                    contrastive_loss.repeat(self.config.data.dataloader.validation_batch_size)).detach().mean().item()
-                total_r_loss += self.accelerator.gather(
-                    resource_loss.repeat(self.config.data.dataloader.validation_batch_size)).detach().mean().item()
-
-                progress_bar.update(1)
+            loss, diff_loss, q_loss, contrastive_loss, resource_loss, _, _, _, _ = self.step(batch)
+            # Gather the losses across all processes for logging (if we use distributed training).
+            total_val_loss = loss.item()
+            total_diff_loss += diff_loss.item()
+            total_q_loss += q_loss.item()
+            total_c_loss += contrastive_loss.item()
+            total_r_loss += resource_loss.item()
+            progress_bar.update(1)
 
         total_val_loss /= len(self.eval_dataloader)
         total_diff_loss /= len(self.eval_dataloader)
         total_q_loss /= len(self.eval_dataloader)
         total_c_loss /= len(self.eval_dataloader)
         total_r_loss /= len(self.eval_dataloader)
+
+        total_val_loss = self.accelerator.reduce(torch.tensor(total_val_loss, device=self.accelerator.device), "mean").item()
+        total_diff_loss = self.accelerator.reduce(torch.tensor(total_diff_loss, device=self.accelerator.device), "mean").item()
+        total_q_loss = self.accelerator.reduce(torch.tensor(total_q_loss, device=self.accelerator.device), "mean").item()
+        total_c_loss = self.accelerator.reduce(torch.tensor(total_c_loss, device=self.accelerator.device), "mean").item()
+        total_r_loss = self.accelerator.reduce(torch.tensor(total_r_loss, device=self.accelerator.device), "mean").item()
 
         self.accelerator.log({
             "validation/loss": total_val_loss,
@@ -645,6 +644,7 @@ class DiffPruningTrainer:
         },
             log_kwargs={"wandb": {"commit": False}})
 
+        torch.cuda.empty_cache()
         del loss, diff_loss, q_loss, contrastive_loss, resource_loss
         torch.cuda.empty_cache()
 
@@ -756,43 +756,51 @@ class DiffPruningTrainer:
         # loss += self.config.training.losses.quantization_loss.weight * q_loss
         loss += self.config.training.losses.contrastive_clip_loss.weight * contrastive_loss
 
+        torch.cuda.empty_cache()
+        del latents, noise, timesteps, noisy_latents, encoder_hidden_states, text_embeddings, arch_vector
+        torch.cuda.empty_cache()
+
         return (loss, diff_loss, q_loss, contrastive_loss, resource_loss, arch_vectors_similarity,
                 resource_ratio, flops_dict, arch_vector_quantized)
 
     @torch.no_grad()
     def count_flops(self, batch):
-        with torch.no_grad():
-            if self.accelerator.num_processes > 1:
-                arch_vecs_separated = self.hyper_net.module.transform_structure_vector(
-                    torch.ones((1, self.quantizer.module.vq_embed_dim),
-                               device=self.accelerator.device))
+        if self.accelerator.num_processes > 1:
+            arch_vecs_separated = self.hyper_net.module.transform_structure_vector(
+                torch.ones((1, self.quantizer.module.vq_embed_dim),
+                           device=self.accelerator.device))
+        else:
+            arch_vecs_separated = self.hyper_net.transform_structure_vector(
+                torch.ones((1, self.quantizer.vq_embed_dim), device=self.accelerator.device))
+        self.unet.set_structure(arch_vecs_separated)
+
+        latents = self.vae.encode(batch["pixel_values"][:1].to(self.weight_dtype)).latent_dist.sample()
+        timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (1,),
+                                  device=self.accelerator.device).long()
+        encoder_hidden_states = self.text_encoder(batch["input_ids"][:1])[0]
+
+        flops, params = count_ops_and_params(self.unet,
+                                             {'sample': latents,
+                                              'timestep': timesteps,
+                                              'encoder_hidden_states': encoder_hidden_states})
+
+        logger.info(
+            "UNet's Params/MACs calculated by OpCounter:\tparams: {:.3f}M\t MACs: {:.3f}G".format(
+                params / 1e6, flops / 1e9))
+        sanity_flops_dict = self.unet.calc_flops()
+        self.unet.resource_info_dict = sanity_flops_dict
+        sanity_string = "Our MACs calculation:\t"
+        for k, v in sanity_flops_dict.items():
+            if isinstance(v, torch.Tensor):
+                sanity_string += f" {k}: {v.item() / 1e9:.3f}\t"
             else:
-                arch_vecs_separated = self.hyper_net.transform_structure_vector(
-                    torch.ones((1, self.quantizer.vq_embed_dim), device=self.accelerator.device))
-            self.unet.set_structure(arch_vecs_separated)
+                sanity_string += f" {k}: {v / 1e9:.3f}\t"
+        logger.info(sanity_string)
 
-            latents = self.vae.encode(batch["pixel_values"][:1].to(self.weight_dtype)).latent_dist.sample()
-            timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (1,),
-                                      device=self.accelerator.device).long()
-            encoder_hidden_states = self.text_encoder(batch["input_ids"][:1])[0]
-
-            flops, params = count_ops_and_params(self.unet,
-                                                 {'sample': latents,
-                                                  'timestep': timesteps,
-                                                  'encoder_hidden_states': encoder_hidden_states})
-
-            logger.info(
-                "UNet's Params/MACs calculated by OpCounter:\tparams: {:.3f}M\t MACs: {:.3f}G".format(
-                    params / 1e6, flops / 1e9))
-            sanity_flops_dict = self.unet.calc_flops()
-            self.unet.resource_info_dict = sanity_flops_dict
-            sanity_string = "Our MACs calculation:\t"
-            for k, v in sanity_flops_dict.items():
-                if isinstance(v, torch.Tensor):
-                    sanity_string += f" {k}: {v.item() / 1e9:.3f}\t"
-                else:
-                    sanity_string += f" {k}: {v / 1e9:.3f}\t"
-            logger.info(sanity_string)
+        torch.cuda.empty_cache()
+        del latents, timesteps, encoder_hidden_states, arch_vecs_separated, flops, params, sanity_flops_dict, \
+            sanity_string
+        torch.cuda.empty_cache()
 
     @torch.no_grad()
     def update_pruning_target(self):
@@ -800,6 +808,10 @@ class DiffPruningTrainer:
         p_actual = (1 - (1 - p) * self.unet.resource_info_dict['total_flops'] /
                     self.unet.resource_info_dict['cur_prunable_flops']).item()
         self.resource_loss.p = p_actual
+
+        torch.cuda.empty_cache()
+        del p, p_actual
+        torch.cuda.empty_cache()
 
     @torch.no_grad()
     def generate_samples_from_prompts(self, global_step):
@@ -848,7 +860,8 @@ class DiffPruningTrainer:
             log_kwargs={"wandb": {"commit": False}}
         )
 
-        del pipeline
+        torch.cuda.empty_cache()
+        del pipeline, embedding_indices, batch_embedding_indices, min_encoding_indices_image, gen_images
         torch.cuda.empty_cache()
 
         return images
@@ -895,7 +908,8 @@ class DiffPruningTrainer:
         self.accelerator.log({"images/quantizer embedding images": wandb.Image(images)},
                              log_kwargs={"wandb": {"commit": False}})
 
-        del pipeline
+        torch.cuda.empty_cache()
+        del pipeline, quantizer_embedding_gumbel_sigmoid, gen_images, quantizer_embed_gs
         torch.cuda.empty_cache()
 
         return images
