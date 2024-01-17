@@ -167,10 +167,12 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
         return z_q
 
-    def get_codebook_entry_gumbel_sigmoid(self, indices: torch.LongTensor,
-                                          shape: Tuple[int, ...] = None):
+    def get_codebook_entry_gumbel_sigmoid(self, indices: torch.LongTensor, shape: Tuple[int, ...] = None, hard=False) -> torch.Tensor:
         z_q = self.get_codebook_entry(indices, shape).contiguous()
-        return self.gumbel_sigmoid_trick(z_q)
+        if hard:
+            return hard_concrete(self.gumbel_sigmoid_trick(z_q))
+        else:
+            return self.gumbel_sigmoid_trick(z_q)
 
     def gumbel_sigmoid_trick(self, z_q: torch.FloatTensor):
         num_width = sum(self.width_list)
@@ -239,7 +241,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
                 Q /= torch.sum(Q, dim=0, keepdim=True)
                 Q /= B
 
-            Q *= B  # the colomns must sum to 1 so that Q is an assignment
+            Q *= B  # the columns must sum to 1 so that Q is an assignment
             return Q.t()
 
         @torch.no_grad()
@@ -264,8 +266,13 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
             Q *= B  # the colomns must sum to 1 so that Q is an assignment
             return Q.t()
+        u = hard_concrete(self.gumbel_sigmoid_trick(z))
+        u = u / u.norm(dim=-1, keepdim=True)
+        v = hard_concrete(self.gumbel_sigmoid_trick(self.embedding.weight))
+        v = v / v.norm(dim=-1, keepdim=True)
+        out = u @ v.t()
 
-        out = z @ self.embedding.weight.t()
+        # out = z @ self.embedding.weight.t()
         if dist.is_initialized():
             Q = distributed_sinkhorn(out)
         else:

@@ -504,7 +504,8 @@ class DiffPruningTrainer:
                     self.update_pruning_target()
 
                 loss, diff_loss, q_loss, contrastive_loss, resource_loss, arch_vectors_similarity, resource_ratio, \
-                    flops_dict, arch_vector_quantized = self.step(batch)
+                    flops_dict, arch_vector_quantized, min_encoding_indices, quantizer_embedding_pairwise_similarity = self.step(
+                    batch)
 
                 avg_loss = self.accelerator.reduce(loss, "mean")
                 train_loss += avg_loss.item() / self.config.training.gradient_accumulation_steps
@@ -538,6 +539,12 @@ class DiffPruningTrainer:
                             log_dict[f"training/{k}"] = v
 
                     log_dict["images/arch vector pairwise similarity image"] = wandb.Image(arch_vectors_similarity)
+                    log_dict["images/training_batch_min_encoding_indices"] = wandb.Image(
+                        create_image_grid_from_indices([x.item() for x in min_encoding_indices],
+                                                       grid_size=(4, len(min_encoding_indices) // 4)))
+                    log_dict["images/quantizer_embedding_pairwise_similarity"] = wandb.Image(
+                        quantizer_embedding_pairwise_similarity)
+
                     self.accelerator.log(log_dict)
 
                 logs = {"diff_loss": diff_loss.detach().item(),
@@ -614,7 +621,7 @@ class DiffPruningTrainer:
         self.unet.eval()
         total_val_loss, total_diff_loss, total_q_loss, total_c_loss, total_r_loss = 0.0, 0.0, 0.0, 0.0, 0.0
         for step, batch in enumerate(self.eval_dataloader):
-            loss, diff_loss, q_loss, contrastive_loss, resource_loss, _, _, _, _ = self.step(batch)
+            loss, diff_loss, q_loss, contrastive_loss, resource_loss, _, _, _, _, _, _ = self.step(batch)
             # Gather the losses across all processes for logging (if we use distributed training).
             total_val_loss = loss.item()
             total_diff_loss += diff_loss.item()
@@ -629,11 +636,16 @@ class DiffPruningTrainer:
         total_c_loss /= len(self.eval_dataloader)
         total_r_loss /= len(self.eval_dataloader)
 
-        total_val_loss = self.accelerator.reduce(torch.tensor(total_val_loss, device=self.accelerator.device), "mean").item()
-        total_diff_loss = self.accelerator.reduce(torch.tensor(total_diff_loss, device=self.accelerator.device), "mean").item()
-        total_q_loss = self.accelerator.reduce(torch.tensor(total_q_loss, device=self.accelerator.device), "mean").item()
-        total_c_loss = self.accelerator.reduce(torch.tensor(total_c_loss, device=self.accelerator.device), "mean").item()
-        total_r_loss = self.accelerator.reduce(torch.tensor(total_r_loss, device=self.accelerator.device), "mean").item()
+        total_val_loss = self.accelerator.reduce(torch.tensor(total_val_loss, device=self.accelerator.device),
+                                                 "mean").item()
+        total_diff_loss = self.accelerator.reduce(torch.tensor(total_diff_loss, device=self.accelerator.device),
+                                                  "mean").item()
+        total_q_loss = self.accelerator.reduce(torch.tensor(total_q_loss, device=self.accelerator.device),
+                                               "mean").item()
+        total_c_loss = self.accelerator.reduce(torch.tensor(total_c_loss, device=self.accelerator.device),
+                                               "mean").item()
+        total_r_loss = self.accelerator.reduce(torch.tensor(total_r_loss, device=self.accelerator.device),
+                                               "mean").item()
 
         self.accelerator.log({
             "validation/loss": total_val_loss,
@@ -644,7 +656,6 @@ class DiffPruningTrainer:
         },
             log_kwargs={"wandb": {"commit": False}})
 
-        torch.cuda.empty_cache()
         del loss, diff_loss, q_loss, contrastive_loss, resource_loss
         torch.cuda.empty_cache()
 
@@ -679,10 +690,15 @@ class DiffPruningTrainer:
         text_embeddings = batch["mpnet_embeddings"]
 
         arch_vector = self.hyper_net(text_embeddings)
-        arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
+        arch_vector_quantized, q_loss, (_, _, min_encoding_indices) = self.quantizer(arch_vector)
 
         if self.accelerator.num_processes > 1:
+            arch_vector = self.quantizer.module.gumbel_sigmoid_trick(arch_vector)
             with torch.no_grad():
+                quantizer_embeddings = self.quantizer.module.get_codebook_entry_gumbel_sigmoid(
+                    torch.arange(self.quantizer.module.n_e, device=self.accelerator.device), hard=True).detach()
+                quantizer_embeddings /= quantizer_embeddings.norm(dim=-1, keepdim=True)
+                quantizer_embeddings_pairwise_similarity = quantizer_embeddings @ quantizer_embeddings.t()
                 text_embeddings_list = [torch.zeros_like(text_embeddings) for _ in
                                         range(self.accelerator.num_processes)]
                 arch_vector_list = [torch.zeros_like(arch_vector) for _ in
@@ -697,6 +713,13 @@ class DiffPruningTrainer:
             arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
 
         else:
+            with torch.no_grad():
+                quantizer_embeddings = self.quantizer.get_codebook_entry_gumbel_sigmoid(
+                    torch.arange(self.quantizer.n_e, device=self.accelerator.device),
+                    hard=True).detach()
+                quantizer_embeddings /= quantizer_embeddings.norm(dim=-1, keepdim=True)
+                quantizer_embeddings_pairwise_similarity = quantizer_embeddings @ quantizer_embeddings.t()
+            arch_vector = self.quantizer.gumbel_sigmoid_trick(arch_vector)
             text_embeddings_list = self.accelerator.gather(text_embeddings)
             arch_vector_list = self.accelerator.gather(arch_vector)
 
@@ -756,12 +779,13 @@ class DiffPruningTrainer:
         # loss += self.config.training.losses.quantization_loss.weight * q_loss
         loss += self.config.training.losses.contrastive_clip_loss.weight * contrastive_loss
 
-        torch.cuda.empty_cache()
-        del latents, noise, timesteps, noisy_latents, encoder_hidden_states, text_embeddings, arch_vector
+        del latents, noise, timesteps, noisy_latents, encoder_hidden_states, text_embeddings, arch_vector, arch_vectors_separated, \
+            quantizer_embeddings, text_embeddings_list, arch_vector_list, curr_flops, model_pred, target
         torch.cuda.empty_cache()
 
         return (loss, diff_loss, q_loss, contrastive_loss, resource_loss, arch_vectors_similarity,
-                resource_ratio, flops_dict, arch_vector_quantized)
+                resource_ratio, flops_dict, arch_vector_quantized, min_encoding_indices,
+                quantizer_embeddings_pairwise_similarity)
 
     @torch.no_grad()
     def count_flops(self, batch):
@@ -797,7 +821,6 @@ class DiffPruningTrainer:
                 sanity_string += f" {k}: {v / 1e9:.3f}\t"
         logger.info(sanity_string)
 
-        torch.cuda.empty_cache()
         del latents, timesteps, encoder_hidden_states, arch_vecs_separated, flops, params, sanity_flops_dict, \
             sanity_string
         torch.cuda.empty_cache()
@@ -809,7 +832,6 @@ class DiffPruningTrainer:
                     self.unet.resource_info_dict['cur_prunable_flops']).item()
         self.resource_loss.p = p_actual
 
-        torch.cuda.empty_cache()
         del p, p_actual
         torch.cuda.empty_cache()
 
@@ -855,12 +877,11 @@ class DiffPruningTrainer:
         self.accelerator.log(
             {
                 "images/prompt images": wandb.Image(images),
-                "images/min encoding indices": wandb.Image(min_encoding_indices_image)
+                "images/prompts min encoding indices": wandb.Image(min_encoding_indices_image)
             },
             log_kwargs={"wandb": {"commit": False}}
         )
 
-        torch.cuda.empty_cache()
         del pipeline, embedding_indices, batch_embedding_indices, min_encoding_indices_image, gen_images
         torch.cuda.empty_cache()
 
@@ -908,7 +929,6 @@ class DiffPruningTrainer:
         self.accelerator.log({"images/quantizer embedding images": wandb.Image(images)},
                              log_kwargs={"wandb": {"commit": False}})
 
-        torch.cuda.empty_cache()
         del pipeline, quantizer_embedding_gumbel_sigmoid, gen_images, quantizer_embed_gs
         torch.cuda.empty_cache()
 
@@ -1053,52 +1073,52 @@ class DiffPruningTrainer:
             img_str += "![val_imgs_grid](./val_imgs_grid.png)\n"
 
         yaml = f"""
-            ---
-            license: creativeml-openrail-m
-            base_model: {self.config.pretrained_model_name_or_path}
-            datasets:
-            - {self.config.data.dataset_name}
-            tags:
-            - stable-diffusion
-            - stable-diffusion-diffusers
-            - text-to-image
-            - diffusers
-            inference: true
-            ---
-                """
+                ---
+                license: creativeml-openrail-m
+                base_model: {self.config.pretrained_model_name_or_path}
+                datasets:
+                - {self.config.data.dataset_name}
+                tags:
+                - stable-diffusion
+                - stable-diffusion-diffusers
+                - text-to-image
+                - diffusers
+                inference: true
+                ---
+                    """
         model_card = f"""
-            # Text-to-image finetuning - {repo_id}
-        
-            This pipeline was pruned from **{self.config.pretrained_model_name_or_path}** on the **{self.config.data.dataset_name}** dataset. Below are some example images generated with the finetuned pipeline using the following prompts: {self.config.data.prompts}: \n
-            {img_str}
-        
-            ## Pipeline usage
-        
-            You can use the pipeline like so:
-        
-            ```python
-            from diffusers import DiffusionPipeline
-            import torch
-        
-            pipeline = DiffusionPipeline.from_pretrained("{repo_id}", torch_dtype=torch.float16)
-            prompt = "{self.config.data.prompts[0]}"
-            image = pipeline(prompt).images[0]
-            image.save("my_image.png")
-            ```
-        
-            ## Training info
-        
-            These are the key hyperparameters used during training:
-        
-            * Epochs: {self.config.training.num_train_epochs}
-            * Hypernet Learning rate: {self.config.training.optim.hypernet_learning_rate}
-            * Quantizer Learning rate: {self.config.training.optim.quantizer_learning_rate}
-            * Batch size: {self.config.data.dataloader.train_batch_size}
-            * Gradient accumulation steps: {self.config.training.gradient_accumulation_steps}
-            * Image resolution: {self.config.model.unet.resolution}
-            * Mixed-precision: {self.config.mixed_precision}
-        
-            """
+                # Text-to-image finetuning - {repo_id}
+            
+                This pipeline was pruned from **{self.config.pretrained_model_name_or_path}** on the **{self.config.data.dataset_name}** dataset. Below are some example images generated with the finetuned pipeline using the following prompts: {self.config.data.prompts}: \n
+                {img_str}
+            
+                ## Pipeline usage
+            
+                You can use the pipeline like so:
+            
+                ```python
+                from diffusers import DiffusionPipeline
+                import torch
+            
+                pipeline = DiffusionPipeline.from_pretrained("{repo_id}", torch_dtype=torch.float16)
+                prompt = "{self.config.data.prompts[0]}"
+                image = pipeline(prompt).images[0]
+                image.save("my_image.png")
+                ```
+            
+                ## Training info
+            
+                These are the key hyperparameters used during training:
+            
+                * Epochs: {self.config.training.num_train_epochs}
+                * Hypernet Learning rate: {self.config.training.optim.hypernet_learning_rate}
+                * Quantizer Learning rate: {self.config.training.optim.quantizer_learning_rate}
+                * Batch size: {self.config.data.dataloader.train_batch_size}
+                * Gradient accumulation steps: {self.config.training.gradient_accumulation_steps}
+                * Image resolution: {self.config.model.unet.resolution}
+                * Mixed-precision: {self.config.mixed_precision}
+            
+                """
         wandb_info = ""
         if is_wandb_available():
             wandb_run_url = None
@@ -1107,8 +1127,8 @@ class DiffPruningTrainer:
 
         if self.config.wandb_run_url is not None:
             wandb_info = f"""
-            More information on all the CLI arguments and the environment are available on your [`wandb` run page]({self.config.wandb_run_url}).
-            """
+                More information on all the CLI arguments and the environment are available on your [`wandb` run page]({self.config.wandb_run_url}).
+                """
 
         model_card += wandb_info
 
