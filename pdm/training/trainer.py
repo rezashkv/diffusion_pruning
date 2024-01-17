@@ -693,7 +693,6 @@ class DiffPruningTrainer:
         arch_vector_quantized, q_loss, (_, _, min_encoding_indices) = self.quantizer(arch_vector)
 
         if self.accelerator.num_processes > 1:
-            arch_vector = self.quantizer.module.gumbel_sigmoid_trick(arch_vector)
             with torch.no_grad():
                 quantizer_embeddings = self.quantizer.module.get_codebook_entry_gumbel_sigmoid(
                     torch.arange(self.quantizer.module.n_e, device=self.accelerator.device), hard=True).detach()
@@ -719,7 +718,6 @@ class DiffPruningTrainer:
                     hard=True).detach()
                 quantizer_embeddings /= quantizer_embeddings.norm(dim=-1, keepdim=True)
                 quantizer_embeddings_pairwise_similarity = quantizer_embeddings @ quantizer_embeddings.t()
-            arch_vector = self.quantizer.gumbel_sigmoid_trick(arch_vector)
             text_embeddings_list = self.accelerator.gather(text_embeddings)
             arch_vector_list = self.accelerator.gather(arch_vector)
 

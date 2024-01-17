@@ -266,13 +266,13 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
             Q *= B  # the colomns must sum to 1 so that Q is an assignment
             return Q.t()
-        u = hard_concrete(self.gumbel_sigmoid_trick(z))
-        u = u / u.norm(dim=-1, keepdim=True)
-        v = hard_concrete(self.gumbel_sigmoid_trick(self.embedding.weight))
-        v = v / v.norm(dim=-1, keepdim=True)
-        out = u @ v.t()
+        # u = hard_concrete(self.gumbel_sigmoid_trick(z))
+        # u = u / u.norm(dim=-1, keepdim=True)
+        # v = hard_concrete(self.gumbel_sigmoid_trick(self.embedding.weight))
+        # v = v / v.norm(dim=-1, keepdim=True)
+        # out = u @ v.t()
 
-        # out = z @ self.embedding.weight.t()
+        out = z @ self.embedding.weight.t()
         if dist.is_initialized():
             Q = distributed_sinkhorn(out)
         else:

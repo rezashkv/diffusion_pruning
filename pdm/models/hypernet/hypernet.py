@@ -67,7 +67,6 @@ class HyperStructure(ModelMixin, ConfigMixin):
         outputs = [self.mh_fc[i](x) for i in range(len(self.mh_fc))]
         out = torch.cat(outputs, dim=1)
 
-
         return out
 
     def print_param_stats(self):
