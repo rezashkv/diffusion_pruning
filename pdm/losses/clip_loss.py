@@ -31,22 +31,20 @@ class ClipLoss(nn.Module):
 
         # Multiply the slice of the arch_vectors defined by the start and end index of the width of the block with the
         # corresponding depth element of the arch_vectors.
-        # arch_vectors_clone = hard_concrete(arch_vectors.clone())
-        #
-        # for i, elem in enumerate(self.depth_list):
-        #     if elem != 0:
-        #         arch_vectors_clone[:, self.width_intervals[i][0]:self.width_intervals[i][1]] = (
-        #                 arch_vectors[:, self.width_intervals[i][0]:self.width_intervals[i][1]] *
-        #                 arch_vectors[:, self.depth_indices[i]:(self.depth_indices[i] + 1)])
-        #
-        # arch_vectors_ = arch_vectors_clone * (torch.sqrt(self.template).detach())
-        # arch_vectors_normalized = arch_vectors_ / arch_vectors_.norm(dim=1, keepdim=True)
+        arch_vectors_clone = hard_concrete(arch_vectors.clone())
 
-        arch_vectors *= torch.sqrt(self.template).detach()
-        arch_vectors = arch_vectors / arch_vectors.norm(dim=1, keepdim=True)
+        for i, elem in enumerate(self.depth_list):
+            if elem != 0:
+                arch_vectors_clone[:, self.width_intervals[i][0]:self.width_intervals[i][1]] = (
+                        arch_vectors[:, self.width_intervals[i][0]:self.width_intervals[i][1]] *
+                        arch_vectors[:, self.depth_indices[i]:(self.depth_indices[i] + 1)])
+
+        arch_vectors_ = arch_vectors_clone * (torch.sqrt(self.template).detach())
+
+        arch_vectors_normalized = arch_vectors_ / arch_vectors_.norm(dim=1, keepdim=True)
         prompt_embeddings = prompt_embeddings / prompt_embeddings.norm(dim=1, keepdim=True)
         arch_vectors_similarity = F.softmax(
-            (arch_vectors @ arch_vectors.T) / self.arch_vector_temperature, dim=-1)
+            (arch_vectors_normalized @ arch_vectors_normalized.T) / self.arch_vector_temperature, dim=-1)
         texts_similarity = F.softmax((prompt_embeddings @ prompt_embeddings.T) / self.prompt_embedding_temperature,
                                      dim=-1)
         loss = F.cross_entropy(arch_vectors_similarity.T, texts_similarity.T, reduction='mean')

@@ -503,9 +503,10 @@ class DiffPruningTrainer:
                 if global_step == 0:
                     self.update_pruning_target()
 
+                pretrain = self.config.training.hypernet_pretraining_steps and global_step < self.config.training.hypernet_pretraining_steps
                 loss, diff_loss, q_loss, contrastive_loss, resource_loss, arch_vectors_similarity, resource_ratio, \
                     flops_dict, arch_vector_quantized, min_encoding_indices, quantizer_embedding_pairwise_similarity = self.step(
-                    batch)
+                    batch, pretrain=pretrain)
 
                 avg_loss = self.accelerator.reduce(loss, "mean")
                 train_loss += avg_loss.item() / self.config.training.gradient_accumulation_steps
@@ -563,7 +564,7 @@ class DiffPruningTrainer:
 
                 if global_step % self.config.training.validation_steps == 0:
                     if self.eval_dataset is not None:
-                        self.validate()
+                        self.validate(pretrain=pretrain)
 
                 if (global_step % self.config.training.image_logging_steps == 0 or
                         (epoch == self.config.training.num_train_epochs - 1 and step == len(
@@ -600,7 +601,7 @@ class DiffPruningTrainer:
         self.accelerator.end_training()
 
     @torch.no_grad()
-    def validate(self):
+    def validate(self, pretrain=False):
         self.init_weight_dtype()
         # Move text_encode and vae to gpu and cast to weight_dtype
         self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
@@ -621,7 +622,7 @@ class DiffPruningTrainer:
         self.unet.eval()
         total_val_loss, total_diff_loss, total_q_loss, total_c_loss, total_r_loss = 0.0, 0.0, 0.0, 0.0, 0.0
         for step, batch in enumerate(self.eval_dataloader):
-            loss, diff_loss, q_loss, contrastive_loss, resource_loss, _, _, _, _, _, _ = self.step(batch)
+            loss, diff_loss, q_loss, contrastive_loss, resource_loss, _, _, _, _, _, _ = self.step(batch, pretrain=pretrain)
             # Gather the losses across all processes for logging (if we use distributed training).
             total_val_loss = loss.item()
             total_diff_loss += diff_loss.item()
@@ -659,7 +660,7 @@ class DiffPruningTrainer:
         del loss, diff_loss, q_loss, contrastive_loss, resource_loss
         torch.cuda.empty_cache()
 
-    def step(self, batch):
+    def step(self, batch, pretrain=False):
         latents = self.vae.encode(batch["pixel_values"].to(self.weight_dtype)).latent_dist.sample()
         latents = latents * self.vae.config.scaling_factor
 
@@ -693,6 +694,7 @@ class DiffPruningTrainer:
         arch_vector_quantized, q_loss, (_, _, min_encoding_indices) = self.quantizer(arch_vector)
 
         if self.accelerator.num_processes > 1:
+            arch_vector = self.quantizer.module.gumbel_sigmoid_trick(arch_vector)
             with torch.no_grad():
                 quantizer_embeddings = self.quantizer.module.get_codebook_entry_gumbel_sigmoid(
                     torch.arange(self.quantizer.module.n_e, device=self.accelerator.device), hard=True).detach()
@@ -709,7 +711,11 @@ class DiffPruningTrainer:
             text_embeddings_list = torch.cat(text_embeddings_list, dim=0)
             arch_vector_list = torch.cat(arch_vector_list, dim=0)
 
-            arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
+            # if in pretrain mode, use the hypernet as the unet pruning architecture vector predictor. Otherwise, use the quantizer.
+            if pretrain:
+                arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector)
+            else:
+                arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
 
         else:
             with torch.no_grad():
@@ -718,10 +724,15 @@ class DiffPruningTrainer:
                     hard=True).detach()
                 quantizer_embeddings /= quantizer_embeddings.norm(dim=-1, keepdim=True)
                 quantizer_embeddings_pairwise_similarity = quantizer_embeddings @ quantizer_embeddings.t()
+
+            arch_vector = self.quantizer.gumbel_sigmoid_trick(arch_vector)
             text_embeddings_list = self.accelerator.gather(text_embeddings)
             arch_vector_list = self.accelerator.gather(arch_vector)
 
-            arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
+            if pretrain:
+                arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector)
+            else:
+                arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
 
         contrastive_loss, arch_vectors_similarity = self.clip_loss(text_embeddings_list, arch_vector_list,
                                                                    return_similarity=True)
