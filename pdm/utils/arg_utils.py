@@ -87,6 +87,12 @@ def parse_args():
         help="The `run_name` argument passed to Accelerator.init_trackers"
     )
     parser.add_argument(
+        "--n_blocks",
+        type=int,
+        default=1,
+        help="Number of consecutive blocks to prune for depth analysis.",
+    )
+    parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
     parser.add_argument("--push_to_hub", action="store_true",

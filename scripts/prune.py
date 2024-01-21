@@ -163,8 +163,7 @@ def main():
     r_loss = ResourceLoss(p=config.training.losses.resource_loss.pruning_target,
                           loss_type=config.training.losses.resource_loss.type)
 
-    clip_loss = ClipLoss(structure=unet_structure,
-                         arch_vector_temperature=config.training.losses.contrastive_clip_loss.arch_vector_temperature,
+    clip_loss = ClipLoss(arch_vector_temperature=config.training.losses.contrastive_clip_loss.arch_vector_temperature,
                          prompt_embedding_temperature=config.training.losses.contrastive_clip_loss.prompt_embedding_temperature)
 
     # Freeze vae and text_encoder and set unet to trainable

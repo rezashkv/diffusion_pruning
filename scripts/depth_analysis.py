@@ -16,7 +16,6 @@
 import logging
 import os
 import random
-import sys
 import datetime
 
 from accelerate.utils import set_seed
@@ -28,7 +27,6 @@ import numpy as np
 import requests
 import torch
 import torch.utils.checkpoint
-import torch.nn.functional as F
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from datasets import load_dataset, Dataset, concatenate_datasets
@@ -36,22 +34,20 @@ from packaging import version
 from torchvision import transforms
 from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, AutoModel
 from transformers.utils import ContextManagers
-from pdm.utils.op_counter import (add_flops_counting_methods)
 
 from diffusers import AutoencoderKL, DDIMScheduler
-from pdm.models.diffusion import UNet2DConditionModelGated
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate
 from diffusers.utils.import_utils import is_xformers_available
+
+from pdm.models.diffusion import UNet2DConditionModelGated
 from pdm.models import HyperStructure
 from pdm.models import StructureVectorQuantizer
 from pdm.losses import ClipLoss, ResourceLoss
 from pdm.utils.arg_utils import parse_args
 from pdm.datasets.cc3m import load_cc3m_dataset
 from pdm.datasets.laion_aes import load_main_laion_dataset
-
 from pdm.training.trainer import DiffPruningTrainer
-
 
 DATASET_NAME_MAPPING = {
     "lambdalabs/pokemon-blip-captions": ("image", "text"),
@@ -64,6 +60,7 @@ logger = get_logger(__name__)
 
 
 def main():
+    torch.autograd.set_detect_anomaly(True)
     args = parse_args()
     config = OmegaConf.load(args.base_config_path)
     # add args to config
@@ -81,8 +78,8 @@ def main():
                 " use `--variant=non_ema` instead."
             ),
         )
-
-    now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    # get current date only
+    now = datetime.datetime.now().strftime("%Y-%m-%dT%H")
 
     if config.name != "":
         nowname = now + f"_{config.name}"
@@ -138,29 +135,36 @@ def main():
         config.pretrained_model_name_or_path,
         subfolder="unet",
         revision=config.non_ema_revision,
-        down_block_types=config.model.unet.unet_down_blocks,
+        down_block_types=tuple(config.model.unet.unet_down_blocks),
         mid_block_type=config.model.unet.unet_mid_block,
-        up_block_types=config.model.unet.unet_up_blocks,
+        up_block_types=tuple(config.model.unet.unet_up_blocks),
+        gated_ff=config.model.unet.gated_ff,
+        ff_gate_width=config.model.unet.ff_gate_width,
+
     )
+
+    mpnet_tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-mpnet-base-v2')
+    mpnet_model = AutoModel.from_pretrained('sentence-transformers/all-mpnet-base-v2')
+
     unet_structure = unet.get_structure()
-    hyper_net = HyperStructure(input_dim=text_encoder.config.hidden_size,
-                               seq_len=text_encoder.config.max_position_embeddings,
+    hyper_net = HyperStructure(input_dim=mpnet_model.config.hidden_size,
                                structure=unet_structure,
                                wn_flag=config.model.hypernet.weight_norm,
-                               inner_dim=config.model.hypernet.inner_dim)
+                               linear_bias=config.model.hypernet.linear_bias)
 
     quantizer = StructureVectorQuantizer(n_e=config.model.quantizer.num_arch_vq_codebook_embeddings,
                                          structure=unet_structure,
                                          beta=config.model.quantizer.arch_vq_beta,
                                          temperature=config.model.quantizer.quantizer_T,
                                          base=config.model.quantizer.quantizer_base,
-                                         depth_order=config.model.quantizer.depth_order)
+                                         depth_order=list(config.model.quantizer.depth_order),
+                                         non_zero_width=config.model.quantizer.non_zero_width)
 
     r_loss = ResourceLoss(p=config.training.losses.resource_loss.pruning_target,
                           loss_type=config.training.losses.resource_loss.type)
 
-    clip_loss = ClipLoss(structure=unet_structure,
-                         temperature=config.training.losses.contrastive_clip_loss.temperature)
+    clip_loss = ClipLoss(arch_vector_temperature=config.training.losses.contrastive_clip_loss.arch_vector_temperature,
+                         prompt_embedding_temperature=config.training.losses.contrastive_clip_loss.prompt_embedding_temperature)
 
     # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
@@ -208,10 +212,6 @@ def main():
     if config.training.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    unet = add_flops_counting_methods(unet)
-    unet.start_flops_count(ost=sys.stdout, verbose=False, ignore_list=[])
-
-    # ##################################################################################################################
     # #################################################### Datasets ####################################################
 
     logging.info("Loading datasets...")
@@ -240,11 +240,11 @@ def main():
         dataset = load_dataset(
             dataset_name,
             dataset_config_name,
-            data_files=data_files,
             cache_dir=config.cache_dir,
-            data_dir=train_data_dir,
             ignore_verifications=True
         )
+
+
     else:
         if "aesthetics" in data_dir:
             if data_files is None:
@@ -322,16 +322,13 @@ def main():
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
+
         inputs = tokenizer(
             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
         return inputs.input_ids
 
-
-    mpnet_tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-mpnet-base-v2')
-    mpnet_model = AutoModel.from_pretrained('sentence-transformers/all-mpnet-base-v2')
-
-    def get_mpnet_embeddings(examples, is_train=True):
+    def get_mpnet_embeddings(capts, is_train=True):
         # Mean Pooling - Take attention mask into account for correct averaging
         def mean_pooling(model_output, attention_mask):
             token_embeddings = model_output[0]  # First element of model_output contains all token embeddings
@@ -340,7 +337,7 @@ def main():
                                                                                       min=1e-9)
 
         captions = []
-        for caption in examples[caption_column]:
+        for caption in capts:
             if isinstance(caption, str):
                 captions.append(caption)
             elif isinstance(caption, (list, np.ndarray)):
@@ -350,12 +347,13 @@ def main():
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
+
         encoded_input = mpnet_tokenizer(captions, padding=True, truncation=True, return_tensors="pt")
         # Compute token embeddings
         with torch.no_grad():
             model_output = mpnet_model(**encoded_input)
         sentence_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
-        sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
+        # sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
         return sentence_embeddings
 
     # Preprocessing the datasets.
@@ -387,14 +385,22 @@ def main():
         # check if image_column path exists:
         if isinstance(examples[image_column][0], str):
             if not os.path.exists(examples[image_column][0]):
-                examples[image_column] = [requests.get(image).content for image in examples[image_column]]
+                downloaded_images = []
+                for image in examples[image_column]:
+                    try:
+                        # download image and convert it to a PIL image
+                        downloaded_images.append(PIL.Image.open(requests.get(image, stream=True).raw))
+                    except:
+                        # remove the caption if the image is not found
+                        downloaded_images.append(None)
+                examples[image_column] = downloaded_images
             else:
                 examples[image_column] = [PIL.Image.open(image) for image in examples[image_column]]
 
-        images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [train_transforms(image) for image in images]
+        images = [image.convert("RGB") if image is not None else image for image in examples[image_column]]
+        examples["pixel_values"] = [train_transforms(image) if image is not None else image for image in images]
         examples["input_ids"] = tokenize_captions(examples)
-        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples, is_train=True)
+        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples[caption_column], is_train=True)
         return examples
 
     def preprocess_validation(examples):
@@ -402,17 +408,30 @@ def main():
         # check if image_column path exists:
         if isinstance(examples[image_column][0], str):
             if not os.path.exists(examples[image_column][0]):
-                examples[image_column] = [requests.get(image).content for image in examples[image_column]]
+                downloaded_images = []
+                for image in examples[image_column]:
+                    try:
+                        # download image and convert it to a PIL image
+                        downloaded_images.append(PIL.Image.open(requests.get(image, stream=True).raw))
+                    except:
+                        # remove the caption if the image is not found
+                        downloaded_images.append(None)
+                examples[image_column] = downloaded_images
             else:
                 examples[image_column] = [PIL.Image.open(image) for image in examples[image_column]]
 
-        images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [validation_transforms(image) for image in images]
+        images = [image.convert("RGB") if image is not None else image for image in examples[image_column]]
+        examples["pixel_values"] = [validation_transforms(image) if image is not None else image for image in images]
         examples["input_ids"] = tokenize_captions(examples, is_train=False)
-        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples, is_train=False)
+        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples[caption_column], is_train=False)
+        return examples
+
+    def preprocess_prompts(examples):
+        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples["prompts"], is_train=False)
         return examples
 
     def collate_fn(examples):
+        examples = [example for example in examples if example["pixel_values"] is not None]
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
         input_ids = torch.stack([example["input_ids"] for example in examples])
@@ -420,8 +439,18 @@ def main():
         mpnet_embeddings = mpnet_embeddings.to(memory_format=torch.contiguous_format).float()
         return {"pixel_values": pixel_values, "input_ids": input_ids, "mpnet_embeddings": mpnet_embeddings}
 
+    def prompts_collate_fn(examples):
+        prompts = [example["prompts"] for example in examples]
+        prompt_embdeddings = torch.stack([example["mpnet_embeddings"] for example in examples])
+        prompt_embdeddings = prompt_embdeddings.to(memory_format=torch.contiguous_format).float()
+        return {"prompts": prompts, "mpnet_embeddings": prompt_embdeddings}
+
     if config.data.prompts is None:
         config.data.prompts = dataset["validation"][caption_column][:config.data.max_generated_samples]
+
+    del args, data_dir, data_files, dataset_config_name, dataset_name, dataset_columns, \
+        train_data_dir, train_data_file, train_bad_images_path, max_train_samples, validation_data_dir, \
+        validation_data_file, validation_bad_images_path, max_validation_samples
 
     trainer = DiffPruningTrainer(config=config,
                                  hyper_net=hyper_net,
@@ -435,13 +464,15 @@ def main():
                                  train_dataset=dataset["train"],
                                  preprocess_train=preprocess_train,
                                  preprocess_eval=preprocess_validation,
+                                 preprocess_prompts=preprocess_prompts,
                                  data_collator=collate_fn,
+                                 prompts_collator=prompts_collate_fn,
                                  ema_unet=ema_unet,
                                  eval_dataset=dataset["validation"],
                                  tokenizer=tokenizer,
                                  )
 
-    trainer.depth_analysis()
+    trainer.depth_analysis(n_consecutive_blocks=config.n_blocks)
 
 
 if __name__ == "__main__":

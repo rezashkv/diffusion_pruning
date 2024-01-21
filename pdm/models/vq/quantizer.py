@@ -32,7 +32,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
             sane_index_shape: bool = True,
             temperature: float = 0.4,
             base: int = 2,
-            depth_order: list = [],
+            depth_order: list = None,
             non_zero_width: bool = True,
             sinkhorn_epsilon: float = 0.05,
             sinkhorn_iterations: int = 3,
@@ -40,7 +40,6 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         super().__init__()
 
         vq_embed_dim = 0
-        # depth_indices = []
         for w_config, d_config in zip(structure['width'], structure['depth']):
             vq_embed_dim += sum(w_config)
             if d_config == [1]:
@@ -52,12 +51,25 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         self.beta = beta
 
         self.structure = structure
+
         self.width_list = [w for sub_width_list in self.structure['width'] for w in sub_width_list]
+        self.width_list_sum = [sum(sub_width_list) for sub_width_list in self.structure['width']]
+        width_indices = [0] + np.cumsum(self.width_list_sum).tolist()
+        self.width_intervals = [(width_indices[i], width_indices[i + 1]) for i in range(len(width_indices) - 1)]
+
         self.depth_list = [d for sub_depth_list in self.structure['depth'] for d in sub_depth_list]
+        widths_sum = sum(self.width_list) - 1
+        self.depth_indices = (widths_sum + np.cumsum(self.depth_list)).tolist()
 
         num_depth_block = sum(self.depth_list)
+        if depth_order is None:
+            depth_order = list(range(num_depth_block))
         self.input_depth_order = depth_order
         self.depth_order = [i % num_depth_block for i in depth_order]
+
+        template = torch.tensor(self.width_list + [d for d in self.depth_list if d != 0])
+        template = torch.repeat_interleave(template, template).type(torch.float32)
+        self.template = (1.0 / template).requires_grad_(False)
 
         self.embedding = nn.Embedding(self.n_e, self.vq_embed_dim)
         nn.init.orthogonal_(self.embedding.weight)
@@ -114,7 +126,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         back = torch.gather(used[None, :][inds.shape[0] * [0], :], 1, inds)
         return back.reshape(ishape)
 
-    def forward(self, z: torch.FloatTensor) -> Tuple[torch.Tensor, torch.Tensor, Tuple]:
+    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Tuple]:
         # reshape z -> (batch, dim) and flatten
         z = z.contiguous()
         z_flattened = z.view(-1, self.vq_embed_dim)
@@ -130,7 +142,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         loss = torch.tensor(0.0, device=z.device)
 
         # preserve gradients
-        # z_q: torch.FloatTensor = z + (z_q - z).detach()
+        # z_q: torch.Tensor = z + (z_q - z).detach()
 
         # reshape back to match original input shape
         z_q = z_q.contiguous()
@@ -150,7 +162,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
         return z_q_out, loss, (perplexity, min_encodings, min_encoding_indices)
 
-    def get_codebook_entry(self, indices: torch.LongTensor, shape: Tuple[int, ...] = None) -> torch.FloatTensor:
+    def get_codebook_entry(self, indices: torch.LongTensor, shape: Tuple[int, ...] = None) -> torch.Tensor:
         # shape specifying (batch, dim)
         if self.remap is not None:
             indices = indices.reshape(shape[0], -1)  # add batch axis
@@ -158,7 +170,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
             indices = indices.reshape(-1)  # flatten again
 
         # get quantized latent vectors
-        z_q: torch.FloatTensor = self.embedding(indices)
+        z_q: torch.Tensor = self.embedding(indices)
 
         if shape is not None:
             z_q = z_q.view(shape)
@@ -174,7 +186,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         else:
             return self.gumbel_sigmoid_trick(z_q)
 
-    def gumbel_sigmoid_trick(self, z_q: torch.FloatTensor):
+    def gumbel_sigmoid_trick(self, z_q: torch.Tensor):
         num_width = sum(self.width_list)
         z_q_width = z_q[:, :num_width]
         z_q_depth = z_q[:, num_width:]
@@ -207,8 +219,23 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
         return arch_vector
 
+    def width_depth_normalize(self, inputs):
+        self.template = self.template.to(inputs.device)
+        # Multiply the slice of the arch_vectors defined by the start and end index of the width of the block with the
+        # corresponding depth element of the arch_vectors.
+        inputs_clone = hard_concrete(inputs.clone())
+        for i, elem in enumerate(self.depth_list):
+            if elem != 0:
+                inputs_clone[:, self.width_intervals[i][0]:self.width_intervals[i][1]] = (
+                        inputs[:, self.width_intervals[i][0]:self.width_intervals[i][1]] *
+                        inputs[:, self.depth_indices[i]:(self.depth_indices[i] + 1)])
+
+        outputs = inputs_clone * (torch.sqrt(self.template).detach())
+
+        return outputs
+
     @torch.no_grad()
-    def get_cosine_sim_min_encoding_indices(self, z: torch.FloatTensor) -> torch.Tensor:
+    def get_cosine_sim_min_encoding_indices(self, z: torch.Tensor) -> torch.Tensor:
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
         u = hard_concrete(self.gumbel_sigmoid_trick(z)).detach()
         u = u / u.norm(dim=-1, keepdim=True)
@@ -218,7 +245,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         return min_encoding_indices
 
     @torch.no_grad()
-    def get_optimal_transport_min_encoding_indices(self, z: torch.FloatTensor) -> torch.Tensor:
+    def get_optimal_transport_min_encoding_indices(self, a: torch.Tensor) -> torch.Tensor:
         @torch.no_grad()
         def distributed_sinkhorn(out):
             Q = torch.exp(out / self.sinkhorn_epsilon).t()  # Q is K-by-B for consistency with notations from the paper
@@ -266,13 +293,16 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
             Q *= B  # the colomns must sum to 1 so that Q is an assignment
             return Q.t()
-        # u = hard_concrete(self.gumbel_sigmoid_trick(z))
-        # u = u / u.norm(dim=-1, keepdim=True)
-        # v = hard_concrete(self.gumbel_sigmoid_trick(self.embedding.weight))
-        # v = v / v.norm(dim=-1, keepdim=True)
-        # out = u @ v.t()
+        a = self.gumbel_sigmoid_trick(a)
+        a = self.width_depth_normalize(a)
+        a = a / a.norm(dim=-1, keepdim=True)
 
-        out = z @ self.embedding.weight.t()
+        codes = self.gumbel_sigmoid_trick(self.embedding.weight)
+        codes = self.width_depth_normalize(codes)
+        codes = codes / codes.norm(dim=-1, keepdim=True)
+
+        out = a @ codes.t()
+
         if dist.is_initialized():
             Q = distributed_sinkhorn(out)
         else:

@@ -636,6 +636,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
             cross_attention_kwargs: Optional[Dict[str, Any]] = None,
             guidance_rescale: float = 0.0,
             return_mapped_indices: bool = False,
+            pretrain: bool = False,
             hyper_net_input: Optional[torch.FloatTensor] = None,
     ):
         r"""
@@ -749,9 +750,16 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
 
         structure_vector_quantized, _, (_, _, min_encoding_indices) = self.quantizer(structure_vector)
         if hasattr(self.hyper_net, "module"):
-            arch_vectors_separated = self.hyper_net.module.transform_structure_vector(structure_vector_quantized)
+            if pretrain:
+                arch_vectors_separated = self.hyper_net.module.transform_structure_vector(structure_vector)
+            else:
+                arch_vectors_separated = self.hyper_net.module.transform_structure_vector(structure_vector_quantized)
         else:
-            arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
+            if pretrain:
+                arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector)
+            else:
+                arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
+
         self.unet.set_structure(arch_vectors_separated)
 
         # For classifier free guidance, we need to do two forward passes.
@@ -815,6 +823,10 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
+        flops_dict = self.unet.calc_flops()
+        resource_ratios = flops_dict['cur_prunable_flops'] / (
+            self.unet.resource_info_dict['cur_prunable_flops'].squeeze())
+
         if not output_type == "latent":
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
             image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
@@ -839,7 +851,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
                 return image, has_nsfw_concept
         if return_mapped_indices:
             return (StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept),
-                    min_encoding_indices)
+                    min_encoding_indices, resource_ratios)
         else:
             return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
 
@@ -1271,6 +1283,9 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
+        flops_dict = self.unet.calc_flops()
+        resource_ratios = flops_dict['cur_prunable_flops'] / (self.unet.resource_info_dict['cur_prunable_flops'].squeeze())
+
         if not output_type == "latent":
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
             image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
@@ -1289,7 +1304,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
         self.maybe_free_model_hooks()
 
         return StableDiffusionPipelineOutput(images=image,
-                                             nsfw_content_detected=has_nsfw_concept), structure_vector_quantized
+                                             nsfw_content_detected=has_nsfw_concept), structure_vector_quantized, resource_ratios
 
     @torch.no_grad()
     def depth_analysis(
@@ -1312,7 +1327,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
             callback_steps: int = 1,
             cross_attention_kwargs: Optional[Dict[str, Any]] = None,
             guidance_rescale: float = 0.0,
-            depth_index: Optional[int] = None,
+            depth_index: Optional[Union[int, List[int]]] = None,
     ):
         # 0. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
@@ -1361,7 +1376,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
         if depth_index is not None:
             structure_vector_quantized[:, depth_index] = 0
 
-        arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
+        arch_vectors_separated = self.hyper_net.module.transform_structure_vector(structure_vector_quantized)
         self.unet.set_structure(arch_vectors_separated)
 
         # For classifier free guidance, we need to do two forward passes.

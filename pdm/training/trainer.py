@@ -31,7 +31,7 @@ from packaging import version
 import accelerate
 
 from pdm.utils.op_counter_orig import count_ops_and_params
-from pdm.utils.logging_utils import create_image_grid_from_indices
+from pdm.utils.logging_utils import create_image_grid_from_indices, create_heatmap
 
 logger = get_logger(__name__)
 
@@ -297,7 +297,7 @@ class DiffPruningTrainer:
 
         # create a torch dataloader from given prompts
         prompt_dataloader = torch.utils.data.DataLoader(self.prompt_dataset,
-                                                        batch_size=self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes,
+                                                        batch_size=self.config.data.dataloader.image_generation_batch_size * self.accelerator.num_processes,
                                                         shuffle=False,
                                                         collate_fn=prompts_collate_fn,
                                                         num_workers=self.config.data.dataloader.dataloader_num_workers)
@@ -308,7 +308,7 @@ class DiffPruningTrainer:
             n_e = self.quantizer.n_e
 
         q_embedding_dataloader = torch.utils.data.DataLoader(torch.arange(n_e),
-                                                             batch_size=self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes,
+                                                             batch_size=self.config.data.dataloader.image_generation_batch_size * self.accelerator.num_processes,
                                                              shuffle=False,
                                                              num_workers=self.config.data.dataloader.dataloader_num_workers)
 
@@ -505,8 +505,8 @@ class DiffPruningTrainer:
 
                 pretrain = self.config.training.hypernet_pretraining_steps and global_step < self.config.training.hypernet_pretraining_steps
                 loss, diff_loss, q_loss, contrastive_loss, resource_loss, arch_vectors_similarity, resource_ratio, \
-                    flops_dict, arch_vector_quantized, min_encoding_indices, quantizer_embedding_pairwise_similarity = self.step(
-                    batch, pretrain=pretrain)
+                    flops_dict, arch_vector_quantized, min_encoding_indices, quantizer_embedding_pairwise_similarity, \
+                    batch_resource_ratios = self.step(batch, pretrain=pretrain)
 
                 avg_loss = self.accelerator.reduce(loss, "mean")
                 train_loss += avg_loss.item() / self.config.training.gradient_accumulation_steps
@@ -569,9 +569,17 @@ class DiffPruningTrainer:
                 if (global_step % self.config.training.image_logging_steps == 0 or
                         (epoch == self.config.training.num_train_epochs - 1 and step == len(
                             self.train_dataloader) - 1)):
+
+                    with torch.no_grad():
+                        batch_resource_ratios = self.accelerator.gather_for_metrics(batch_resource_ratios).cpu().numpy()
+
+                    self.accelerator.log({"images/batch resource ratio heatmap": wandb.Image(
+                        create_heatmap(batch_resource_ratios, n_rows=16, n_cols=len(batch_resource_ratios) // 16))},
+                        log_kwargs={"wandb": {"commit": False}})
+
                     # generate some validation images
                     if self.config.data.prompts is not None:
-                        val_images = self.generate_samples_from_prompts(global_step)
+                        val_images = self.generate_samples_from_prompts(global_step, pretrain=pretrain)
 
                     # visualize the quantizer embeddings
                     self.log_quantizer_embedding_samples(global_step)
@@ -622,7 +630,8 @@ class DiffPruningTrainer:
         self.unet.eval()
         total_val_loss, total_diff_loss, total_q_loss, total_c_loss, total_r_loss = 0.0, 0.0, 0.0, 0.0, 0.0
         for step, batch in enumerate(self.eval_dataloader):
-            loss, diff_loss, q_loss, contrastive_loss, resource_loss, _, _, _, _, _, _ = self.step(batch, pretrain=pretrain)
+            loss, diff_loss, q_loss, contrastive_loss, resource_loss, _, _, _, _, _, _, _ = self.step(batch,
+                                                                                                      pretrain=pretrain)
             # Gather the losses across all processes for logging (if we use distributed training).
             total_val_loss = loss.item()
             total_diff_loss += diff_loss.item()
@@ -695,29 +704,33 @@ class DiffPruningTrainer:
 
         if self.accelerator.num_processes > 1:
             arch_vector = self.quantizer.module.gumbel_sigmoid_trick(arch_vector)
+            arch_vector_width_depth_normalized = self.quantizer.module.width_depth_normalize(arch_vector)
             with torch.no_grad():
                 quantizer_embeddings = self.quantizer.module.get_codebook_entry_gumbel_sigmoid(
                     torch.arange(self.quantizer.module.n_e, device=self.accelerator.device), hard=True).detach()
                 quantizer_embeddings /= quantizer_embeddings.norm(dim=-1, keepdim=True)
                 quantizer_embeddings_pairwise_similarity = quantizer_embeddings @ quantizer_embeddings.t()
+
                 text_embeddings_list = [torch.zeros_like(text_embeddings) for _ in
                                         range(self.accelerator.num_processes)]
                 arch_vector_list = [torch.zeros_like(arch_vector) for _ in
                                     range(self.accelerator.num_processes)]
                 torch.distributed.all_gather(text_embeddings_list, text_embeddings)
-                torch.distributed.all_gather(arch_vector_list, arch_vector)
+                torch.distributed.all_gather(arch_vector_list, arch_vector_width_depth_normalized)
             text_embeddings_list[self.accelerator.process_index] = text_embeddings
-            arch_vector_list[self.accelerator.process_index] = arch_vector
+            arch_vector_list[self.accelerator.process_index] = arch_vector_width_depth_normalized
             text_embeddings_list = torch.cat(text_embeddings_list, dim=0)
             arch_vector_list = torch.cat(arch_vector_list, dim=0)
 
-            # if in pretrain mode, use the hypernet as the unet pruning architecture vector predictor. Otherwise, use the quantizer.
+            # During hyper_net pretraining, we don't cluster the architecture vector and directly use it.
             if pretrain:
                 arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector)
             else:
                 arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
 
         else:
+            arch_vector = self.quantizer.gumbel_sigmoid_trick(arch_vector)
+            arch_vector_width_depth_normalized = self.quantizer.width_depth_normalize(arch_vector)
             with torch.no_grad():
                 quantizer_embeddings = self.quantizer.get_codebook_entry_gumbel_sigmoid(
                     torch.arange(self.quantizer.n_e, device=self.accelerator.device),
@@ -725,10 +738,10 @@ class DiffPruningTrainer:
                 quantizer_embeddings /= quantizer_embeddings.norm(dim=-1, keepdim=True)
                 quantizer_embeddings_pairwise_similarity = quantizer_embeddings @ quantizer_embeddings.t()
 
-            arch_vector = self.quantizer.gumbel_sigmoid_trick(arch_vector)
+            arch_vector_list = self.accelerator.gather(arch_vector_width_depth_normalized)
             text_embeddings_list = self.accelerator.gather(text_embeddings)
-            arch_vector_list = self.accelerator.gather(arch_vector)
 
+            # During hyper_net pretraining, we don't cluster the architecture vector and directly use it.
             if pretrain:
                 arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector)
             else:
@@ -783,18 +796,23 @@ class DiffPruningTrainer:
         resource_ratio = (curr_flops / (self.unet.resource_info_dict['cur_prunable_flops'].squeeze()))
         resource_loss = self.resource_loss(resource_ratio)
 
+        with torch.no_grad():
+            batch_resource_ratios = flops_dict['cur_prunable_flops'] / (
+                self.unet.resource_info_dict['cur_prunable_flops'].squeeze())
+
         diff_loss = loss.clone().detach().mean()
         loss += self.config.training.losses.resource_loss.weight * resource_loss
         # loss += self.config.training.losses.quantization_loss.weight * q_loss
         loss += self.config.training.losses.contrastive_clip_loss.weight * contrastive_loss
 
         del latents, noise, timesteps, noisy_latents, encoder_hidden_states, text_embeddings, arch_vector, arch_vectors_separated, \
-            quantizer_embeddings, text_embeddings_list, arch_vector_list, curr_flops, model_pred, target
+            quantizer_embeddings, text_embeddings_list, arch_vector_list, curr_flops, model_pred, target, \
+            arch_vector_width_depth_normalized
         torch.cuda.empty_cache()
 
         return (loss, diff_loss, q_loss, contrastive_loss, resource_loss, arch_vectors_similarity,
                 resource_ratio, flops_dict, arch_vector_quantized, min_encoding_indices,
-                quantizer_embeddings_pairwise_similarity)
+                quantizer_embeddings_pairwise_similarity, batch_resource_ratios)
 
     @torch.no_grad()
     def count_flops(self, batch):
@@ -845,7 +863,7 @@ class DiffPruningTrainer:
         torch.cuda.empty_cache()
 
     @torch.no_grad()
-    def generate_samples_from_prompts(self, global_step):
+    def generate_samples_from_prompts(self, global_step, save_images=False, pretrain=False):
         logger.info("Generating samples from the given prompts... ")
 
         pipeline = self.get_pipeline()
@@ -855,38 +873,46 @@ class DiffPruningTrainer:
         os.makedirs(image_output_dir, exist_ok=True)
         images = []
         embedding_indices = []
+        prompts_resource_ratios = []
 
         for step, batch in enumerate(self.prompt_dataloader):
-            with torch.autocast("cuda"):
-                if self.config.seed is None:
-                    generator = None
-                else:
-                    generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
-                gen_images, batch_embedding_indices = pipeline(batch["prompts"],
-                                                               num_inference_steps=self.config.training.num_inference_steps,
-                                                               generator=generator, output_type="pt",
-                                                               return_mapped_indices=True,
-                                                               hyper_net_input=batch["mpnet_embeddings"]
-                                                               )
-                gen_images = gen_images.images
-                gen_images = self.accelerator.gather_for_metrics(gen_images)
-                batch_embedding_indices = self.accelerator.gather_for_metrics(batch_embedding_indices)
-                images += gen_images
-                embedding_indices += batch_embedding_indices
+            if self.config.seed is None:
+                generator = None
+            else:
+                generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
+            gen_images, batch_embedding_indices, resource_ratios = pipeline(batch["prompts"],
+                                                                            num_inference_steps=self.config.training.num_inference_steps,
+                                                                            generator=generator, output_type="pt",
+                                                                            return_mapped_indices=True,
+                                                                            hyper_net_input=batch["mpnet_embeddings"],
+                                                                            pretrain=pretrain
+                                                                            )
+            gen_images = gen_images.images
+            gen_images = self.accelerator.gather_for_metrics(gen_images)
+            batch_embedding_indices = self.accelerator.gather_for_metrics(batch_embedding_indices)
+            resource_ratios = self.accelerator.gather_for_metrics(resource_ratios)
+            images += gen_images
+            embedding_indices += batch_embedding_indices
+            prompts_resource_ratios += resource_ratios
 
         min_encoding_indices_image = create_image_grid_from_indices([x.item() for x in embedding_indices],
                                                                     grid_size=(4, len(images) // 4))
         images = [torchvision.transforms.ToPILImage()(img) for img in images]
         images = make_image_grid(images, len(images) // 4, 4)
+        prompts_resource_ratios = torch.cat(prompts_resource_ratios, dim=0).cpu().numpy()
+        prompts_resource_ratios_images = create_heatmap(prompts_resource_ratios, n_rows=4,
+                                                        n_cols=len(prompts_resource_ratios) // 4)
 
-        if self.accelerator.is_main_process:
+
+        if self.accelerator.is_main_process and save_images:
             images.save(os.path.join(image_output_dir, "prompt_images.png"))
             min_encoding_indices_image.save(os.path.join(image_output_dir, "min_encoding_indices.png"))
 
         self.accelerator.log(
             {
                 "images/prompt images": wandb.Image(images),
-                "images/prompts min encoding indices": wandb.Image(min_encoding_indices_image)
+                "images/prompts min encoding indices": wandb.Image(min_encoding_indices_image),
+                "images/prompts resource ratio heatmap": wandb.Image(prompts_resource_ratios_images),
             },
             log_kwargs={"wandb": {"commit": False}}
         )
@@ -897,7 +923,7 @@ class DiffPruningTrainer:
         return images
 
     @torch.no_grad()
-    def log_quantizer_embedding_samples(self, step):
+    def log_quantizer_embedding_samples(self, step, save_to_disk=False):
         logger.info("Sampling from quantizer... ")
 
         pipeline = self.get_pipeline()
@@ -907,44 +933,50 @@ class DiffPruningTrainer:
         os.makedirs(image_output_dir, exist_ok=True)
 
         images = []
-
         quantizer_embedding_gumbel_sigmoid = []
+        embeddings_resource_ratios = []
 
         for step, indices in enumerate(self.quantizer_embeddings_dataloader):
-            with torch.autocast("cuda"):
-                if self.config.seed is None:
-                    generator = None
-                else:
-                    generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
+            if self.config.seed is None:
+                generator = None
+            else:
+                generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
 
-                gen_images, quantizer_embed_gs = pipeline.quantizer_samples(indices=indices,
-                                                                            num_inference_steps=self.config.training.num_inference_steps,
-                                                                            generator=generator, output_type="pt")
-                gen_images = gen_images.images
-                gen_images = self.accelerator.gather_for_metrics(gen_images)
-                quantizer_embed_gs = self.accelerator.gather_for_metrics(quantizer_embed_gs)
-                quantizer_embedding_gumbel_sigmoid += quantizer_embed_gs
-                images += gen_images
+            gen_images, quantizer_embed_gs, resource_ratios = pipeline.quantizer_samples(indices=indices,
+                                                                                         num_inference_steps=self.config.training.num_inference_steps,
+                                                                                         generator=generator,
+                                                                                         output_type="pt")
+            gen_images = gen_images.images
+            gen_images = self.accelerator.gather_for_metrics(gen_images)
+            quantizer_embed_gs = self.accelerator.gather_for_metrics(quantizer_embed_gs)
+            resource_ratios = self.accelerator.gather_for_metrics(resource_ratios)
+            quantizer_embedding_gumbel_sigmoid += quantizer_embed_gs
+            images += gen_images
+            embeddings_resource_ratios += resource_ratios
 
         quantizer_embedding_gumbel_sigmoid = torch.cat(quantizer_embedding_gumbel_sigmoid, dim=0)
         images = [torchvision.transforms.ToPILImage()(img) for img in images]
         images = make_image_grid(images, len(images) // 4, 4)
+        embeddings_resource_ratios = torch.cat(embeddings_resource_ratios, dim=0).cpu().numpy()
+        embeddings_resource_ratios_images = create_heatmap(embeddings_resource_ratios, n_rows=4,
+                                                           n_cols=len(embeddings_resource_ratios) // 4)
 
-        if self.accelerator.is_main_process:
+        if self.accelerator.is_main_process and save_to_disk:
             images.save(os.path.join(image_output_dir, "quantizer_embedding_images.png"))
             torch.save(quantizer_embedding_gumbel_sigmoid, os.path.join(image_output_dir,
                                                                         "quantizer_embeddings_gumbel_sigmoid.pt"))
 
-        self.accelerator.log({"images/quantizer embedding images": wandb.Image(images)},
+        self.accelerator.log({"images/quantizer embedding images": wandb.Image(images),
+                              "images/embedding resource ratio heatmap": wandb.Image(
+                                  embeddings_resource_ratios_images)},
                              log_kwargs={"wandb": {"commit": False}})
 
-        del pipeline, quantizer_embedding_gumbel_sigmoid, gen_images, quantizer_embed_gs
+        del pipeline, quantizer_embedding_gumbel_sigmoid, gen_images, quantizer_embed_gs, images, \
+            embeddings_resource_ratios, embeddings_resource_ratios_images
         torch.cuda.empty_cache()
 
-        return images
-
     @torch.no_grad()
-    def depth_analysis(self):
+    def depth_analysis(self, n_consecutive_blocks=1):
         logger.info("Generating depth analysis samples from the given prompts... ")
         pipeline = self.get_pipeline()
 
@@ -966,31 +998,32 @@ class DiffPruningTrainer:
                 disable=not self.accelerator.is_main_process,
             )
             for step in range(0, len(self.config.data.prompts),
-                              self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes):
+                              self.config.data.dataloader.image_generation_batch_size * self.accelerator.num_processes):
                 batch = self.config.data.prompts[
-                        step:step + self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes]
-                with torch.autocast("cuda"):
-                    with self.accelerator.split_between_processes(batch) as batch:
-                        if self.config.seed is None:
-                            generator = None
-                        else:
-                            generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
+                        step:step + self.config.data.dataloader.image_generation_batch_size * self.accelerator.num_processes]
+                with self.accelerator.split_between_processes(batch) as batch:
+                    if self.config.seed is None:
+                        generator = None
+                    else:
+                        generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
 
-                        if d_block == n_depth_pruned_blocks:
-                            gen_images = pipeline.depth_analysis(batch,
-                                                                 num_inference_steps=self.config.training.num_inference_steps,
-                                                                 generator=generator, depth_index=None,
-                                                                 output_type="pt").images
-                        else:
-                            gen_images = pipeline.depth_analysis(batch,
-                                                                 num_inference_steps=self.config.training.num_inference_steps,
-                                                                 generator=generator, depth_index=d_block,
-                                                                 output_type="pt").images
+                    if d_block == n_depth_pruned_blocks:
+                        gen_images = pipeline.depth_analysis(batch,
+                                                             num_inference_steps=self.config.training.num_inference_steps,
+                                                             generator=generator, depth_index=None,
+                                                             output_type="pt").images
+                    else:
+                        if n_consecutive_blocks > 1:
+                            d_blocks = [(d_block + i) % n_depth_pruned_blocks for i in range(n_consecutive_blocks)]
+                        gen_images = pipeline.depth_analysis(batch,
+                                                             num_inference_steps=self.config.training.num_inference_steps,
+                                                             generator=generator, depth_index=d_blocks,
+                                                             output_type="pt").images
 
-                        gen_images = self.accelerator.gather(gen_images)
+                    gen_images = self.accelerator.gather(gen_images)
 
-                        # append gen_images to images dict at the same key
-                        images[d_block] += gen_images
+                    # append gen_images to images dict at the same key
+                    images[d_block] += gen_images
 
                 progress_bar.update(self.config.data.dataloader.validation_batch_size * self.accelerator.num_processes)
 
@@ -1004,20 +1037,12 @@ class DiffPruningTrainer:
             image_grid.save(os.path.join(image_output_dir, f"depth_{i}.png"))
             image_grids[i] = image_grid
 
-        for tracker in self.accelerator.trackers:
-            if tracker.name == "wandb":
-                tracker.log(
-                    {
-                        "depth analysis": [
-                            wandb.Image(image_grid, caption=f"Depth: {i}")
-                            for i, image_grid in image_grids.items()
-                        ]
-                    }
-                )
-            else:
-                logger.warn(f"image logging not implemented for {tracker.name}")
+        self.accelerator.log(
+            {"depth analysis": [wandb.Image(image_grid, caption=f"Depth: {i}") for i, image_grid in
+                                image_grids.items()]}
+        )
 
-        del pipeline
+        del pipeline, images, image_grids
         torch.cuda.empty_cache()
         return gen_images
 

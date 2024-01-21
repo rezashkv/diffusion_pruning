@@ -1,4 +1,6 @@
 from PIL import Image, ImageDraw, ImageFont
+import seaborn as sns
+import matplotlib.pyplot as plt
 
 
 def create_image_grid_from_indices(indices, grid_size=(5, 5), image_size=(256, 256), font_size=40):
@@ -30,3 +32,10 @@ def create_image_grid_from_indices(indices, grid_size=(5, 5), image_size=(256, 2
 
     # Save or display the resulting image
     return background
+
+def create_heatmap(data, n_rows, n_cols):
+    plt.figure()
+    data = data.reshape(n_rows, n_cols)
+    fig = sns.heatmap(data, cmap='Blues', linewidth=0.5, xticklabels=False, yticklabels=False).get_figure()
+    return fig
+
