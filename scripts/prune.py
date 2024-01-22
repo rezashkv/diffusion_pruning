@@ -100,6 +100,7 @@ def main():
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDIMScheduler.from_pretrained(config.pretrained_model_name_or_path, subfolder="scheduler")
+
     tokenizer = CLIPTokenizer.from_pretrained(
         config.pretrained_model_name_or_path, subfolder="tokenizer", revision=config.revision
     )
@@ -158,7 +159,9 @@ def main():
                                          temperature=config.model.quantizer.quantizer_T,
                                          base=config.model.quantizer.quantizer_base,
                                          depth_order=list(config.model.quantizer.depth_order),
-                                         non_zero_width=config.model.quantizer.non_zero_width)
+                                         non_zero_width=config.model.quantizer.non_zero_width,
+                                         resource_aware_normalization=config.model.quantizer.resource_aware_normalization
+                                         )
 
     r_loss = ResourceLoss(p=config.training.losses.resource_loss.pruning_target,
                           loss_type=config.training.losses.resource_loss.type)
@@ -244,20 +247,25 @@ def main():
             ignore_verifications=True
         )
 
-
     else:
         if "aesthetics" in data_dir:
+            data_dir = os.path.join(data_dir, "data")
             if data_files is None:
-                # datafiles a list of 5-char strs from 00000 to 00200
-                data_files = [f"{i:05d}" for i in range(250)]
+                # datafiles a list of 5-char strs from 00000 to 00250.
+                data_files = [f"{i:05d}" for i in range(50)]
             train_data = load_main_laion_dataset(data_dir, list(data_files))
-
+            val_data = load_main_laion_dataset(data_dir, ["01000"])
             # Convert the loaded data into a Hugging Face Dataset
             tr_datasets = []
             for dataset_name, dataset in train_data.items():
                 tr_datasets.append(Dataset.from_list(dataset))
-            dataset = {'train': concatenate_datasets(tr_datasets), 'validation': None}
-            del tr_datasets
+
+            val_datasets = []
+            for dataset_name, dataset in val_data.items():
+                val_datasets.append(Dataset.from_list(dataset))
+
+            dataset = {'train': concatenate_datasets(tr_datasets), 'validation': concatenate_datasets(val_datasets)}
+            del tr_datasets, val_datasets, train_data, val_data
 
         elif "conceptual_captions" in data_dir:
             dataset = {"train": load_cc3m_dataset(data_dir,

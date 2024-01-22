@@ -36,6 +36,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
             non_zero_width: bool = True,
             sinkhorn_epsilon: float = 0.05,
             sinkhorn_iterations: int = 3,
+            resource_aware_normalization: bool = True,
     ):
         super().__init__()
 
@@ -70,6 +71,10 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         template = torch.tensor(self.width_list + [d for d in self.depth_list if d != 0])
         template = torch.repeat_interleave(template, template).type(torch.float32)
         self.template = (1.0 / template).requires_grad_(False)
+        self.prunable_flops_template = None
+        if resource_aware_normalization is None:
+            resource_aware_normalization = True
+        self.resource_effect_normalization = resource_aware_normalization
 
         self.embedding = nn.Embedding(self.n_e, self.vq_embed_dim)
         nn.init.orthogonal_(self.embedding.weight)
@@ -131,7 +136,11 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         z = z.contiguous()
         z_flattened = z.view(-1, self.vq_embed_dim)
 
-        min_encoding_indices = self.get_optimal_transport_min_encoding_indices(z_flattened)
+        # if in training use optimal transport, else use cosine similarity
+        if self.training:
+            min_encoding_indices = self.get_optimal_transport_min_encoding_indices(z_flattened)
+        else:
+            min_encoding_indices = self.get_cosine_sim_min_encoding_indices(z_flattened)
 
         z_q = self.embedding(min_encoding_indices).view(z.shape)
         perplexity = None
@@ -179,7 +188,8 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
         return z_q
 
-    def get_codebook_entry_gumbel_sigmoid(self, indices: torch.LongTensor, shape: Tuple[int, ...] = None, hard=False) -> torch.Tensor:
+    def get_codebook_entry_gumbel_sigmoid(self, indices: torch.LongTensor, shape: Tuple[int, ...] = None,
+                                          hard=False) -> torch.Tensor:
         z_q = self.get_codebook_entry(indices, shape).contiguous()
         if hard:
             return hard_concrete(self.gumbel_sigmoid_trick(z_q))
@@ -221,6 +231,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
     def width_depth_normalize(self, inputs):
         self.template = self.template.to(inputs.device)
+        self.prunable_flops_template = self.prunable_flops_template.to(inputs.device)
         # Multiply the slice of the arch_vectors defined by the start and end index of the width of the block with the
         # corresponding depth element of the arch_vectors.
         inputs_clone = hard_concrete(inputs.clone())
@@ -231,15 +242,27 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
                         inputs[:, self.depth_indices[i]:(self.depth_indices[i] + 1)])
 
         outputs = inputs_clone * (torch.sqrt(self.template).detach())
+        if self.config.resource_aware_normalization:
+            outputs = outputs * self.prunable_flops_template.detach()
 
         return outputs
+
+    def set_prunable_flops_template(self, prunable_flops_list):
+        depth_template = []
+        for i, elem in enumerate(self.depth_list):
+            if elem == 1:
+                depth_template.append([sum(prunable_flops_list[i])])
+        prunable_flops_list += depth_template
+        prunable_flops_list = [item for sublist in prunable_flops_list for item in sublist]
+        self.prunable_flops_template = torch.repeat_interleave(torch.tensor(prunable_flops_list),
+                                                               torch.tensor(self.width_list + [1 for _ in range(len(depth_template))]))
 
     @torch.no_grad()
     def get_cosine_sim_min_encoding_indices(self, z: torch.Tensor) -> torch.Tensor:
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
-        u = hard_concrete(self.gumbel_sigmoid_trick(z)).detach()
+        u = self.width_depth_normalize(self.gumbel_sigmoid_trick(z))
         u = u / u.norm(dim=-1, keepdim=True)
-        v = hard_concrete(self.gumbel_sigmoid_trick(self.embedding.weight)).detach()
+        v = self.width_depth_normalize(self.gumbel_sigmoid_trick(self.embedding.weight))
         v = v / v.norm(dim=-1, keepdim=True)
         min_encoding_indices = torch.argmax(u @ v.t(), dim=-1)
         return min_encoding_indices
@@ -293,6 +316,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
             Q *= B  # the colomns must sum to 1 so that Q is an assignment
             return Q.t()
+
         a = self.gumbel_sigmoid_trick(a)
         a = self.width_depth_normalize(a)
         a = a / a.norm(dim=-1, keepdim=True)

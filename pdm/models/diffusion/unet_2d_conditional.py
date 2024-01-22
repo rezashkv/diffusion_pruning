@@ -2182,3 +2182,12 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         out_dict['cur_total_flops'] += self.conv_out.__flops__
 
         return out_dict
+
+    def get_prunable_flops(self):
+        flops = []
+        for m in self.down_blocks:
+            flops += m.get_prunable_flops()
+        flops += self.mid_block.get_prunable_flops()
+        for m in self.up_blocks:
+            flops += m.get_prunable_flops()
+        return flops

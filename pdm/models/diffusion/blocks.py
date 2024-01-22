@@ -46,7 +46,7 @@ class GEGLUGated(GEGLU):
         hidden_states = mask.expand_as(hidden_states) * hidden_states
         gate = mask.expand_as(gate) * gate
         return hidden_states * self.gelu(gate)
-    
+
 
 class FeedForwardWidthGated(FeedForward):
     r"""
@@ -110,14 +110,14 @@ class GatedAttention(Attention):
         self.prunable_flops, self.total_flops = 0., 0.
 
     def calc_flops(self):
-        assert ((self.total_flops != 0.) and (self.prunable_flops != 0.)) 
+        assert ((self.total_flops != 0.) and (self.prunable_flops != 0.))
         hard_width_gate = hard_concrete(self.gate.gate_f)
         ratio = hard_width_gate.sum(dim=1, keepdim=True) / hard_width_gate.shape[1]
         return {"prunable_flops": self.prunable_flops,
                 "total_flops": self.total_flops,
                 "cur_prunable_flops": ratio * self.prunable_flops,
                 "cur_total_flops": ratio.detach() * self.prunable_flops + (self.total_flops - self.prunable_flops)}
-        
+
 
 class HeadGatedAttnProcessor2(AttnProcessor2_0):
     def __init__(self):
@@ -357,6 +357,9 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
                 "cur_prunable_flops": ratio * self.prunable_flops,
                 "cur_total_flops": (ratio.detach()) * self.prunable_flops + (self.total_flops - self.prunable_flops)}
 
+    def get_prunable_flops(self):
+        return [self.prunable_flops]
+
 
 class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
     def __init__(self, skip_connection_dim=None, is_input_concatenated=False, *args, **kwargs):
@@ -516,9 +519,13 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         depth_ratio = depth_hard_gate.sum(dim=1, keepdim=True) / depth_hard_gate.shape[1]
         return {"prunable_flops": self.prunable_flops,
                 "total_flops": self.total_flops,
-                "cur_prunable_flops": ((ratio * self.prunable_flops) + ( self.total_flops - self.prunable_flops)) * depth_ratio,
+                "cur_prunable_flops": ((ratio * self.prunable_flops) + (
+                        self.total_flops - self.prunable_flops)) * depth_ratio,
                 "cur_total_flops": ((ratio.detach()) * self.prunable_flops + (
                         self.total_flops - self.prunable_flops)) * (depth_ratio.detach())}
+
+    def get_prunable_flops(self):
+        return [self.prunable_flops]
 
 
 class BasicTransformerBlockWidthGated(BasicTransformerBlock):
@@ -731,11 +738,17 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
 
         if self.total_flops == 0.:
             self.total_flops = out_dict["total_flops"]
-        
+
         if self.prunable_flops == 0.:
             self.prunable_flops = out_dict["prunable_flops"]
 
         return out_dict
+
+    def get_prunable_flops(self):
+        flops = [self.attn1.prunable_flops, self.attn2.prunable_flops]
+        if isinstance(self.ff, FeedForwardWidthGated):
+            flops.append(self.ff.prunable_flops)
+        return flops
 
 
 class Transformer2DModelWidthGated(Transformer2DModel):
@@ -848,11 +861,17 @@ class Transformer2DModelWidthGated(Transformer2DModel):
 
         if self.total_flops == 0.:
             self.total_flops = out_dict["total_flops"]
-        
+
         if self.prunable_flops == 0:
             self.prunable_flops = out_dict["prunable_flops"]
 
         return out_dict
+
+    def get_prunable_flops(self):
+        flops = []
+        for tb in self.transformer_blocks:
+            flops += tb.get_prunable_flops()
+        return flops
 
 
 class Transformer2DModelWidthDepthGated(Transformer2DModel):
@@ -1134,7 +1153,6 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
 
         return Transformer2DModelOutput(sample=output_tensor)
 
-
     def get_gate_structure(self):
         if len(self.structure['width']) == 0:
             for tb in self.transformer_blocks:
@@ -1183,14 +1201,21 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
 
         if self.total_flops == 0.:
             self.total_flops = out_dict["total_flops"]
-        
+
         if self.prunable_flops == 0:
             self.prunable_flops = out_dict["prunable_flops"]
 
-        out_dict["cur_prunable_flops"] = (out_dict["cur_prunable_flops"] + self.total_flops - self.prunable_flops) * depth_ratio
+        out_dict["cur_prunable_flops"] = (out_dict[
+                                              "cur_prunable_flops"] + self.total_flops - self.prunable_flops) * depth_ratio
         out_dict["cur_total_flops"] = out_dict["cur_total_flops"] * (depth_ratio.detach())
-        
+
         return out_dict
+
+    def get_prunable_flops(self):
+        flops = []
+        for tb in self.transformer_blocks:
+            flops += tb.get_prunable_flops()
+        return flops
 
 
 class DualTransformer2DModelWidthGated(DualTransformer2DModel):
@@ -1620,16 +1645,16 @@ class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
 
     def calc_flops(self):
         out_dict = {"prunable_flops": 0., "total_flops": 0., "cur_prunable_flops": 0., "cur_total_flops": 0.}
-        
+
         blocks = list(zip(self.resnets, self.attentions))
         for (resnet, attention) in blocks:
             resnet_flops = resnet.calc_flops()
-            
+
             for k in out_dict.keys():
                 out_dict[k] = out_dict[k] + resnet_flops[k]
 
             attention_flops = attention.calc_flops()
-            
+
             for k in out_dict.keys():
                 out_dict[k] = out_dict[k] + attention_flops[k]
 
@@ -1642,11 +1667,19 @@ class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
 
         if self.total_flops == 0.:
             self.total_flops = out_dict["total_flops"]
-        
+
         if self.prunable_flops == 0:
             self.prunable_flops = out_dict["prunable_flops"]
-        
+
         return out_dict
+
+    def get_prunable_flops(self):
+        flops = []
+        for b in self.resnets:
+            flops.append(b.get_prunable_flops())
+        for b in self.attentions:
+            flops.append(b.get_prunable_flops())
+        return flops
 
 
 class CrossAttnUpBlock2DWidthDepthGated(CrossAttnUpBlock2D):
@@ -1892,24 +1925,12 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
                 b_structure = b.get_gate_structure()
                 structure['width'].append(b_structure['width'])
                 structure['depth'].append(b_structure['depth'])
-                # if len(b_structure) == 1:
-                #     structure['width'] = structure['width'] + b_structure['width']
-
-                # elif len(b_structure) == 2:
-                #     structure['width'] = structure['width'] + b_structure['width']
-                #     structure['depth'] = structure['depth'] + b_structure['depth']
 
             for b in self.attentions:
                 assert hasattr(b, "get_gate_structure")
                 b_structure = b.get_gate_structure()
                 structure['width'].append(b_structure['width'])
                 structure['depth'].append(b_structure['depth'])
-                # if len(b_structure) == 1:
-                #     structure['width'] = structure['width'] + b_structure['width']
-
-                # elif len(b_structure) == 2:
-                #     structure['width'] = structure['width'] + b_structure['width']
-                #     structure['depth'] = structure['depth'] + b_structure['depth']
 
             self.structure = structure
 
@@ -1949,16 +1970,16 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
 
     def calc_flops(self):
         out_dict = {"prunable_flops": 0., "total_flops": 0., "cur_prunable_flops": 0., "cur_total_flops": 0.}
-        
+
         blocks = list(zip(self.resnets, self.attentions))
         for (resnet, attention) in blocks:
             resnet_flops = resnet.calc_flops()
-            
+
             for k in out_dict.keys():
                 out_dict[k] = out_dict[k] + resnet_flops[k]
 
             attention_flops = attention.calc_flops()
-            
+
             for k in out_dict.keys():
                 out_dict[k] = out_dict[k] + attention_flops[k]
 
@@ -1972,11 +1993,19 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
 
         if self.total_flops == 0.:
             self.total_flops = out_dict["total_flops"]
-        
+
         if self.prunable_flops == 0:
             self.prunable_flops = out_dict["prunable_flops"]
-        
+
         return out_dict
+
+    def get_prunable_flops(self):
+        flops = []
+        for b in self.resnets:
+            flops.append(b.get_prunable_flops())
+        for b in self.attentions:
+            flops.append(b.get_prunable_flops())
+        return flops
 
 
 class DownBlock2DWidthDepthGated(DownBlock2D):
@@ -2121,7 +2150,7 @@ class DownBlock2DWidthHalfDepthGated(DownBlock2D):
 
         for resnet in self.resnets:
             resnet_flops = resnet.calc_flops()
-            
+
             for k in out_dict.keys():
                 out_dict[k] = out_dict[k] + resnet_flops[k]
 
@@ -2130,17 +2159,23 @@ class DownBlock2DWidthHalfDepthGated(DownBlock2D):
                 b_flops = 0
                 for m in b.children():
                     b_flops += m.__flops__
-                
+
                 out_dict["total_flops"] += b_flops
                 out_dict["cur_total_flops"] += b_flops
 
         if self.total_flops == 0.:
             self.total_flops = out_dict["total_flops"]
-        
+
         if self.prunable_flops == 0:
             self.prunable_flops = out_dict["prunable_flops"]
 
         return out_dict
+
+    def get_prunable_flops(self):
+        flops = []
+        for b in self.resnets:
+            flops.append(b.get_prunable_flops())
+        return flops
 
 
 class UpBlock2DWidthDepthGated(UpBlock2D):
@@ -2292,7 +2327,7 @@ class UpBlock2DWidthHalfDepthGated(UpBlock2D):
 
         for resnet in self.resnets:
             resnet_flops = resnet.calc_flops()
-            
+
             for k in out_dict.keys():
                 out_dict[k] = out_dict[k] + resnet_flops[k]
 
@@ -2307,11 +2342,17 @@ class UpBlock2DWidthHalfDepthGated(UpBlock2D):
 
         if self.total_flops == 0.:
             self.total_flops = out_dict["total_flops"]
-        
+
         if self.prunable_flops == 0:
             self.prunable_flops = out_dict["prunable_flops"]
 
         return out_dict
+
+    def get_prunable_flops(self):
+        flops = []
+        for b in self.resnets:
+            flops.append(b.get_prunable_flops())
+        return flops
 
 
 class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
@@ -2471,7 +2512,7 @@ class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
             resnet_flops = resnet.calc_flops()
             for k in out_dict.keys():
                 out_dict[k] = out_dict[k] + resnet_flops[k]
-        
+
         for attention in self.attentions:
             attention_flops = attention.calc_flops()
             for k in out_dict.keys():
@@ -2479,8 +2520,16 @@ class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
 
         if self.total_flops == 0.:
             self.total_flops = out_dict["total_flops"]
-        
+
         if self.prunable_flops == 0:
             self.prunable_flops = out_dict["prunable_flops"]
 
         return out_dict
+
+    def get_prunable_flops(self):
+        flops = []
+        for b in self.resnets:
+            flops.append(b.get_prunable_flops())
+        for b in self.attentions:
+            flops.append(b.get_prunable_flops())
+        return flops
