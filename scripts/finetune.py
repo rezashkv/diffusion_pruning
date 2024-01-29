@@ -88,6 +88,7 @@ def main():
 
     config.training.logging.logging_dir = os.path.join(config.training.logging.logging_dir,
                                                        os.getcwd().split('/')[-2],
+                                                       config.base_config_path.split('/')[-2],
                                                        config.base_config_path.split('/')[-1].split('.')[0],
                                                        nowname)
 
@@ -147,21 +148,25 @@ def main():
     mpnet_tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-mpnet-base-v2')
     mpnet_model = AutoModel.from_pretrained('sentence-transformers/all-mpnet-base-v2')
 
-    unet_structure = unet.get_structure()
-    hyper_net = HyperStructure(input_dim=mpnet_model.config.hidden_size,
-                               structure=unet_structure,
-                               wn_flag=config.model.hypernet.weight_norm,
-                               linear_bias=config.model.hypernet.linear_bias)
+    if config.checkpoint_dir is None:
+        unet_structure = unet.get_structure()
+        hyper_net = HyperStructure(input_dim=mpnet_model.config.hidden_size,
+                                   structure=unet_structure,
+                                   wn_flag=config.model.hypernet.weight_norm,
+                                   linear_bias=config.model.hypernet.linear_bias)
 
-    quantizer = StructureVectorQuantizer(n_e=config.model.quantizer.num_arch_vq_codebook_embeddings,
-                                         structure=unet_structure,
-                                         beta=config.model.quantizer.arch_vq_beta,
-                                         temperature=config.model.quantizer.quantizer_T,
-                                         base=config.model.quantizer.quantizer_base,
-                                         depth_order=list(config.model.quantizer.depth_order),
-                                         non_zero_width=config.model.quantizer.non_zero_width,
-                                         resource_aware_normalization=config.model.quantizer.resource_aware_normalization
-                                         )
+        quantizer = StructureVectorQuantizer(n_e=config.model.quantizer.num_arch_vq_codebook_embeddings,
+                                             structure=unet_structure,
+                                             beta=config.model.quantizer.arch_vq_beta,
+                                             temperature=config.model.quantizer.quantizer_T,
+                                             base=config.model.quantizer.quantizer_base,
+                                             depth_order=list(config.model.quantizer.depth_order),
+                                             non_zero_width=config.model.quantizer.non_zero_width,
+                                             resource_aware_normalization=config.model.quantizer.resource_aware_normalization
+                                             )
+    else:
+        hyper_net = HyperStructure.from_pretrained(config.checkpoint_dir, subfolder="hypernet")
+        quantizer = StructureVectorQuantizer.from_pretrained(config.checkpoint_dir, subfolder="quantizer")
 
     r_loss = ResourceLoss(p=config.training.losses.resource_loss.pruning_target,
                           loss_type=config.training.losses.resource_loss.type)
@@ -189,8 +194,7 @@ def main():
     else:
         ema_unet = None
 
-    unet.eval()
-    unet.freeze()
+    unet.train()
     hyper_net.train()
     quantizer.train()
 
@@ -484,7 +488,7 @@ def main():
                                  tokenizer=tokenizer,
                                  )
 
-    trainer.train()
+    trainer.finetune()
 
 
 if __name__ == "__main__":

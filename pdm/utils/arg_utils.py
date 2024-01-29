@@ -30,6 +30,12 @@ def parse_args():
         help="Path to the model/data/training config file.",
     )
     parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default=None,
+        help="Path to the saved pruning checkpoint. used for finetuning.",
+    )
+    parser.add_argument(
         "--name",
         type=str,
         default="",

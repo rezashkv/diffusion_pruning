@@ -3,7 +3,7 @@ from typing import Tuple
 import numpy as np
 import torch
 from diffusers.configuration_utils import register_to_config, ConfigMixin
-from torch import nn
+from torch import nn, Tensor
 from pdm.utils.estimation_utils import gumbel_softmax_sample, hard_concrete, importance_gumbel_softmax_sample
 from diffusers import ModelMixin
 import torch.distributed as dist
@@ -36,7 +36,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
             non_zero_width: bool = True,
             sinkhorn_epsilon: float = 0.05,
             sinkhorn_iterations: int = 3,
-            resource_aware_normalization: bool = True,
+            resource_aware_normalization: bool = True
     ):
         super().__init__()
 
@@ -78,6 +78,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
         self.embedding = nn.Embedding(self.n_e, self.vq_embed_dim)
         nn.init.orthogonal_(self.embedding.weight)
+        self.embedding_gs = nn.Parameter(torch.zeros_like(self.embedding.weight), requires_grad=False)
 
         self.remap = remap
         if self.remap is not None:
@@ -142,7 +143,17 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         else:
             min_encoding_indices = self.get_cosine_sim_min_encoding_indices(z_flattened)
 
-        z_q = self.embedding(min_encoding_indices).view(z.shape)
+        if self.training:
+            embedding_gs = self.gumbel_sigmoid_trick(self.embedding.weight)
+            self.embedding_gs.data = embedding_gs.detach()
+        else:
+            embedding_gs = self.embedding_gs
+
+        z_q = embedding_gs[min_encoding_indices].view(z.shape)
+
+        z_q_out = z_q.contiguous()
+        # z_q_out = self.gumbel_sigmoid_trick(z_q)
+
         perplexity = None
         min_encodings = None
 
@@ -154,7 +165,6 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         # z_q: torch.Tensor = z + (z_q - z).detach()
 
         # reshape back to match original input shape
-        z_q = z_q.contiguous()
 
         if self.remap is not None:
             min_encoding_indices = min_encoding_indices.reshape(z.shape[0], -1)  # add batch axis
@@ -164,10 +174,8 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         if self.sane_index_shape:
             min_encoding_indices = min_encoding_indices.reshape(z_q.shape[0])
 
-        z_q_out = self.gumbel_sigmoid_trick(z_q)
-
         if not self.training:
-            z_q_out = hard_concrete(z_q_out)
+            z_q_out = hard_concrete(z_q)
 
         return z_q_out, loss, (perplexity, min_encodings, min_encoding_indices)
 
@@ -231,7 +239,8 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
     def width_depth_normalize(self, inputs):
         self.template = self.template.to(inputs.device)
-        self.prunable_flops_template = self.prunable_flops_template.to(inputs.device)
+        if self.resource_effect_normalization:
+            self.prunable_flops_template = self.prunable_flops_template.to(inputs.device)
         # Multiply the slice of the arch_vectors defined by the start and end index of the width of the block with the
         # corresponding depth element of the arch_vectors.
         inputs_clone = hard_concrete(inputs.clone())

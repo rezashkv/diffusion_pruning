@@ -199,6 +199,7 @@ class DiffPruningTrainer:
                     f"q_lr:{self.config.training.optim.quantizer_learning_rate}")
             self.accelerator.init_trackers(self.config.tracker_project_name, tracker_config,
                                            init_kwargs={"wandb": {"name": self.config.wandb_run_name,
+                                                                  "dir": self.config.training.logging.wandb_log_dir,
                                                                   "resume": resume}})
 
     def configure_logging(self):
@@ -322,8 +323,14 @@ class DiffPruningTrainer:
                     self.config.data.dataloader.train_batch_size *
                     self.accelerator.num_processes
             )
-            self.config.raining.optim.quantizer_learning_rate = (
+            self.config.training.optim.quantizer_learning_rate = (
                     self.config.training.optim.quantizer_learning_rate *
+                    self.config.training.optim.gradient_accumulation_steps *
+                    self.config.data.dataloader.train_batch_size *
+                    self.accelerator.num_processes
+            )
+            self.config.training.optim.unet_learning_rate = (
+                    self.config.training.optim.unet_learning_rate *
                     self.config.training.optim.gradient_accumulation_steps *
                     self.config.data.dataloader.train_batch_size *
                     self.accelerator.num_processes
@@ -348,6 +355,8 @@ class DiffPruningTrainer:
                  "weight_decay": self.config.training.optim.hypernet_weight_decay},
                 {"params": self.quantizer.parameters(), "lr": self.config.training.optim.quantizer_learning_rate,
                  "weight_decay": self.config.training.optim.quantizer_weight_decay},
+                {"params": self.unet.parameters(), "lr": self.config.training.optim.unet_learning_rate,
+                 "weight_decay": self.config.training.optim.unet_weight_decay},
             ],
             betas=(self.config.training.optim.adam_beta1, self.config.training.optim.adam_beta2),
             eps=self.config.training.optim.adam_epsilon,
@@ -494,6 +503,7 @@ class DiffPruningTrainer:
                 train_loss = 0.0
                 self.hyper_net.train()
                 self.quantizer.train()
+                self.unet.eval()
 
                 # Calculating the MACs of each module of the model in the first iteration.
                 if global_step == initial_global_step:
@@ -591,9 +601,6 @@ class DiffPruningTrainer:
             # checkpoint at the end of each epoch
             if self.accelerator.is_main_process:
                 self.save_checkpoint(logging_dir, global_step)
-                # arch_vector_quantized_list = self.accelerator.gather(arch_vector_quantized)
-                # save architecture vector quantized
-                # torch.save(arch_vector_quantized_list, os.path.join(logging_dir, f"arch_vector_quantized.pt"))
 
         # Create the pipeline using the trained modules and save it.
         self.accelerator.wait_for_everyone()
@@ -632,9 +639,9 @@ class DiffPruningTrainer:
         total_val_loss, total_diff_loss, total_q_loss, total_c_loss, total_r_loss = 0.0, 0.0, 0.0, 0.0, 0.0
         for step, batch in enumerate(self.eval_dataloader):
             loss, diff_loss, q_loss, contrastive_loss, resource_loss, _, _, _, _, _, _ = self.step(batch,
-                                                                                                      pretrain=pretrain)
+                                                                                                   pretrain=pretrain)
             # Gather the losses across all processes for logging (if we use distributed training).
-            total_val_loss = loss.item()
+            total_val_loss += loss.item()
             total_diff_loss += diff_loss.item()
             total_q_loss += q_loss.item()
             total_c_loss += contrastive_loss.item()
@@ -792,13 +799,15 @@ class DiffPruningTrainer:
             loss = loss.mean()
 
         flops_dict = self.unet.calc_flops()
-        curr_flops = flops_dict['cur_prunable_flops'].mean()
+        curr_flops = flops_dict['cur_prunable_flops']
 
         # The reason is that sanity['prunable_flops'] does not have depth-related pruning flops
         # like skip connections of resnets in it.
-        resource_ratio = (curr_flops / (self.unet.resource_info_dict['cur_prunable_flops'].squeeze()))
-        resource_loss = self.resource_loss(resource_ratio)
+        resource_ratios = (curr_flops / (self.unet.resource_info_dict['cur_prunable_flops'].squeeze()))
+        resource_loss = self.resource_loss(resource_ratios.mean())
 
+        # max_loss = 1. - torch.max(resource_ratios)
+        std_loss = -torch.std(resource_ratios)
         with torch.no_grad():
             batch_resource_ratios = flops_dict['cur_prunable_flops'] / (
                 self.unet.resource_info_dict['cur_prunable_flops'].squeeze())
@@ -807,14 +816,254 @@ class DiffPruningTrainer:
         loss += self.config.training.losses.resource_loss.weight * resource_loss
         # loss += self.config.training.losses.quantization_loss.weight * q_loss
         loss += self.config.training.losses.contrastive_clip_loss.weight * contrastive_loss
+        # loss += max_loss
+        loss += 0.25 * std_loss
 
         del latents, noise, timesteps, noisy_latents, encoder_hidden_states, text_embeddings, arch_vector, arch_vectors_separated, \
             quantizer_embeddings, text_embeddings_list, arch_vector_list, curr_flops, model_pred, target, \
             arch_vector_width_depth_normalized
         torch.cuda.empty_cache()
 
-        return (loss, diff_loss, q_loss, contrastive_loss, resource_loss, arch_vectors_similarity, resource_ratio,
-                flops_dict, arch_vector_quantized, quantizer_embeddings_pairwise_similarity, batch_resource_ratios)
+        return (
+            loss, diff_loss, q_loss, contrastive_loss, resource_loss, arch_vectors_similarity, resource_ratios.mean(),
+            flops_dict, arch_vector_quantized, quantizer_embeddings_pairwise_similarity, batch_resource_ratios)
+
+    def finetune(self):
+        self.init_weight_dtype()
+
+        # Move text_encode and vae to gpu and cast to weight_dtype
+        self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
+        self.vae.to(self.accelerator.device, dtype=self.weight_dtype)
+
+        self.pre_train_setup()
+        # Train!
+        logging_dir = self.config.training.logging.logging_dir
+        total_batch_size = (self.config.data.dataloader.train_batch_size * self.accelerator.num_processes *
+                            self.config.training.gradient_accumulation_steps)
+
+        initial_global_step, first_epoch = self.load_checkpoint()
+        global_step = initial_global_step
+
+        if len(self.accelerator.trackers) == 0:
+            if global_step == 0:
+                self.init_trackers(resume=False)
+            else:
+                self.init_trackers(resume=True)
+
+        logger.info("***** Running finetuning *****")
+        logger.info(f"  Num examples = {len(self.train_dataset)}")
+        logger.info(f"  Num Epochs = {self.config.training.num_train_epochs}")
+        logger.info(f"  Instantaneous batch size per device = {self.config.data.dataloader.train_batch_size}")
+        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+        logger.info(f"  Gradient Accumulation steps = {self.config.training.gradient_accumulation_steps}")
+        logger.info(f"  Total optimization steps = {self.config.training.max_train_steps}")
+
+        progress_bar = tqdm(
+            range(0, self.config.training.max_train_steps),
+            initial=initial_global_step,
+            desc="Steps",
+            # Only show the progress bar once on each machine.
+            disable=not self.accelerator.is_main_process,
+        )
+
+        for epoch in range(first_epoch, self.config.training.num_train_epochs):
+            for step, batch in enumerate(self.train_dataloader):
+                train_loss = 0.0
+                self.hyper_net.eval()
+                self.quantizer.eval()
+                self.unet.train()
+
+                loss = self.finetune_step(batch)
+                avg_loss = self.accelerator.reduce(loss, "mean")
+                train_loss += avg_loss.item() / self.config.training.gradient_accumulation_steps
+
+                # Back-propagate
+                self.accelerator.backward(loss)
+                self.optimizer.step()
+                self.lr_scheduler.step()
+                self.optimizer.zero_grad()
+
+                # Checks if the accelerator has performed an optimization step behind the scenes
+                if self.accelerator.sync_gradients:
+                    if self.config.use_ema:
+                        self.ema_unet.step(self.unet.parameters())
+                    progress_bar.update(1)
+                    global_step += 1
+                    log_dict = {
+                        "finetuning/loss": train_loss,
+                        "finetuning/unet_lr": self.lr_scheduler.get_last_lr()[2],
+                    }
+                    self.accelerator.log(log_dict)
+
+                logs = {
+                    "step_loss": loss.detach().item(),
+                    "lr": self.lr_scheduler.get_last_lr()[2],
+                }
+                progress_bar.set_postfix(**logs)
+
+                if global_step % self.config.training.validation_steps == 0:
+                    if self.eval_dataset is not None:
+                        self.finetuning_validate()
+
+                if (global_step % self.config.training.image_logging_steps == 0 or
+                        (epoch == self.config.training.num_train_epochs - 1 and step == len(
+                            self.train_dataloader) - 1)):
+
+                    with torch.no_grad():
+                        batch_resource_ratios = self.accelerator.gather_for_metrics(batch_resource_ratios).cpu().numpy()
+
+                    self.accelerator.log({"images/batch resource ratio heatmap": wandb.Image(
+                        create_heatmap(batch_resource_ratios, n_rows=16, n_cols=len(batch_resource_ratios) // 16))},
+                        log_kwargs={"wandb": {"commit": False}})
+
+                    # generate some validation images
+                    if self.config.data.prompts is not None:
+                        val_images = self.generate_samples_from_prompts(global_step, pretrain=False)
+
+                if global_step >= self.config.training.max_train_steps:
+                    break
+
+            # checkpoint at the end of each epoch
+            if self.accelerator.is_main_process:
+                self.save_checkpoint(logging_dir, global_step)
+
+            # Create the pipeline using the trained modules and save it.
+            self.accelerator.wait_for_everyone()
+            if self.accelerator.is_main_process:
+                if self.config.push_to_hub:
+                    self.save_model_card(self.repo_id, val_images, repo_folder=self.config.output_dir)
+                    upload_folder(
+                        repo_id=self.repo_id,
+                        folder_path=logging_dir,
+                        commit_message="End of training",
+                        ignore_patterns=["step_*", "epoch_*"],
+                    )
+
+            self.accelerator.end_training()
+
+    def finetune_step(self, batch):
+        latents = self.vae.encode(batch["pixel_values"].to(self.weight_dtype)).latent_dist.sample()
+        latents = latents * self.vae.config.scaling_factor
+
+        # Sample noise that we'll add to the latents
+        noise = torch.randn_like(latents)
+        if self.config.model.unet.noise_offset:
+            # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+            noise += self.config.model.unet.noise_offset * torch.randn(
+                (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+            )
+        if self.config.model.unet.input_perturbation:
+            new_noise = noise + self.config.model.unet.input_perturbation * torch.randn_like(noise)
+        bsz = latents.shape[0]
+        # Sample a random timestep for each image
+        if self.config.model.unet.max_scheduler_steps is None:
+            self.config.model.unet.max_scheduler_steps = self.noise_scheduler.config.num_train_timesteps
+        timesteps = torch.randint(0, self.config.model.unet.max_scheduler_steps, (bsz,),
+                                  device=latents.device)
+        timesteps = timesteps.long()
+
+        # Add noise to the latents according to the noise magnitude at each timestep
+        # (this is the forward diffusion process)
+        if self.config.model.unet.input_perturbation:
+            noisy_latents = self.noise_scheduler.add_noise(latents, new_noise, timesteps)
+        else:
+            noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+
+        # Get the text embedding for conditioning
+        encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
+        text_embeddings = batch["mpnet_embeddings"]
+
+        arch_vector = self.hyper_net(text_embeddings)
+        arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
+
+        if self.accelerator.num_processes > 1:
+            arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
+            self.unet.module.set_structure(arch_vectors_separated)
+        else:
+            arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
+            self.unet.set_structure(arch_vectors_separated)
+
+        # Get the target for loss depending on the prediction type
+        if self.config.model.unet.prediction_type is not None:
+            # set prediction_type of scheduler if defined
+            self.noise_scheduler.register_to_config(prediction_type=self.config.model.unet.prediction_type)
+
+        if self.noise_scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif self.noise_scheduler.config.prediction_type == "v_prediction":
+            target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
+        else:
+            raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
+
+        # Predict the noise residual and compute loss
+        model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+        if self.config.training.losses.diffusion_loss.snr_gamma is None:
+            loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+        else:
+            # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+            # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+            # This is discussed in Section 4.2 of the same paper.
+            snr = compute_snr(self.noise_scheduler, timesteps)
+            if self.noise_scheduler.config.prediction_type == "v_prediction":
+                # Velocity objective requires that we add one to SNR values before we divide by them.
+                snr = snr + 1
+            mse_loss_weights = (
+                    torch.stack(
+                        [snr,
+                         self.config.training.losses.diffusion_loss.snr_gamma * torch.ones_like(timesteps)],
+                        dim=1).min(dim=1)[0] / snr
+            )
+
+            loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+            loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+            loss = loss.mean()
+
+        del latents, noise, timesteps, noisy_latents, encoder_hidden_states, text_embeddings, arch_vector, \
+            arch_vectors_separated, model_pred, target
+        torch.cuda.empty_cache()
+
+        return loss
+
+    @torch.no_grad()
+    def finetuning_validate(self):
+        self.init_weight_dtype()
+        # Move text_encode and vae to gpu and cast to weight_dtype
+        self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
+        self.vae.to(self.accelerator.device, dtype=self.weight_dtype)
+        if len(self.accelerator.trackers) == 0:
+            self.init_trackers()
+
+        progress_bar = tqdm(
+            range(0, len(self.eval_dataloader)),
+            initial=0,
+            desc="Val Steps",
+            # Only show the progress bar once on each machine.
+            disable=not self.accelerator.is_main_process,
+        )
+
+        self.hyper_net.eval()
+        self.quantizer.eval()
+        self.unet.eval()
+        total_val_loss = 0.0
+        for step, batch in enumerate(self.eval_dataloader):
+            loss = self.finetune_step(batch)
+            # Gather the losses across all processes for logging (if we use distributed training).
+            total_val_loss += loss.item()
+            progress_bar.update(1)
+
+        total_val_loss /= len(self.eval_dataloader)
+
+        total_val_loss = self.accelerator.reduce(torch.tensor(total_val_loss, device=self.accelerator.device),
+                                                 "mean").item()
+
+        self.accelerator.log({
+            "validation/loss": total_val_loss,
+        },
+            log_kwargs={"wandb": {"commit": False}})
+
+        del loss, total_val_loss
+        torch.cuda.empty_cache()
 
     @torch.no_grad()
     def count_flops(self, batch):
@@ -842,7 +1091,8 @@ class DiffPruningTrainer:
                 params / 1e6, flops / 1e9))
         sanity_flops_dict = self.unet.calc_flops()
 
-        prunable_flops_list = [[e / sanity_flops_dict['prunable_flops'] for e in elem] for elem in self.unet.get_prunable_flops()]
+        prunable_flops_list = [[e / sanity_flops_dict['prunable_flops'] for e in elem] for elem in
+                               self.unet.get_prunable_flops()]
         self.unet.prunable_flops_list = prunable_flops_list
 
         self.unet.resource_info_dict = sanity_flops_dict
@@ -857,7 +1107,6 @@ class DiffPruningTrainer:
         del latents, timesteps, encoder_hidden_states, arch_vecs_separated, flops, params, sanity_flops_dict, \
             sanity_string
         torch.cuda.empty_cache()
-
 
     @torch.no_grad()
     def update_pruning_target(self):
@@ -887,12 +1136,12 @@ class DiffPruningTrainer:
             else:
                 generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
             gen_images, _, resource_ratios = pipeline(batch["prompts"],
-                                                                            num_inference_steps=self.config.training.num_inference_steps,
-                                                                            generator=generator, output_type="pt",
-                                                                            return_mapped_indices=True,
-                                                                            hyper_net_input=batch["mpnet_embeddings"],
-                                                                            pretrain=pretrain
-                                                                            )
+                                                      num_inference_steps=self.config.training.num_inference_steps,
+                                                      generator=generator, output_type="pt",
+                                                      return_mapped_indices=True,
+                                                      hyper_net_input=batch["mpnet_embeddings"],
+                                                      pretrain=pretrain
+                                                      )
             gen_images = gen_images.images
             gen_images = self.accelerator.gather_for_metrics(gen_images)
             resource_ratios = self.accelerator.gather_for_metrics(resource_ratios)
