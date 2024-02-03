@@ -750,18 +750,11 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
 
         structure_vector_quantized, _, (_, _, min_encoding_indices) = self.quantizer(structure_vector)
 
-        if hasattr(self.hyper_net, "module"):
-            structure_vector = self.quantizer.module.gumbel_sigmoid_trick(structure_vector)
-            if pretrain:
-                arch_vectors_separated = self.hyper_net.module.transform_structure_vector(structure_vector)
-            else:
-                arch_vectors_separated = self.hyper_net.module.transform_structure_vector(structure_vector_quantized)
+        structure_vector = self.quantizer.gumbel_sigmoid_trick(structure_vector)
+        if pretrain:
+            arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector)
         else:
-            structure_vector = self.quantizer.gumbel_sigmoid_trick(structure_vector)
-            if pretrain:
-                arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector)
-            else:
-                arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
+            arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
 
         self.unet.set_structure(arch_vectors_separated)
 
@@ -992,10 +985,8 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
         else:
             structure_vector = self.hyper_net(hyper_net_input)
         structure_vector_quantized, _, _ = self.quantizer(structure_vector)
-        if hasattr(self.hyper_net, "module"):
-            arch_vectors_separated = self.hyper_net.module.transform_structure_vector(structure_vector_quantized)
-        else:
-            arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
+        arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
+
         self.unet.set_structure(arch_vectors_separated)
 
         # For classifier free guidance, we need to do two forward passes.
@@ -1215,14 +1206,9 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
             negative_prompt_embeds=negative_prompt_embeds,
             lora_scale=text_encoder_lora_scale,
         )
-        if hasattr(self.quantizer, "module"):
-            structure_vector_quantized = self.quantizer.module.get_codebook_entry_gumbel_sigmoid(indices)
-        else:
-            structure_vector_quantized = self.quantizer.get_codebook_entry_gumbel_sigmoid(indices)
-        if hasattr(self.hyper_net, "module"):
-            arch_vectors_separated = self.hyper_net.module.transform_structure_vector(structure_vector_quantized)
-        else:
-            arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
+        structure_vector_quantized = self.quantizer.get_codebook_entry_gumbel_sigmoid(indices)
+        arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
+
         self.unet.set_structure(arch_vectors_separated)
 
         # For classifier free guidance, we need to do two forward passes.
@@ -1371,15 +1357,12 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
             lora_scale=text_encoder_lora_scale,
         )
 
-        if hasattr(self.quantizer, "module"):
-            vq_embed_dim = self.quantizer.module.vq_embed_dim
-        else:
-            vq_embed_dim = self.quantizer.vq_embed_dim
+        vq_embed_dim = self.quantizer.vq_embed_dim
         structure_vector_quantized = torch.ones((batch_size, vq_embed_dim), device=device)
         if depth_index is not None:
             structure_vector_quantized[:, depth_index] = 0
 
-        arch_vectors_separated = self.hyper_net.module.transform_structure_vector(structure_vector_quantized)
+        arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
         self.unet.set_structure(arch_vectors_separated)
 
         # For classifier free guidance, we need to do two forward passes.

@@ -88,6 +88,7 @@ def main():
 
     config.training.logging.logging_dir = os.path.join(config.training.logging.logging_dir,
                                                        os.getcwd().split('/')[-2],
+                                                       config.base_config_path.split('/')[-2],
                                                        config.base_config_path.split('/')[-1].split('.')[0],
                                                        nowname)
 
@@ -129,7 +130,7 @@ def main():
             config.pretrained_model_name_or_path, subfolder="text_encoder", revision=config.revision
         )
         vae = AutoencoderKL.from_pretrained(
-            config.pretrained_model_name_or_path, subfolder="vae", revision=config.revision
+                config.pretrained_model_name_or_path, subfolder="vae", revision=config.revision
         )
 
     unet = UNet2DConditionModelGated.from_pretrained(
@@ -189,10 +190,6 @@ def main():
     else:
         ema_unet = None
 
-    unet.eval()
-    unet.freeze()
-    hyper_net.train()
-    quantizer.train()
 
     if config.training.enable_xformers_memory_efficient_attention:
         if is_xformers_available():

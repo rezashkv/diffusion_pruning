@@ -303,10 +303,7 @@ class DiffPruningTrainer:
                                                         collate_fn=prompts_collate_fn,
                                                         num_workers=self.config.data.dataloader.dataloader_num_workers)
 
-        if hasattr(self.quantizer, "module"):
-            n_e = self.quantizer.module.n_e
-        else:
-            n_e = self.quantizer.n_e
+        n_e = self.quantizer.n_e
 
         q_embedding_dataloader = torch.utils.data.DataLoader(torch.arange(n_e),
                                                              batch_size=self.config.data.dataloader.image_generation_batch_size * self.accelerator.num_processes,
@@ -498,6 +495,9 @@ class DiffPruningTrainer:
             disable=not self.accelerator.is_main_process,
         )
 
+        for param in self.unet.parameters():
+            param.requires_grad = False
+
         for epoch in range(first_epoch, self.config.training.num_train_epochs):
             for step, batch in enumerate(self.train_dataloader):
                 train_loss = 0.0
@@ -508,10 +508,7 @@ class DiffPruningTrainer:
                 # Calculating the MACs of each module of the model in the first iteration.
                 if global_step == initial_global_step:
                     self.count_flops(batch)
-                    if self.accelerator.num_processes > 1:
-                        self.quantizer.module.set_prunable_flops_template(self.unet.prunable_flops_list)
-                    else:
-                        self.quantizer.set_prunable_flops_template(self.unet.prunable_flops_list)
+                    self.quantizer.module.set_prunable_flops_template(self.unet.module.prunable_flops_list)
 
                 # pruning target is for total flops. we calculate loss for prunable flops.
                 if global_step == 0:
@@ -712,55 +709,35 @@ class DiffPruningTrainer:
         arch_vector = self.hyper_net(text_embeddings)
         arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
 
-        if self.accelerator.num_processes > 1:
-            arch_vector = self.quantizer.module.gumbel_sigmoid_trick(arch_vector)
-            arch_vector_width_depth_normalized = self.quantizer.module.width_depth_normalize(arch_vector)
-            with torch.no_grad():
-                quantizer_embeddings = self.quantizer.module.get_codebook_entry_gumbel_sigmoid(
-                    torch.arange(self.quantizer.module.n_e, device=self.accelerator.device), hard=True).detach()
-                quantizer_embeddings /= quantizer_embeddings.norm(dim=-1, keepdim=True)
-                quantizer_embeddings_pairwise_similarity = quantizer_embeddings @ quantizer_embeddings.t()
+        arch_vector = self.quantizer.module.gumbel_sigmoid_trick(arch_vector)
+        arch_vector_width_depth_normalized = self.quantizer.module.width_depth_normalize(arch_vector)
+        with torch.no_grad():
+            quantizer_embeddings = self.quantizer.module.get_codebook_entry_gumbel_sigmoid(
+                torch.arange(self.quantizer.module.n_e, device=self.accelerator.device), hard=True).detach()
+            quantizer_embeddings /= quantizer_embeddings.norm(dim=-1, keepdim=True)
+            quantizer_embeddings_pairwise_similarity = quantizer_embeddings @ quantizer_embeddings.t()
 
-                text_embeddings_list = [torch.zeros_like(text_embeddings) for _ in
-                                        range(self.accelerator.num_processes)]
-                arch_vector_list = [torch.zeros_like(arch_vector) for _ in
+            text_embeddings_list = [torch.zeros_like(text_embeddings) for _ in
                                     range(self.accelerator.num_processes)]
-                torch.distributed.all_gather(text_embeddings_list, text_embeddings)
-                torch.distributed.all_gather(arch_vector_list, arch_vector_width_depth_normalized)
-            text_embeddings_list[self.accelerator.process_index] = text_embeddings
-            arch_vector_list[self.accelerator.process_index] = arch_vector_width_depth_normalized
-            text_embeddings_list = torch.cat(text_embeddings_list, dim=0)
-            arch_vector_list = torch.cat(arch_vector_list, dim=0)
+            arch_vector_list = [torch.zeros_like(arch_vector) for _ in
+                                range(self.accelerator.num_processes)]
+            torch.distributed.all_gather(text_embeddings_list, text_embeddings)
+            torch.distributed.all_gather(arch_vector_list, arch_vector_width_depth_normalized)
+        text_embeddings_list[self.accelerator.process_index] = text_embeddings
+        arch_vector_list[self.accelerator.process_index] = arch_vector_width_depth_normalized
+        text_embeddings_list = torch.cat(text_embeddings_list, dim=0)
+        arch_vector_list = torch.cat(arch_vector_list, dim=0)
 
-            # During hyper_net pretraining, we don't cluster the architecture vector and directly use it.
-            if pretrain:
-                arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector)
-            else:
-                arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
-
+        # During hyper_net pretraining, we don't cluster the architecture vector and directly use it.
+        if pretrain:
+            arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector)
         else:
-            arch_vector = self.quantizer.gumbel_sigmoid_trick(arch_vector)
-            arch_vector_width_depth_normalized = self.quantizer.width_depth_normalize(arch_vector)
-            with torch.no_grad():
-                quantizer_embeddings = self.quantizer.get_codebook_entry_gumbel_sigmoid(
-                    torch.arange(self.quantizer.n_e, device=self.accelerator.device),
-                    hard=True).detach()
-                quantizer_embeddings /= quantizer_embeddings.norm(dim=-1, keepdim=True)
-                quantizer_embeddings_pairwise_similarity = quantizer_embeddings @ quantizer_embeddings.t()
-
-            arch_vector_list = self.accelerator.gather(arch_vector_width_depth_normalized)
-            text_embeddings_list = self.accelerator.gather(text_embeddings)
-
-            # During hyper_net pretraining, we don't cluster the architecture vector and directly use it.
-            if pretrain:
-                arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector)
-            else:
-                arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
+            arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
 
         contrastive_loss, arch_vectors_similarity = self.clip_loss(text_embeddings_list, arch_vector_list,
                                                                    return_similarity=True)
 
-        self.unet.set_structure(arch_vectors_separated)
+        self.unet.module.set_structure(arch_vectors_separated)
 
         # Get the target for loss depending on the prediction type
         if self.config.model.unet.prediction_type is not None:
@@ -798,26 +775,25 @@ class DiffPruningTrainer:
             loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
             loss = loss.mean()
 
-        flops_dict = self.unet.calc_flops()
+        flops_dict = self.unet.module.calc_flops()
         curr_flops = flops_dict['cur_prunable_flops']
 
         # The reason is that sanity['prunable_flops'] does not have depth-related pruning flops
         # like skip connections of resnets in it.
-        resource_ratios = (curr_flops / (self.unet.resource_info_dict['cur_prunable_flops'].squeeze()))
+        resource_ratios = (curr_flops / (self.unet.module.resource_info_dict['cur_prunable_flops'].squeeze()))
         resource_loss = self.resource_loss(resource_ratios.mean())
 
-        # max_loss = 1. - torch.max(resource_ratios)
+        max_loss = 1. - torch.max(resource_ratios)
         std_loss = -torch.std(resource_ratios)
         with torch.no_grad():
             batch_resource_ratios = flops_dict['cur_prunable_flops'] / (
-                self.unet.resource_info_dict['cur_prunable_flops'].squeeze())
+                self.unet.module.resource_info_dict['cur_prunable_flops'].squeeze())
 
         diff_loss = loss.clone().detach().mean()
         loss += self.config.training.losses.resource_loss.weight * resource_loss
-        # loss += self.config.training.losses.quantization_loss.weight * q_loss
         loss += self.config.training.losses.contrastive_clip_loss.weight * contrastive_loss
-        # loss += max_loss
-        loss += 0.25 * std_loss
+        loss += self.config.training.losses.std_loss.weight * std_loss
+        loss += self.config.training.losses.max_loss.weight * max_loss
 
         del latents, noise, timesteps, noisy_latents, encoder_hidden_states, text_embeddings, arch_vector, arch_vectors_separated, \
             quantizer_embeddings, text_embeddings_list, arch_vector_list, curr_flops, model_pred, target, \
@@ -866,12 +842,22 @@ class DiffPruningTrainer:
             disable=not self.accelerator.is_main_process,
         )
 
+        for param in self.hyper_net.parameters():
+            param.requires_grad = False
+        for param in self.quantizer.parameters():
+            param.requires_grad = False
+
+
         for epoch in range(first_epoch, self.config.training.num_train_epochs):
             for step, batch in enumerate(self.train_dataloader):
                 train_loss = 0.0
                 self.hyper_net.eval()
                 self.quantizer.eval()
                 self.unet.train()
+
+                # Calculating the MACs of each module of the model in the first iteration.
+                if global_step == initial_global_step:
+                    self.count_flops(batch)
 
                 loss = self.finetune_step(batch)
                 avg_loss = self.accelerator.reduce(loss, "mean")
@@ -901,6 +887,9 @@ class DiffPruningTrainer:
                 }
                 progress_bar.set_postfix(**logs)
 
+                del loss, avg_loss, train_loss
+                torch.cuda.empty_cache()
+
                 if global_step % self.config.training.validation_steps == 0:
                     if self.eval_dataset is not None:
                         self.finetuning_validate()
@@ -908,13 +897,6 @@ class DiffPruningTrainer:
                 if (global_step % self.config.training.image_logging_steps == 0 or
                         (epoch == self.config.training.num_train_epochs - 1 and step == len(
                             self.train_dataloader) - 1)):
-
-                    with torch.no_grad():
-                        batch_resource_ratios = self.accelerator.gather_for_metrics(batch_resource_ratios).cpu().numpy()
-
-                    self.accelerator.log({"images/batch resource ratio heatmap": wandb.Image(
-                        create_heatmap(batch_resource_ratios, n_rows=16, n_cols=len(batch_resource_ratios) // 16))},
-                        log_kwargs={"wandb": {"commit": False}})
 
                     # generate some validation images
                     if self.config.data.prompts is not None:
@@ -939,7 +921,7 @@ class DiffPruningTrainer:
                         ignore_patterns=["step_*", "epoch_*"],
                     )
 
-            self.accelerator.end_training()
+        self.accelerator.end_training()
 
     def finetune_step(self, batch):
         latents = self.vae.encode(batch["pixel_values"].to(self.weight_dtype)).latent_dist.sample()
@@ -976,12 +958,8 @@ class DiffPruningTrainer:
         arch_vector = self.hyper_net(text_embeddings)
         arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
 
-        if self.accelerator.num_processes > 1:
-            arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
-            self.unet.module.set_structure(arch_vectors_separated)
-        else:
-            arch_vectors_separated = self.hyper_net.transform_structure_vector(arch_vector_quantized)
-            self.unet.set_structure(arch_vectors_separated)
+        arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
+        self.unet.module.set_structure(arch_vectors_separated)
 
         # Get the target for loss depending on the prediction type
         if self.config.model.unet.prediction_type is not None:
@@ -1067,14 +1045,12 @@ class DiffPruningTrainer:
 
     @torch.no_grad()
     def count_flops(self, batch):
-        if self.accelerator.num_processes > 1:
-            arch_vecs_separated = self.hyper_net.module.transform_structure_vector(
-                torch.ones((1, self.quantizer.module.vq_embed_dim),
-                           device=self.accelerator.device))
-        else:
-            arch_vecs_separated = self.hyper_net.transform_structure_vector(
-                torch.ones((1, self.quantizer.vq_embed_dim), device=self.accelerator.device))
-        self.unet.set_structure(arch_vecs_separated)
+
+        arch_vecs_separated = self.hyper_net.module.transform_structure_vector(
+            torch.ones((1, self.quantizer.module.vq_embed_dim),
+                       device=self.accelerator.device))
+
+        self.unet.module.set_structure(arch_vecs_separated)
 
         latents = self.vae.encode(batch["pixel_values"][:1].to(self.weight_dtype)).latent_dist.sample()
         timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (1,),
@@ -1089,13 +1065,14 @@ class DiffPruningTrainer:
         logger.info(
             "UNet's Params/MACs calculated by OpCounter:\tparams: {:.3f}M\t MACs: {:.3f}G".format(
                 params / 1e6, flops / 1e9))
-        sanity_flops_dict = self.unet.calc_flops()
 
+        sanity_flops_dict = self.unet.module.calc_flops()
         prunable_flops_list = [[e / sanity_flops_dict['prunable_flops'] for e in elem] for elem in
-                               self.unet.get_prunable_flops()]
-        self.unet.prunable_flops_list = prunable_flops_list
+                               self.unet.module.get_prunable_flops()]
 
-        self.unet.resource_info_dict = sanity_flops_dict
+        self.unet.module.prunable_flops_list = prunable_flops_list
+        self.unet.module.resource_info_dict = sanity_flops_dict
+
         sanity_string = "Our MACs calculation:\t"
         for k, v in sanity_flops_dict.items():
             if isinstance(v, torch.Tensor):
@@ -1111,8 +1088,8 @@ class DiffPruningTrainer:
     @torch.no_grad()
     def update_pruning_target(self):
         p = self.config.training.losses.resource_loss.pruning_target
-        p_actual = (1 - (1 - p) * self.unet.resource_info_dict['total_flops'] /
-                    self.unet.resource_info_dict['cur_prunable_flops']).item()
+        p_actual = (1 - (1 - p) * self.unet.module.resource_info_dict['total_flops'] /
+                    self.unet.module.resource_info_dict['cur_prunable_flops']).item()
         self.resource_loss.p = p_actual
 
         del p, p_actual
@@ -1231,7 +1208,7 @@ class DiffPruningTrainer:
         image_output_dir = os.path.join(self.config.training.logging.logging_dir, "depth_analysis_images")
         os.makedirs(image_output_dir, exist_ok=True)
 
-        n_depth_pruned_blocks = sum([sum(d) for d in self.unet.get_structure()['depth']])
+        n_depth_pruned_blocks = sum([sum(d) for d in self.unet.module.get_structure()['depth']])
 
         # index n_depth_pruned_blocks is for no pruning
         images = {i: [] for i in range(n_depth_pruned_blocks + 1)}
@@ -1331,8 +1308,8 @@ class DiffPruningTrainer:
             safety_checker=None,
             revision=self.config.revision,
             torch_dtype=self.weight_dtype,
-            hyper_net=self.hyper_net,
-            quantizer=self.quantizer,
+            hyper_net=self.accelerator.unwrap_model(self.hyper_net),
+            quantizer=self.accelerator.unwrap_model(self.quantizer),
         )
 
         pipeline = pipeline.to(self.accelerator.device)

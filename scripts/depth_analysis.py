@@ -186,11 +186,6 @@ def main():
     else:
         ema_unet = None
 
-    unet.eval()
-    unet.freeze()
-    hyper_net.train()
-    quantizer.train()
-
     if config.training.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
             import xformers

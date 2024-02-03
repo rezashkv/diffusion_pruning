@@ -78,7 +78,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
         self.embedding = nn.Embedding(self.n_e, self.vq_embed_dim)
         nn.init.orthogonal_(self.embedding.weight)
-        self.embedding_gs = nn.Parameter(torch.zeros_like(self.embedding.weight), requires_grad=False)
+        self.embedding_gs = nn.Parameter(self.embedding.weight.detach().clone(), requires_grad=False)
 
         self.remap = remap
         if self.remap is not None:
@@ -137,17 +137,13 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         z = z.contiguous()
         z_flattened = z.view(-1, self.vq_embed_dim)
 
-        # if in training use optimal transport, else use cosine similarity
-        if self.training:
-            min_encoding_indices = self.get_optimal_transport_min_encoding_indices(z_flattened)
-        else:
-            min_encoding_indices = self.get_cosine_sim_min_encoding_indices(z_flattened)
-
         if self.training:
             embedding_gs = self.gumbel_sigmoid_trick(self.embedding.weight)
             self.embedding_gs.data = embedding_gs.detach()
+            min_encoding_indices = self.get_optimal_transport_min_encoding_indices(z_flattened)
         else:
-            embedding_gs = self.embedding_gs
+            embedding_gs = self.embedding_gs.detach()
+            min_encoding_indices = self.get_cosine_sim_min_encoding_indices(z_flattened)
 
         z_q = embedding_gs[min_encoding_indices].view(z.shape)
 
@@ -209,13 +205,17 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         z_q_width = z_q[:, :num_width]
         z_q_depth = z_q[:, num_width:]
 
-        z_q_depth_b_ = importance_gumbel_softmax_sample(z_q_depth, temperature=self.temperature, offset=self.base)
+        fixed_seed = not self.training
+
+        z_q_depth_b_ = importance_gumbel_softmax_sample(z_q_depth, temperature=self.temperature, offset=self.base,
+                                                        fixed_seed=fixed_seed)
         z_q_depth_b = torch.zeros_like(z_q_depth_b_, device=z_q_depth_b_.device)
         z_q_depth_b[:, self.depth_order] = z_q_depth_b_
 
         z_q_width_list = self._transform_width_vector(z_q_width)
         z_q_width_b_list = [gumbel_softmax_sample(zw, temperature=self.temperature, offset=self.base,
-                                                  force_width_non_zero=self.non_zero_width) for zw in z_q_width_list]
+                                                  force_width_non_zero=self.non_zero_width, fixed_seed=fixed_seed) for
+                            zw in z_q_width_list]
         z_q_width_b = torch.cat(z_q_width_b_list, dim=1)
 
         z_q_out = torch.cat([z_q_width_b, z_q_depth_b], dim=1)
@@ -264,14 +264,15 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         prunable_flops_list += depth_template
         prunable_flops_list = [item for sublist in prunable_flops_list for item in sublist]
         self.prunable_flops_template = torch.repeat_interleave(torch.tensor(prunable_flops_list),
-                                                               torch.tensor(self.width_list + [1 for _ in range(len(depth_template))]))
+                                                               torch.tensor(self.width_list + [1 for _ in range(
+                                                                   len(depth_template))]))
 
     @torch.no_grad()
     def get_cosine_sim_min_encoding_indices(self, z: torch.Tensor) -> torch.Tensor:
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
         u = self.width_depth_normalize(self.gumbel_sigmoid_trick(z))
         u = u / u.norm(dim=-1, keepdim=True)
-        v = self.width_depth_normalize(self.gumbel_sigmoid_trick(self.embedding.weight))
+        v = self.width_depth_normalize(self.embedding_gs)
         v = v / v.norm(dim=-1, keepdim=True)
         min_encoding_indices = torch.argmax(u @ v.t(), dim=-1)
         return min_encoding_indices
@@ -330,7 +331,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         a = self.width_depth_normalize(a)
         a = a / a.norm(dim=-1, keepdim=True)
 
-        codes = self.gumbel_sigmoid_trick(self.embedding.weight)
+        codes = self.embedding_gs
         codes = self.width_depth_normalize(codes)
         codes = codes / codes.norm(dim=-1, keepdim=True)
 

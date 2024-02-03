@@ -195,8 +195,8 @@ def main():
         ema_unet = None
 
     unet.train()
-    hyper_net.train()
-    quantizer.train()
+    hyper_net.eval()
+    quantizer.eval()
 
     if config.training.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
