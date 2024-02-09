@@ -30,10 +30,10 @@ def parse_args():
         help="Path to the model/data/training config file.",
     )
     parser.add_argument(
-        "--checkpoint_dir",
+        "--pruning_ckpt_dir",
         type=str,
         default=None,
-        help="Path to the saved pruning checkpoint. used for finetuning.",
+        help="Path to the saved pruning checkpoint dir. used for finetuning.",
     )
     parser.add_argument(
         "--name",
@@ -97,6 +97,12 @@ def parse_args():
         type=int,
         default=1,
         help="Number of consecutive blocks to prune for depth analysis.",
+    )
+    parser.add_argument(
+        "--embedding_ind",
+        type=int,
+        default=0,
+        help="Index of the embedding layer to prune for depth analysis.",
     )
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."

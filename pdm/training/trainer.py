@@ -1,6 +1,7 @@
 import logging
 from pathlib import Path
 
+import safetensors
 import torch.nn.functional as F
 import os
 import shutil
@@ -18,6 +19,7 @@ from diffusers import UNet2DConditionModel, EMAModel, get_scheduler
 from diffusers.utils import make_image_grid, is_wandb_available
 from huggingface_hub import upload_folder, create_repo
 from pdm.models import UNet2DConditionModelGated, HyperStructure, StructureVectorQuantizer
+from pdm.models.diffusion import UNet2DConditionModelPruned
 from pdm.pipelines import StableDiffusionPruningPipeline
 from pdm.utils import compute_snr
 from torch import nn
@@ -57,6 +59,7 @@ class DiffPruningTrainer:
                  eval_dataset: Dataset = None,
                  tokenizer: Optional[PreTrainedTokenizerBase] = None,
                  optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
+                 finetuning_arch_vector=None,
                  ):
 
         self.config = config
@@ -105,6 +108,8 @@ class DiffPruningTrainer:
         self.init_prompts()
         self.prepare_with_accelerator()
 
+        self.finetuning_arch_vector = finetuning_arch_vector
+
     def create_accelerator(self):
         logging_dir = self.config.training.logging.logging_dir
         accelerator_project_config = ProjectConfiguration(project_dir=logging_dir,
@@ -135,6 +140,8 @@ class DiffPruningTrainer:
                     elif isinstance(model, StructureVectorQuantizer):
                         logger.info(f"Saving Quantizer")
                         model.save_pretrained(os.path.join(output_dir, "quantizer"))
+                        # save the quantizer embeddings
+                        torch.save(model.embedding_gs, os.path.join(output_dir, "quantizer_embeddings.pt"))
 
                     # make sure to pop weight so that corresponding model is not saved again
                     weights.pop()
@@ -148,9 +155,13 @@ class DiffPruningTrainer:
             for _ in range(len(models)):
                 # pop models so that they are not loaded again
                 model = models.pop()
-
+                if isinstance(model, UNet2DConditionModelPruned):
+                    state_dict = safetensors.torch.load_file(os.path.join(input_dir, "unet",
+                                                                          "diffusion_pytorch_model.safetensors"))
+                    model.load_state_dict(state_dict)
+                    del state_dict
                 # load diffusers style into model
-                if isinstance(model, (UNet2DConditionModel, UNet2DConditionModelGated)):
+                elif isinstance(model, (UNet2DConditionModel, UNet2DConditionModelGated)):
                     load_model = UNet2DConditionModelGated.from_pretrained(input_dir, subfolder="unet")
                     model.register_to_config(**load_model.config)
                     model.load_state_dict(load_model.state_dict())
@@ -166,8 +177,6 @@ class DiffPruningTrainer:
                     model.register_to_config(**load_model.config)
                     model.load_state_dict(load_model.state_dict())
                     del load_model
-                else:
-                    models.append(model)
 
         self.accelerator.register_save_state_pre_hook(save_model_hook)
         self.accelerator.register_load_state_pre_hook(load_model_hook)
@@ -258,14 +267,14 @@ class DiffPruningTrainer:
         with self.accelerator.main_process_first():
             if self.config.data.max_train_samples is not None:
                 self.train_dataset = self.train_dataset.select(
-                    range(self.config.data.max_train_samples))
+                    range(min(self.config.data.max_train_samples, len(self.train_dataset))))
             # Set the training transforms
             self.train_dataset = self.train_dataset.with_transform(preprocess_train)
 
             if self.eval_dataset is not None:
                 if self.config.data.max_validation_samples is not None:
                     self.eval_dataset = self.eval_dataset.select(
-                        range(self.config.data.max_validation_samples))
+                        range(min(self.config.data.max_validation_samples, len(self.eval_dataset))))
                     # Set the validation transforms
                 self.eval_dataset = self.eval_dataset.with_transform(preprocess_eval)
 
@@ -313,24 +322,18 @@ class DiffPruningTrainer:
         return train_dataloader, eval_dataloader, prompt_dataloader, q_embedding_dataloader
 
     def initialize_optimizer(self):
+        # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
+        scaling_factor = self.config.training.gradient_accumulation_steps * self.config.data.dataloader.train_batch_size * self.accelerator.num_processes
+
         if self.config.training.optim.scale_lr:
             self.config.training.optim.hypernet_learning_rate = (
-                    self.config.training.optim.hypernet_learning_rate *
-                    self.config.training.optim.gradient_accumulation_steps *
-                    self.config.data.dataloader.train_batch_size *
-                    self.accelerator.num_processes
+                    self.config.training.optim.hypernet_learning_rate * math.sqrt(scaling_factor)
             )
             self.config.training.optim.quantizer_learning_rate = (
-                    self.config.training.optim.quantizer_learning_rate *
-                    self.config.training.optim.gradient_accumulation_steps *
-                    self.config.data.dataloader.train_batch_size *
-                    self.accelerator.num_processes
+                    self.config.training.optim.quantizer_learning_rate * math.sqrt(scaling_factor)
             )
             self.config.training.optim.unet_learning_rate = (
-                    self.config.training.optim.unet_learning_rate *
-                    self.config.training.optim.gradient_accumulation_steps *
-                    self.config.data.dataloader.train_batch_size *
-                    self.accelerator.num_processes
+                    self.config.training.optim.unet_learning_rate * math.sqrt(scaling_factor)
             )
 
         # Initialize the optimizer
@@ -409,7 +412,7 @@ class DiffPruningTrainer:
         # Potentially load in the weights and states from a previous save
         if self.config.training.logging.resume_from_checkpoint:
             if self.config.training.logging.resume_from_checkpoint != "latest":
-                path = os.path.basename(self.config.training.logging.resume_from_checkpoint)
+                path = self.config.training.logging.resume_from_checkpoint
             else:
                 # Get the most recent checkpoint
                 dirs = os.listdir(logging_dir)
@@ -425,8 +428,11 @@ class DiffPruningTrainer:
                 initial_global_step = 0
             else:
                 self.accelerator.print(f"Resuming from checkpoint {path}")
-                self.accelerator.load_state(os.path.join(logging_dir, path))
-                global_step = int(path.split("-")[1])
+                if self.config.training.logging.resume_from_checkpoint != "latest":
+                    self.accelerator.load_state(path)
+                else:
+                    self.accelerator.load_state(os.path.join(logging_dir, path))
+                global_step = int(os.path.basename(path).split("-")[1])
 
                 initial_global_step = global_step
                 first_epoch = global_step // self.num_update_steps_per_epoch
@@ -495,8 +501,7 @@ class DiffPruningTrainer:
             disable=not self.accelerator.is_main_process,
         )
 
-        for param in self.unet.parameters():
-            param.requires_grad = False
+        self.unet.module.freeze()
 
         for epoch in range(first_epoch, self.config.training.num_train_epochs):
             for step, batch in enumerate(self.train_dataloader):
@@ -565,10 +570,6 @@ class DiffPruningTrainer:
                         "q_lr": self.lr_scheduler.get_last_lr()[1],
                         }
                 progress_bar.set_postfix(**logs)
-
-                del loss, diff_loss, q_loss, contrastive_loss, resource_loss, arch_vectors_similarity, resource_ratio, \
-                    flops_dict, avg_loss, train_loss
-                torch.cuda.empty_cache()
 
                 if global_step % self.config.training.validation_steps == 0:
                     if self.eval_dataset is not None:
@@ -847,7 +848,6 @@ class DiffPruningTrainer:
         for param in self.quantizer.parameters():
             param.requires_grad = False
 
-
         for epoch in range(first_epoch, self.config.training.num_train_epochs):
             for step, batch in enumerate(self.train_dataloader):
                 train_loss = 0.0
@@ -855,9 +855,9 @@ class DiffPruningTrainer:
                 self.quantizer.eval()
                 self.unet.train()
 
-                # Calculating the MACs of each module of the model in the first iteration.
-                if global_step == initial_global_step:
-                    self.count_flops(batch)
+                # # Calculating the MACs of each module of the model in the first iteration.
+                # if global_step == initial_global_step:
+                #     self.count_flops(batch)
 
                 loss = self.finetune_step(batch)
                 avg_loss = self.accelerator.reduce(loss, "mean")
@@ -887,9 +887,6 @@ class DiffPruningTrainer:
                 }
                 progress_bar.set_postfix(**logs)
 
-                del loss, avg_loss, train_loss
-                torch.cuda.empty_cache()
-
                 if global_step % self.config.training.validation_steps == 0:
                     if self.eval_dataset is not None:
                         self.finetuning_validate()
@@ -900,7 +897,7 @@ class DiffPruningTrainer:
 
                     # generate some validation images
                     if self.config.data.prompts is not None:
-                        val_images = self.generate_samples_from_prompts(global_step, pretrain=False)
+                        val_images = self.generate_samples_from_prompts_finetuning(global_step)
 
                 if global_step >= self.config.training.max_train_steps:
                     break
@@ -953,13 +950,13 @@ class DiffPruningTrainer:
 
         # Get the text embedding for conditioning
         encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
-        text_embeddings = batch["mpnet_embeddings"]
+        # text_embeddings = batch["mpnet_embeddings"]
 
-        arch_vector = self.hyper_net(text_embeddings)
-        arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
-
-        arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
-        self.unet.module.set_structure(arch_vectors_separated)
+        # arch_vector = self.hyper_net(text_embeddings)
+        # arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
+        #
+        # arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
+        # self.unet.module.set_structure(arch_vectors_separated)
 
         # Get the target for loss depending on the prediction type
         if self.config.model.unet.prediction_type is not None:
@@ -997,8 +994,7 @@ class DiffPruningTrainer:
             loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
             loss = loss.mean()
 
-        del latents, noise, timesteps, noisy_latents, encoder_hidden_states, text_embeddings, arch_vector, \
-            arch_vectors_separated, model_pred, target
+        del latents, noise, timesteps, noisy_latents, encoder_hidden_states, model_pred, target
         torch.cuda.empty_cache()
 
         return loss
@@ -1094,6 +1090,47 @@ class DiffPruningTrainer:
 
         del p, p_actual
         torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def generate_samples_from_prompts_finetuning(self, global_step, save_images=False):
+        logger.info("Generating samples from the given prompts... ")
+
+        pipeline = self.get_pipeline()
+
+        image_output_dir = os.path.join(self.config.training.logging.logging_dir, "prompt_images",
+                                        f"step_{global_step}")
+        os.makedirs(image_output_dir, exist_ok=True)
+        images = []
+
+        for step, batch in enumerate(self.prompt_dataloader):
+            if self.config.seed is None:
+                generator = None
+            else:
+                generator = torch.Generator(device=self.accelerator.device).manual_seed(self.config.seed)
+            gen_images = pipeline.generate_samples(batch["prompts"],
+                                                   num_inference_steps=self.config.training.num_inference_steps,
+                                                   generator=generator, output_type="pt"
+                                                   ).images
+            gen_images = self.accelerator.gather_for_metrics(gen_images)
+            images += gen_images
+
+        images = [torchvision.transforms.ToPILImage()(img) for img in images]
+        images = make_image_grid(images, 4, len(images) // 4)
+
+        if self.accelerator.is_main_process and save_images:
+            images.save(os.path.join(image_output_dir, "prompt_images.png"))
+
+        self.accelerator.log(
+            {
+                "images/prompt images": wandb.Image(images),
+            },
+            log_kwargs={"wandb": {"commit": False}}
+        )
+
+        del pipeline, gen_images
+        torch.cuda.empty_cache()
+
+        return images
 
     @torch.no_grad()
     def generate_samples_from_prompts(self, global_step, save_images=False, pretrain=False):

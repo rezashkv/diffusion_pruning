@@ -90,3 +90,23 @@ class HyperStructure(ModelMixin, ConfigMixin):
             depth_list.append(depth_vectors[:, i])
 
         return {"width": width_list, "depth": depth_list}
+
+    @classmethod
+    def transform_arch_vector(cls, inputs, structure):
+        width_list = [w for sub_width_list in structure['width'] for w in sub_width_list]
+        depth_list = [d for sub_depth_list in structure['depth'] for d in sub_depth_list]
+        assert inputs.shape[1] == (sum(width_list) + sum(depth_list))
+        width_vectors = inputs[:, :sum(width_list)]
+        depth_vectors = inputs[:, sum(width_list):]
+        start = 0
+        w_list = []
+        d_list = []
+        for i in range(len(width_list)):
+            end = start + width_list[i]
+            w_list.append(width_vectors[:, start:end])
+            start = end
+
+        for i in range(sum(depth_list)):
+            d_list.append(depth_vectors[:, i])
+
+        return {"width": w_list, "depth": d_list}

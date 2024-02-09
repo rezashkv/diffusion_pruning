@@ -31,6 +31,7 @@ from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from datasets import load_dataset, Dataset, concatenate_datasets
 from packaging import version
+from pdm.datasets.coco import load_coco_dataset
 from torchvision import transforms
 from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, AutoModel
 from transformers.utils import ContextManagers
@@ -282,6 +283,13 @@ def main():
                                                           split_dir=validation_data_dir,
                                                           max_samples=max_validation_samples,
                                                           bad_images_path=validation_bad_images_path)
+
+        elif "coco" in data_dir:
+            dataset = {"train": load_coco_dataset(os.path.join(data_dir, "iamges", "train2017"),
+                                                  os.path.join(data_dir, "annotations", "captions_train2017.json"))}
+            if validation_data_dir is not None:
+                dataset["validation"] = load_coco_dataset(os.path.join(data_dir, "iamges", "val2017"),
+                                                          os.path.join(data_dir, "annotations", "captions_val2017.json"))
 
         else:
             data_files = {}

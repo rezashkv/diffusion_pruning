@@ -118,6 +118,6 @@ training:
     logging_dir: "/fs/cbcb-scratch/aliganj/results"
     report_to: "wandb"
     checkpoints_total_limit: 1
-    resume_from_checkpoint: "latest"
+    resume_from_checkpoint: null
     tracker_project_name: "text2image-dynamic-pruning"
 

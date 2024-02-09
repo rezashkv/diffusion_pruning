@@ -116,6 +116,6 @@ training:
     report_to: "wandb"
     checkpointing_steps: 1000
     checkpoints_total_limit: 1
-    resume_from_checkpoint: "latest"
+    resume_from_checkpoint: null
     tracker_project_name: "text2image-dynamic-pruning"
 
