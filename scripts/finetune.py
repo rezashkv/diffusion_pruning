@@ -31,6 +31,7 @@ from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from datasets import load_dataset, Dataset, concatenate_datasets
 from packaging import version
+from pdm.datasets.coco import load_coco_dataset
 from torchvision import transforms
 from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, AutoModel
 from transformers.utils import ContextManagers
@@ -60,6 +61,7 @@ logger = get_logger(__name__)
 
 
 def main():
+    PIL.Image.MAX_IMAGE_PIXELS = 933120000
     torch.autograd.set_detect_anomaly(True)
     args = parse_args()
     config = OmegaConf.load(args.base_config_path)
@@ -178,12 +180,15 @@ def main():
                                                           max_samples=max_validation_samples,
                                                           bad_images_path=validation_bad_images_path)
 
+
         elif "coco" in data_dir:
-            dataset = {"train": load_coco_dataset(os.path.join(data_dir, "iamges", "train2017"),
-                                                  os.path.join(data_dir, "annotations", "captions_train2017.json"))}
-            if validation_data_dir is not None:
-                dataset["validation"] = load_coco_dataset(os.path.join(data_dir, "iamges", "val2017"),
-                                                          os.path.join(data_dir, "annotations", "captions_val2017.json"))
+            dataset = {"train": load_coco_dataset(os.path.join(data_dir, "images", "train2017"),
+
+                                                  os.path.join(data_dir, "annotations", "captions_train2017.json")),
+
+                       "validation": load_coco_dataset(os.path.join(data_dir, "images", "val2017"),
+
+                                                       os.path.join(data_dir, "annotations", "captions_val2017.json"))}
 
         else:
             data_files = {}
@@ -218,7 +223,6 @@ def main():
             raise ValueError(
                 f"--caption_column' value '{config.data.caption_column}' needs to be one of: {', '.join(column_names)}"
             )
-
 
     # Preprocessing the datasets.
     # We need to tokenize input captions and transform the images.
@@ -363,7 +367,8 @@ def main():
             train_captions = dataset["train"][caption_column]
             validation_captions = dataset["validation"][caption_column]
             train_filtering_dataloader = torch.utils.data.DataLoader(train_captions, batch_size=4096, shuffle=False)
-            validation_filtering_dataloader = torch.utils.data.DataLoader(validation_captions, batch_size=4096, shuffle=False)
+            validation_filtering_dataloader = torch.utils.data.DataLoader(validation_captions, batch_size=4096,
+                                                                          shuffle=False)
             hyper_net.to("cuda")
             quantizer.to("cuda")
             mpnet_model.to("cuda")
@@ -384,19 +389,18 @@ def main():
                     validation_indices.append(indices)
             train_indices = torch.cat(train_indices, dim=0)
             validation_indices = torch.cat(validation_indices, dim=0)
-            torch.save(train_indices, os.path.join(config.pruning_ckpt_dir, "cc3m_train_mapped_indices.pt"))
-            torch.save(validation_indices, os.path.join(config.pruning_ckpt_dir, "cc3m_validation_mapped_indices.pt"))
+            torch.save(train_indices, os.path.join(config.pruning_ckpt_dir, "train_mapped_indices.pt"))
+            torch.save(validation_indices, os.path.join(config.pruning_ckpt_dir, "validation_mapped_indices.pt"))
 
         dataset["train"] = dataset["train"].select(torch.where(train_indices == config.embedding_ind)[0])
         dataset["validation"] = dataset["validation"].select(torch.where(validation_indices == config.embedding_ind)[0])
         return dataset
 
     tr_indices, val_indices = None, None
-    if os.path.exists(os.path.join(config.pruning_ckpt_dir, "cc3m_train_mapped_indices.pt")) and \
-            os.path.exists(os.path.join(config.pruning_ckpt_dir, "cc3m_validation_mapped_indices.pt")):
-
-        tr_indices = torch.load(os.path.join(config.pruning_ckpt_dir, "cc3m_train_mapped_indices.pt"))
-        val_indices = torch.load(os.path.join(config.pruning_ckpt_dir, "cc3m_validation_mapped_indices.pt"))
+    if os.path.exists(os.path.join(config.pruning_ckpt_dir, "train_mapped_indices.pt")) and \
+            os.path.exists(os.path.join(config.pruning_ckpt_dir, "validation_mapped_indices.pt")):
+        tr_indices = torch.load(os.path.join(config.pruning_ckpt_dir, "train_mapped_indices.pt"))
+        val_indices = torch.load(os.path.join(config.pruning_ckpt_dir, "validation_mapped_indices.pt"))
 
     # dataset = filter_dataset(dataset, train_indices=tr_indices, validation_indices=val_indices)
 

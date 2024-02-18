@@ -61,6 +61,7 @@ logger = get_logger(__name__)
 
 
 def main():
+    PIL.Image.MAX_IMAGE_PIXELS = 933120000
     torch.autograd.set_detect_anomaly(True)
     args = parse_args()
     config = OmegaConf.load(args.base_config_path)
@@ -285,11 +286,10 @@ def main():
                                                           bad_images_path=validation_bad_images_path)
 
         elif "coco" in data_dir:
-            dataset = {"train": load_coco_dataset(os.path.join(data_dir, "iamges", "train2017"),
-                                                  os.path.join(data_dir, "annotations", "captions_train2017.json"))}
-            if validation_data_dir is not None:
-                dataset["validation"] = load_coco_dataset(os.path.join(data_dir, "iamges", "val2017"),
-                                                          os.path.join(data_dir, "annotations", "captions_val2017.json"))
+            dataset = {"train": load_coco_dataset(os.path.join(data_dir, "images", "train2017"),
+                                                  os.path.join(data_dir, "annotations", "captions_train2017.json")),
+                       "validation": load_coco_dataset(os.path.join(data_dir, "images", "val2017"),
+                                                      os.path.join(data_dir, "annotations", "captions_val2017.json"))}
 
         else:
             data_files = {}
