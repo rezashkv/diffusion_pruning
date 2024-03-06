@@ -1156,7 +1156,7 @@ class DiffPruningTrainer:
             images += gen_images
 
         images = [torchvision.transforms.ToPILImage()(img) for img in images]
-        images = make_image_grid(images, 4, len(images) // 4)
+        images = make_image_grid(images[:4 * (len(images) // 4)], 4, len(images) // 4)
 
         if self.accelerator.is_main_process and save_images:
             images.save(os.path.join(image_output_dir, "prompt_images.png"))
@@ -1204,7 +1204,7 @@ class DiffPruningTrainer:
             prompts_resource_ratios += resource_ratios
 
         images = [torchvision.transforms.ToPILImage()(img) for img in images]
-        images = make_image_grid(images, 4, len(images) // 4)
+        images = make_image_grid(images[:4 * (len(images) // 4)], 4, len(images) // 4)
         prompts_resource_ratios = torch.cat(prompts_resource_ratios, dim=0).cpu().numpy()
         prompts_resource_ratios_images = create_heatmap(prompts_resource_ratios, n_rows=4,
                                                         n_cols=len(prompts_resource_ratios) // 4)
@@ -1259,7 +1259,7 @@ class DiffPruningTrainer:
 
         quantizer_embedding_gumbel_sigmoid = torch.cat(quantizer_embedding_gumbel_sigmoid, dim=0)
         images = [torchvision.transforms.ToPILImage()(img) for img in images]
-        images = make_image_grid(images, len(images) // 4, 4)
+        images = make_image_grid(images[:4 * (len(images) // 4)], len(images) // 4, 4)
         embeddings_resource_ratios = torch.cat(embeddings_resource_ratios, dim=0).cpu().numpy()
         embeddings_resource_ratios_images = create_heatmap(embeddings_resource_ratios, n_rows=4,
                                                            n_cols=len(embeddings_resource_ratios) // 4)
@@ -1336,7 +1336,7 @@ class DiffPruningTrainer:
             image = [torchvision.transforms.ToPILImage()(img) for img in image]
 
             # make an image grid with 4 columns
-            image_grid = make_image_grid(image, len(image) // 4, 4)
+            image_grid = make_image_grid(image[:4 * (len(images) // 4)], 4, len(images) // 4)
             image_grid.save(os.path.join(image_output_dir, f"depth_{i}.png"))
             image_grids[i] = image_grid
 
