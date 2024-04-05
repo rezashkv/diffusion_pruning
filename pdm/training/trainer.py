@@ -60,6 +60,7 @@ class DiffPruningTrainer:
                  tokenizer: Optional[PreTrainedTokenizerBase] = None,
                  optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
                  finetuning_arch_vector=None,
+                 teacher_model: Optional[nn.Module] = None,
                  ):
 
         self.config = config
@@ -67,6 +68,7 @@ class DiffPruningTrainer:
         self.hyper_net = hyper_net
         self.quantizer = quantizer
         self.unet = unet
+        self.teacher_model = teacher_model
         self.noise_scheduler = noise_scheduler
         self.vae = vae
         self.text_encoder = text_encoder
@@ -224,22 +226,14 @@ class DiffPruningTrainer:
 
     def prepare_with_accelerator(self):
         # Prepare everything with our `accelerator`.
-        if self.eval_dataloader is not None:
-            (self.unet, self.optimizer, self.train_dataloader, self.eval_dataloader, self.prompt_dataloader,
-             self.quantizer_embeddings_dataloader, self.lr_scheduler, self.hyper_net,
-             self.quantizer) = (self.accelerator.prepare(self.unet, self.optimizer, self.train_dataloader,
-                                                         self.eval_dataloader, self.prompt_dataloader,
-                                                         self.quantizer_embeddings_dataloader, self.lr_scheduler,
-                                                         self.hyper_net,
-                                                         self.quantizer
-                                                         ))
-        else:
-            (self.unet, self.optimizer, self.train_dataloader, self.prompt_dataloader,
-             self.quantizer_embeddings_dataloader, self.lr_scheduler, self.hyper_net, self.quantizer) = (
-                self.accelerator.prepare(self.unet, self.optimizer, self.train_dataloader, self.prompt_dataloader,
-                                         self.quantizer_embeddings_dataloader, self.lr_scheduler,
-                                         self.hyper_net, self.quantizer
-                                         ))
+        (self.unet, self.optimizer, self.train_dataloader, self.eval_dataloader, self.prompt_dataloader,
+         self.quantizer_embeddings_dataloader, self.lr_scheduler, self.hyper_net,
+         self.quantizer) = (self.accelerator.prepare(self.unet, self.optimizer, self.train_dataloader,
+                                                     self.eval_dataloader, self.prompt_dataloader,
+                                                     self.quantizer_embeddings_dataloader, self.lr_scheduler,
+                                                     self.hyper_net,
+                                                     self.quantizer
+                                                     ))
 
         if self.config.use_ema:
             self.ema_unet.to(self.accelerator.device)
@@ -503,11 +497,15 @@ class DiffPruningTrainer:
 
         self.unet.module.freeze()
 
+        self.block_activations = {}
+        self.cast_block_act_hooks(self.unet, self.block_activations)
+
         for epoch in range(first_epoch, self.config.training.num_train_epochs):
             for step, batch in enumerate(self.train_dataloader):
 
                 if batch["pixel_values"].numel() == 0:
                     continue
+
                 train_loss = 0.0
                 self.hyper_net.train()
                 self.quantizer.train()
@@ -523,7 +521,7 @@ class DiffPruningTrainer:
                     self.update_pruning_target()
 
                 pretrain = self.config.training.hypernet_pretraining_steps and global_step < self.config.training.hypernet_pretraining_steps
-                loss, diff_loss, q_loss, contrastive_loss, resource_loss, arch_vectors_similarity, resource_ratio, \
+                loss, diff_loss, distillation_loss, block_loss, q_loss, contrastive_loss, resource_loss, arch_vectors_similarity, resource_ratio, \
                     flops_dict, arch_vector_quantized, quantizer_embedding_pairwise_similarity, \
                     batch_resource_ratios = self.step(batch, pretrain=pretrain)
 
@@ -531,7 +529,16 @@ class DiffPruningTrainer:
                 train_loss += avg_loss.item() / self.config.training.gradient_accumulation_steps
 
                 # Back-propagate
-                self.accelerator.backward(loss)
+                try:
+                    self.accelerator.backward(loss)
+                except RuntimeError as e:
+                    if "returned nan values" in str(e):
+                        logger.error("NaNs detected in the loss. Skipping batch.")
+                        self.optimizer.zero_grad()
+                        continue
+                    else:
+                        raise e
+
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad()
@@ -541,10 +548,11 @@ class DiffPruningTrainer:
                     if self.config.use_ema:
                         self.ema_unet.step(self.unet.parameters())
                     progress_bar.update(1)
-                    global_step += 1
                     log_dict = {
                         "training/loss": train_loss,
                         "training/diffusion_loss": diff_loss,
+                        "training/distillation_loss": distillation_loss.detach().item(),
+                        "training/block_loss": block_loss.detach().item(),
                         "training/resource_loss": resource_loss.detach().item(),
                         "training/commitment_loss": q_loss.detach().item(),
                         "training/contrastive_loss": contrastive_loss.detach().item(),
@@ -564,37 +572,42 @@ class DiffPruningTrainer:
 
                     self.accelerator.log(log_dict)
 
-                logs = {"diff_loss": diff_loss.detach().item(),
-                        "q_loss": q_loss.detach().item(),
-                        "c_loss": contrastive_loss.detach().item(),
-                        "r_loss": resource_loss.detach().item(),
-                        "step_loss": loss.detach().item(),
-                        "h_lr": self.lr_scheduler.get_last_lr()[0],
-                        "q_lr": self.lr_scheduler.get_last_lr()[1],
-                        }
-                progress_bar.set_postfix(**logs)
+                    logs = {"diff_loss": diff_loss.detach().item(),
+                            "dist_loss": distillation_loss.detach().item(),
+                            "block_loss": block_loss.detach().item(),
+                            "q_loss": q_loss.detach().item(),
+                            "c_loss": contrastive_loss.detach().item(),
+                            "r_loss": resource_loss.detach().item(),
+                            "step_loss": loss.detach().item(),
+                            "h_lr": self.lr_scheduler.get_last_lr()[0],
+                            "q_lr": self.lr_scheduler.get_last_lr()[1],
+                            }
+                    progress_bar.set_postfix(**logs)
 
-                if global_step % self.config.training.validation_steps == 0:
-                    if self.eval_dataset is not None:
-                        self.validate(pretrain=pretrain)
+                    if global_step % self.config.training.validation_steps == 0:
+                        if self.eval_dataset is not None:
+                            self.validate(pretrain=pretrain)
 
-                if (global_step % self.config.training.image_logging_steps == 0 or
-                        (epoch == self.config.training.num_train_epochs - 1 and step == len(
-                            self.train_dataloader) - 1)):
+                    if (global_step % self.config.training.image_logging_steps == 0 or
+                            (epoch == self.config.training.num_train_epochs - 1 and step == len(
+                                self.train_dataloader) - 1)):
 
-                    with torch.no_grad():
-                        batch_resource_ratios = self.accelerator.gather_for_metrics(batch_resource_ratios).cpu().numpy()
+                        with torch.no_grad():
+                            batch_resource_ratios = self.accelerator.gather_for_metrics(
+                                batch_resource_ratios).cpu().numpy()
 
-                    self.accelerator.log({"images/batch resource ratio heatmap": wandb.Image(
-                        create_heatmap(batch_resource_ratios, n_rows=16, n_cols=len(batch_resource_ratios) // 16))},
-                        log_kwargs={"wandb": {"commit": False}})
+                        self.accelerator.log({"images/batch resource ratio heatmap": wandb.Image(
+                            create_heatmap(batch_resource_ratios, n_rows=16, n_cols=len(batch_resource_ratios) // 16))},
+                            log_kwargs={"wandb": {"commit": False}})
 
-                    # generate some validation images
-                    if self.config.data.prompts is not None:
-                        val_images = self.generate_samples_from_prompts(global_step, pretrain=pretrain)
+                        # generate some validation images
+                        if self.config.data.prompts is not None:
+                            val_images = self.generate_samples_from_prompts(global_step, pretrain=pretrain)
 
-                    # visualize the quantizer embeddings
-                    self.log_quantizer_embedding_samples(global_step)
+                        # visualize the quantizer embeddings
+                        self.log_quantizer_embedding_samples(global_step)
+
+                    global_step += 1
 
                 if global_step >= self.config.training.max_train_steps:
                     break
@@ -637,15 +650,19 @@ class DiffPruningTrainer:
         self.hyper_net.eval()
         self.quantizer.eval()
         self.unet.eval()
-        total_val_loss, total_diff_loss, total_q_loss, total_c_loss, total_r_loss = 0.0, 0.0, 0.0, 0.0, 0.0
+        (total_val_loss, total_diff_loss, total_distillation_loss, total_block_loss, total_q_loss, total_c_loss,
+         total_r_loss) = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         for step, batch in enumerate(self.eval_dataloader):
             if batch["pixel_values"].numel() == 0:
                 continue
-            loss, diff_loss, q_loss, contrastive_loss, resource_loss, _, _, _, _, _, _ = self.step(batch,
-                                                                                                   pretrain=pretrain)
+            loss, diff_loss, distillation_loss, block_loss, q_loss, contrastive_loss, resource_loss, _, _, _, _, _, _ = self.step(
+                batch,
+                pretrain=pretrain)
             # Gather the losses across all processes for logging (if we use distributed training).
             total_val_loss += loss.item()
             total_diff_loss += diff_loss.item()
+            total_distillation_loss += distillation_loss.item()
+            total_block_loss += block_loss.item()
             total_q_loss += q_loss.item()
             total_c_loss += contrastive_loss.item()
             total_r_loss += resource_loss.item()
@@ -655,6 +672,8 @@ class DiffPruningTrainer:
         total_diff_loss /= len(self.eval_dataloader)
         total_q_loss /= len(self.eval_dataloader)
         total_c_loss /= len(self.eval_dataloader)
+        total_distillation_loss /= len(self.eval_dataloader)
+        total_block_loss /= len(self.eval_dataloader)
         total_r_loss /= len(self.eval_dataloader)
 
         total_val_loss = self.accelerator.reduce(torch.tensor(total_val_loss, device=self.accelerator.device),
@@ -667,17 +686,25 @@ class DiffPruningTrainer:
                                                "mean").item()
         total_r_loss = self.accelerator.reduce(torch.tensor(total_r_loss, device=self.accelerator.device),
                                                "mean").item()
+        total_distillation_loss = self.accelerator.reduce(
+            torch.tensor(total_distillation_loss, device=self.accelerator.device), "mean").item()
+        total_block_loss = self.accelerator.reduce(torch.tensor(total_block_loss, device=self.accelerator.device),
+                                                   "mean").item()
 
         self.accelerator.log({
             "validation/loss": total_val_loss,
             "validation/diffusion_loss": total_diff_loss,
+            "validation/distillation_loss": total_distillation_loss,
+            "validation/block_loss": total_block_loss,
             "validation/resource_loss": total_r_loss,
             "validation/commitment_loss": total_q_loss,
             "validation/contrastive_loss": total_c_loss,
         },
             log_kwargs={"wandb": {"commit": False}})
 
-        del loss, diff_loss, q_loss, contrastive_loss, resource_loss
+        del loss, diff_loss, q_loss, contrastive_loss, \
+            resource_loss, total_val_loss, total_diff_loss, total_q_loss, total_c_loss, total_r_loss, \
+            total_distillation_loss, total_block_loss
         torch.cuda.empty_cache()
 
     def step(self, batch, pretrain=False):
@@ -755,21 +782,17 @@ class DiffPruningTrainer:
         else:
             raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
 
+        with torch.no_grad():
+            full_arch_vector = torch.ones_like(arch_vector)
+            full_arch_vector = self.hyper_net.module.transform_structure_vector(full_arch_vector)
+            self.unet.module.set_structure(full_arch_vector)
+            full_model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample.detach()
+            teacher_block_activations = self.block_activations.copy()
 
         self.unet.module.set_structure(arch_vectors_separated)
         # Predict the noise residual and compute loss
         model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
-
-        # if self.config.training.losses.diff_reward is not None:
-        #     if self.noise_scheduler.config.prediction_type == "epsilon":
-        #         denoised_latents = self.denoise_sample(noisy_latents, model_pred, timesteps)
-        #
-        #     # velocity prediction
-        #     else:
-        #         denoised_latents = self.denoise_sample(noisy_latents, model_pred, timesteps, velocity=True)
-        #
-        #     denoised_sample = self.vae.decode(denoised_latents / self.vae.config.scaling_factor, return_dict=False)[0]
-
+        student_block_activations = self.block_activations.copy()
 
         if self.config.training.losses.diffusion_loss.snr_gamma is None:
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -792,6 +815,14 @@ class DiffPruningTrainer:
             loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
             loss = loss.mean()
 
+        distillation_loss = F.mse_loss(model_pred.float(), full_model_pred.float(), reduction="mean")
+
+        block_loss = torch.tensor(0.0, device=self.accelerator.device)
+        for key in student_block_activations.keys():
+            block_loss += F.mse_loss(student_block_activations[key], teacher_block_activations[key].detach(),
+                                     reduction="mean")
+        block_loss /= len(student_block_activations)
+
         flops_dict = self.unet.module.calc_flops()
         curr_flops = flops_dict['cur_prunable_flops']
 
@@ -811,22 +842,47 @@ class DiffPruningTrainer:
         loss += self.config.training.losses.contrastive_clip_loss.weight * contrastive_loss
         loss += self.config.training.losses.std_loss.weight * std_loss
         loss += self.config.training.losses.max_loss.weight * max_loss
+        loss += self.config.training.losses.distillation_loss.weight * distillation_loss
+        loss += self.config.training.losses.block_loss.weight * block_loss
 
         del latents, noise, timesteps, noisy_latents, encoder_hidden_states, text_embeddings, arch_vector, arch_vectors_separated, \
             quantizer_embeddings, text_embeddings_list, arch_vector_list, curr_flops, model_pred, target, \
-            arch_vector_width_depth_normalized
+            arch_vector_width_depth_normalized, full_arch_vector, full_model_pred, teacher_block_activations, \
+            student_block_activations
+
         torch.cuda.empty_cache()
 
         return (
-            loss, diff_loss, q_loss, contrastive_loss, resource_loss, arch_vectors_similarity, resource_ratios.mean(),
+            loss, diff_loss, distillation_loss, block_loss, q_loss, contrastive_loss, resource_loss,
+            arch_vectors_similarity, resource_ratios.mean(),
             flops_dict, arch_vector_quantized, quantizer_embeddings_pairwise_similarity, batch_resource_ratios)
 
+    def cast_block_act_hooks(self, unet, dicts):
+        def get_activation(activation, name, residuals_present):
+            if residuals_present:
+                def hook(model, input, output):
+                    activation[name] = output[0]
+            else:
+                def hook(model, input, output):
+                    activation[name] = output
+            return hook
+
+        unet = self.accelerator.unwrap_model(unet)
+        for i in range(len(unet.down_blocks)):
+            unet.down_blocks[i].register_forward_hook(get_activation(dicts, 'd' + str(i), True))
+        unet.mid_block.register_forward_hook(get_activation(dicts, 'm', False))
+        for i in range(len(unet.up_blocks)):
+            unet.up_blocks[i].register_forward_hook(get_activation(dicts, 'u' + str(i), False))
+
     def finetune(self):
+        assert self.teacher_model is not None, "Teacher model is not provided for finetuning"
+
         self.init_weight_dtype()
 
         # Move text_encode and vae to gpu and cast to weight_dtype
         self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
         self.vae.to(self.accelerator.device, dtype=self.weight_dtype)
+        self.teacher_model.to(self.accelerator.device, dtype=self.weight_dtype)
 
         self.pre_train_setup()
         # Train!
@@ -864,6 +920,20 @@ class DiffPruningTrainer:
         for param in self.quantizer.parameters():
             param.requires_grad = False
 
+        if self.config.training.validation_steps > self.config.training.max_train_steps:
+            self.config.training.validation_steps = self.config.training.max_train_steps // 10
+        if self.config.training.image_logging_steps > self.config.training.max_train_steps:
+            self.config.training.image_logging_steps = self.config.training.max_train_steps // 10
+        if self.config.training.logging.auto_checkpoint_step:
+            self.config.training.logging.checkpoint_step = self.config.training.num_train_epochs // 5
+        else:
+            self.config.training.logging.checkpoint_step = 1
+
+        self.block_act_teacher = {}
+        self.block_act_student = {}
+        self.cast_block_act_hooks(self.unet, self.block_act_student)
+        self.cast_block_act_hooks(self.teacher_model, self.block_act_teacher)
+
         for epoch in range(first_epoch, self.config.training.num_train_epochs):
             for step, batch in enumerate(self.train_dataloader):
                 if batch["pixel_values"].numel() == 0:
@@ -871,13 +941,14 @@ class DiffPruningTrainer:
                 train_loss = 0.0
                 self.hyper_net.eval()
                 self.quantizer.eval()
+                self.teacher_model.eval()
                 self.unet.train()
 
-                # # Calculating the MACs of each module of the model in the first iteration.
+                # Calculating the MACs of each module of the model in the first iteration.
                 # if global_step == initial_global_step:
                 #     self.count_flops(batch)
 
-                loss = self.finetune_step(batch)
+                loss, diff_loss, distillation_loss, block_loss = self.finetune_step(batch)
                 avg_loss = self.accelerator.reduce(loss, "mean")
                 train_loss += avg_loss.item() / self.config.training.gradient_accumulation_steps
 
@@ -892,36 +963,40 @@ class DiffPruningTrainer:
                     if self.config.use_ema:
                         self.ema_unet.step(self.unet.parameters())
                     progress_bar.update(1)
-                    global_step += 1
                     log_dict = {
                         "finetuning/loss": train_loss,
+                        "finetuning/diffusion_loss": diff_loss,
+                        "finetuning/distillation_loss": distillation_loss.detach().item(),
+                        "finetuning/block_loss": block_loss.detach().item(),
                         "finetuning/unet_lr": self.lr_scheduler.get_last_lr()[2],
                     }
                     self.accelerator.log(log_dict)
 
-                logs = {
-                    "step_loss": loss.detach().item(),
-                    "lr": self.lr_scheduler.get_last_lr()[2],
-                }
-                progress_bar.set_postfix(**logs)
+                    logs = {
+                        "step_loss": loss.detach().item(),
+                        "lr": self.lr_scheduler.get_last_lr()[2],
+                    }
+                    progress_bar.set_postfix(**logs)
 
-                if global_step % self.config.training.validation_steps == 0:
-                    if self.eval_dataset is not None:
-                        self.finetuning_validate()
+                    if global_step % self.config.training.validation_steps == 0:
+                        if self.eval_dataset is not None:
+                            self.finetuning_validate()
 
-                if (global_step % self.config.training.image_logging_steps == 0 or
-                        (epoch == self.config.training.num_train_epochs - 1 and step == len(
-                            self.train_dataloader) - 1)):
+                    if (global_step % self.config.training.image_logging_steps == 0 or
+                            (epoch == self.config.training.num_train_epochs - 1 and step == len(
+                                self.train_dataloader) - 1)):
 
-                    # generate some validation images
-                    if self.config.data.prompts is not None:
-                        val_images = self.generate_samples_from_prompts_finetuning(global_step)
+                        # generate some validation images
+                        if self.config.data.prompts is not None:
+                            val_images = self.generate_samples_from_prompts_finetuning(global_step)
+
+                    global_step += 1
 
                 if global_step >= self.config.training.max_train_steps:
                     break
 
             # checkpoint at the end of each epoch
-            if self.accelerator.is_main_process:
+            if epoch % self.config.training.logging.checkpoint_step == 0 and self.accelerator.is_main_process:
                 self.save_checkpoint(logging_dir, global_step)
 
             # Create the pipeline using the trained modules and save it.
@@ -968,13 +1043,6 @@ class DiffPruningTrainer:
 
         # Get the text embedding for conditioning
         encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
-        # text_embeddings = batch["mpnet_embeddings"]
-
-        # arch_vector = self.hyper_net(text_embeddings)
-        # arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
-        #
-        # arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
-        # self.unet.module.set_structure(arch_vectors_separated)
 
         # Get the target for loss depending on the prediction type
         if self.config.model.unet.prediction_type is not None:
@@ -987,6 +1055,9 @@ class DiffPruningTrainer:
             target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
         else:
             raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
+
+        with torch.no_grad():
+            full_model_pred = self.teacher_model(noisy_latents, timesteps, encoder_hidden_states).sample.detach()
 
         # Predict the noise residual and compute loss
         model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
@@ -1012,10 +1083,23 @@ class DiffPruningTrainer:
             loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
             loss = loss.mean()
 
+        diff_loss = loss.clone().detach().mean()
+        loss *= self.config.training.losses.diffusion_loss.weight
+
+        block_loss = torch.tensor(0.0, device=self.accelerator.device)
+        for key in self.block_act_student.keys():
+            block_loss += F.mse_loss(self.block_act_student[key], self.block_act_teacher[key].detach(),
+                                     reduction="mean")
+        block_loss /= len(self.block_act_student)
+        loss += self.config.training.losses.block_loss.weight * block_loss
+
+        distillation_loss = F.mse_loss(model_pred.float(), full_model_pred.float(), reduction="mean")
+        loss += self.config.training.losses.distillation_loss.weight * distillation_loss
+
         del latents, noise, timesteps, noisy_latents, encoder_hidden_states, model_pred, target
         torch.cuda.empty_cache()
 
-        return loss
+        return loss, diff_loss, distillation_loss, block_loss
 
     @torch.no_grad()
     def finetuning_validate(self):
@@ -1038,47 +1122,45 @@ class DiffPruningTrainer:
         self.quantizer.eval()
         self.unet.eval()
         total_val_loss = 0.0
+        total_diff_loss = 0.0
+        total_distillation_loss = 0.0
+        total_block_loss = 0.0
         for step, batch in enumerate(self.eval_dataloader):
             if batch["pixel_values"].numel() == 0:
                 continue
-            loss = self.finetune_step(batch)
+            loss, diff_loss, distillation_loss, block_loss = self.finetune_step(batch)
             # Gather the losses across all processes for logging (if we use distributed training).
             total_val_loss += loss.item()
+            total_diff_loss += diff_loss.item()
+            total_distillation_loss += distillation_loss.item()
+            total_block_loss += block_loss.item()
             progress_bar.update(1)
 
         total_val_loss /= len(self.eval_dataloader)
+        total_diff_loss /= len(self.eval_dataloader)
+        total_distillation_loss /= len(self.eval_dataloader)
+        total_block_loss /= len(self.eval_dataloader)
 
         total_val_loss = self.accelerator.reduce(torch.tensor(total_val_loss, device=self.accelerator.device),
                                                  "mean").item()
+        total_diff_loss = self.accelerator.reduce(torch.tensor(total_diff_loss, device=self.accelerator.device),
+                                                  "mean").item()
+        total_distillation_loss = self.accelerator.reduce(torch.tensor(total_distillation_loss,
+                                                                       device=self.accelerator.device),
+                                                          "mean").item()
+        total_block_loss = self.accelerator.reduce(torch.tensor(total_block_loss, device=self.accelerator.device),
+                                                   "mean").item()
 
         self.accelerator.log({
             "validation/loss": total_val_loss,
+            "validation/diffusion_loss": total_diff_loss,
+            "validation/distillation_loss": total_distillation_loss,
+            "validation/block_loss": total_block_loss
         },
             log_kwargs={"wandb": {"commit": False}})
 
-        del loss, total_val_loss
+        del loss, total_val_loss, total_diff_loss, total_distillation_loss, total_block_loss
         torch.cuda.empty_cache()
-
-    def denoise_sample(self, noisy_samples, model_pred, timesteps, velocity=False):
-        # Make sure alphas_cumprod and timestep have same device and dtype as original_samples
-        alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(device=noisy_samples.device, dtype=noisy_samples.dtype)
-        timesteps = timesteps.to(noisy_samples.device)
-
-        sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
-        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-        while len(sqrt_alpha_prod.shape) < len(noisy_samples.shape):
-            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
-
-        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
-        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-        while len(sqrt_one_minus_alpha_prod.shape) < len(noisy_samples.shape):
-            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
-
-        if velocity:
-            original_samples = sqrt_alpha_prod * noisy_samples - sqrt_one_minus_alpha_prod * model_pred
-        else:
-            original_samples = (noisy_samples - sqrt_one_minus_alpha_prod * model_pred) / sqrt_alpha_prod
-        return original_samples
 
     @torch.no_grad()
     def count_flops(self, batch):
@@ -1389,7 +1471,6 @@ class DiffPruningTrainer:
             hyper_net=self.accelerator.unwrap_model(self.hyper_net),
             quantizer=self.accelerator.unwrap_model(self.quantizer),
         )
-
         pipeline = pipeline.to(self.accelerator.device)
         pipeline.set_progress_bar_config(disable=not self.accelerator.is_main_process)
 

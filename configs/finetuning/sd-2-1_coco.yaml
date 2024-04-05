@@ -15,7 +15,7 @@ model:
       - DownBlock2DHalfGated
 
     unet_mid_block: UNetMidBlock2DCrossAttnWidthGated
-      
+
     unet_up_blocks:
       - UpBlock2DHalfGated
       - CrossAttnUpBlock2DHalfGated
@@ -42,7 +42,7 @@ data:
   dataset_name: null
   data_files: null
   dataset_config_name: null
-  data_dir: "path/to/data"
+  data_dir: "path/to/coco"
   max_train_samples: null
   max_validation_samples: null
 
@@ -59,22 +59,23 @@ data:
     random_flip: true
 
 training:
-  num_train_epochs: 200
-  max_train_steps: null
+  num_train_epochs: null
+  max_train_steps: 50000
   hypernet_pretraining_steps: 300
-  validation_steps: 500
-  image_logging_steps: 500
+  validation_steps: 250
+  image_logging_steps: 250
   mixed_precision: null
   gradient_accumulation_steps: 1
   gradient_checkpointing: false
   local_rank: -1
-  num_inference_steps: 100
+  num_inference_steps: 50
   allow_tf32: false
   enable_xformers_memory_efficient_attention: false
 
   losses:
     diffusion_loss:
       snr_gamma: 5.0
+      weight: 1.0
 
     resource_loss:
       type: log
@@ -92,16 +93,22 @@ training:
     std_loss:
       weight: 0.7
 
+    distillation_loss:
+      weight: 0.5
+
+    block_loss:
+      weight: 0.5
+
   optim:
     hypernet_learning_rate: 2e-4
     quantizer_learning_rate: 2e-4
-    unet_learning_rate: 1e-8
+    unet_learning_rate: 5e-5
     quantizer_weight_decay: 0.00
     hypernet_weight_decay: 0.00
     unet_weight_decay: 0.00
-    scale_lr: true
+    scale_lr: false
     lr_scheduler: "constant_with_warmup"
-    lr_warmup_steps: 1000
+    lr_warmup_steps: 200
     use_8bit_adam: false
     adam_beta1: 0.9
     adam_beta2: 0.999
@@ -116,8 +123,9 @@ training:
   logging:
     logging_dir: "path/to/logs/"
     report_to: "wandb"
-    wandb_log_dir: "/path/to/wandb"
+    wandb_log_dir: "path/to/wandb/logs/"
     checkpoints_total_limit: 1
+    auto_checkpoint_step: false
     resume_from_checkpoint: null
     tracker_project_name: "text2image-dynamic-pruning"
 

@@ -152,6 +152,7 @@ class GatedAttention(Attention):
     def prune(self):
         def prune_linear(layer, gate_hard, out=False):
             num_new_heads = gate_hard.sum().int().item()
+            assert num_new_heads > 0
             linear_cls = layer.__class__
             if out:
                 head_dim = layer.in_features // self.heads
@@ -909,9 +910,10 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
         out_dict["cur_total_flops"] += self.norm3.__flops__
 
         # FeedForward
-        ff_flops = self.ff.calc_flops()
-        for k in out_dict.keys():
-            out_dict[k] = out_dict[k] + ff_flops[k]
+        if self.gated_ff:
+            ff_flops = self.ff.calc_flops()
+            for k in out_dict.keys():
+                out_dict[k] = out_dict[k] + ff_flops[k]
 
         if self.total_flops == 0.:
             self.total_flops = out_dict["total_flops"]
@@ -923,7 +925,7 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
 
     def get_prunable_flops(self):
         flops = [self.attn1.prunable_flops, self.attn2.prunable_flops]
-        if isinstance(self.ff, FeedForwardWidthGated):
+        if self.gated_ff:
             flops.append(self.ff.prunable_flops)
         return flops
 
@@ -2377,53 +2379,6 @@ class DownBlock2DWidthHalfDepthGated(DownBlock2D):
         return flops
 
 
-class UpBlock2DWidthDepthGated(UpBlock2D):
-    def __init__(
-            self,
-            in_channels: int,
-            prev_output_channel: int,
-            out_channels: int,
-            temb_channels: int,
-            dropout: float = 0.0,
-            num_layers: int = 1,
-            resnet_eps: float = 1e-6,
-            resnet_time_scale_shift: str = "default",
-            resnet_act_fn: str = "swish",
-            resnet_groups: int = 32,
-            resnet_pre_norm: bool = True,
-            output_scale_factor=1.0,
-            add_upsample=True,
-    ):
-        super().__init__(in_channels=in_channels, prev_output_channel=prev_output_channel, out_channels=out_channels,
-                         temb_channels=temb_channels, dropout=dropout, num_layers=num_layers, resnet_eps=resnet_eps,
-                         resnet_time_scale_shift=resnet_time_scale_shift, resnet_act_fn=resnet_act_fn,
-                         resnet_groups=resnet_groups, resnet_pre_norm=resnet_pre_norm,
-                         output_scale_factor=output_scale_factor, add_upsample=add_upsample)
-        resnets = []
-
-        for i in range(num_layers):
-            res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
-            resnet_in_channels = prev_output_channel if i == 0 else out_channels
-
-            resnets.append(
-                ResnetBlock2DWidthDepthGated(
-                    skip_connection_dim=res_skip_channels,
-                    in_channels=resnet_in_channels + res_skip_channels,
-                    out_channels=out_channels,
-                    temb_channels=temb_channels,
-                    eps=resnet_eps,
-                    groups=resnet_groups,
-                    dropout=dropout,
-                    time_embedding_norm=resnet_time_scale_shift,
-                    non_linearity=resnet_act_fn,
-                    output_scale_factor=output_scale_factor,
-                    pre_norm=resnet_pre_norm,
-                )
-            )
-
-        self.resnets = nn.ModuleList(resnets)
-
-
 class UpBlock2DWidthHalfDepthGated(UpBlock2D):
     def __init__(
             self,
@@ -2575,6 +2530,7 @@ class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
             upcast_attention: bool = False,
             attention_type: str = "default",
             gated_ff: bool = False,
+            width_gating: bool = True,
             ff_gate_width: int = 32
     ):
         super().__init__(in_channels=in_channels, temb_channels=temb_channels, dropout=dropout, num_layers=num_layers,

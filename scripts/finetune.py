@@ -36,7 +36,7 @@ from torchvision import transforms
 from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, AutoModel
 from transformers.utils import ContextManagers
 
-from diffusers import AutoencoderKL, DDIMScheduler
+from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate
 from diffusers.utils.import_utils import is_xformers_available
@@ -49,6 +49,7 @@ from pdm.utils.arg_utils import parse_args
 from pdm.datasets.cc3m import load_cc3m_dataset
 from pdm.datasets.laion_aes import load_main_laion_dataset
 from pdm.training.trainer import DiffPruningTrainer
+import torch._dynamo
 
 DATASET_NAME_MAPPING = {
     "lambdalabs/pokemon-blip-captions": ("image", "text"),
@@ -63,6 +64,7 @@ logger = get_logger(__name__)
 def main():
     PIL.Image.MAX_IMAGE_PIXELS = 933120000
     torch.autograd.set_detect_anomaly(True)
+    torch._dynamo.config.suppress_errors = True
     args = parse_args()
     config = OmegaConf.load(args.base_config_path)
     # add args to config
@@ -350,7 +352,8 @@ def main():
     def collate_fn(examples):
         examples = [example for example in examples if example["pixel_values"] is not None]
         if len(examples) == 0:
-            return {"pixel_values": torch.tensor([]), "input_ids": torch.tensor([]), "mpnet_embeddings": torch.tensor([])}
+            return {"pixel_values": torch.tensor([]), "input_ids": torch.tensor([]),
+                    "mpnet_embeddings": torch.tensor([])}
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
         input_ids = torch.stack([example["input_ids"] for example in examples])
@@ -371,9 +374,10 @@ def main():
             train_filtering_dataloader = torch.utils.data.DataLoader(train_captions, batch_size=4096, shuffle=False)
             validation_filtering_dataloader = torch.utils.data.DataLoader(validation_captions, batch_size=4096,
                                                                           shuffle=False)
-            hyper_net.to("cuda")
-            quantizer.to("cuda")
-            mpnet_model.to("cuda")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            hyper_net.to(device)
+            quantizer.to(device)
+            mpnet_model.to(device)
             hyper_net.eval()
             quantizer.eval()
             train_indices = []
@@ -393,9 +397,12 @@ def main():
             validation_indices = torch.cat(validation_indices, dim=0)
             torch.save(train_indices, os.path.join(config.pruning_ckpt_dir, "train_mapped_indices.pt"))
             torch.save(validation_indices, os.path.join(config.pruning_ckpt_dir, "validation_mapped_indices.pt"))
-
-        dataset["train"] = dataset["train"].select(torch.where(train_indices == config.embedding_ind)[0])
-        dataset["validation"] = dataset["validation"].select(torch.where(validation_indices == config.embedding_ind)[0])
+        if config.embedding_ind == -1:
+            index = torch.mode(train_indices, 0).values.item()
+        else:
+            index = config.embedding_ind
+        dataset["train"] = dataset["train"].select(torch.where(train_indices == index)[0])
+        dataset["validation"] = dataset["validation"].select(torch.where(validation_indices == index)[0])
         return dataset
 
     tr_indices, val_indices = None, None
@@ -404,7 +411,7 @@ def main():
         tr_indices = torch.load(os.path.join(config.pruning_ckpt_dir, "train_mapped_indices.pt"))
         val_indices = torch.load(os.path.join(config.pruning_ckpt_dir, "validation_mapped_indices.pt"))
 
-    # dataset = filter_dataset(dataset, train_indices=tr_indices, validation_indices=val_indices)
+    dataset = filter_dataset(dataset, train_indices=tr_indices, validation_indices=val_indices)
 
     if config.data.prompts is None:
         config.data.prompts = dataset["validation"][caption_column][:config.data.max_generated_samples]
@@ -450,7 +457,18 @@ def main():
     assert config.embedding_ind is not None, "embedding_ind must be provided"
 
     embeddings_gs = torch.load(os.path.join(config.pruning_ckpt_dir, "quantizer_embeddings.pt"), map_location="cpu")
-    arch_v = embeddings_gs[config.embedding_ind].unsqueeze(0)
+
+    if config.embedding_ind != -1:
+        arch_v = embeddings_gs[config.embedding_ind % embeddings_gs.shape[0]].unsqueeze(0)
+    else:
+        arch_v = torch.ones(1, embeddings_gs.shape[1])
+
+    teacher_unet = UNet2DConditionModel.from_pretrained(
+        config.pretrained_model_name_or_path,
+        subfolder="unet",
+        revision=config.revision,
+    )
+
     unet = UNet2DConditionModelPruned.from_pretrained(
         config.pretrained_model_name_or_path,
         subfolder="unet",
@@ -473,6 +491,7 @@ def main():
     # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
+    teacher_unet.requires_grad_(False)
 
     # Create EMA for the unet.
     if config.model.unet.use_ema:
@@ -542,6 +561,7 @@ def main():
                                  eval_dataset=dataset["validation"],
                                  tokenizer=tokenizer,
                                  finetuning_arch_vector=arch_v,
+                                 teacher_model=teacher_unet,
                                  )
 
     trainer.finetune()

@@ -35,7 +35,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
             depth_order: list = None,
             non_zero_width: bool = True,
             sinkhorn_epsilon: float = 0.05,
-            sinkhorn_iterations: int = 6,
+            sinkhorn_iterations: int = 3,
             resource_aware_normalization: bool = True
     ):
         super().__init__()

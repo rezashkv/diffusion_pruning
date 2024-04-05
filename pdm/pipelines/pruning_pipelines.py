@@ -824,6 +824,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
             self.unet.resource_info_dict['cur_prunable_flops'].squeeze())
 
         if not output_type == "latent":
+            latents = latents.to(dtype=self.vae.dtype, device=self.vae.device)
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
             image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
         else:
@@ -976,6 +977,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
                         callback(i, t, latents)
 
         if not output_type == "latent":
+            latents = latents.to(dtype=self.vae.dtype, device=self.vae.device)
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
             image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
         else:
@@ -1202,6 +1204,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
                 latents_all.append(latents)
 
         if not output_type == "latent":
+            latents_all = [latents.to(dtype=self.vae.dtype, device=self.vae.device) for latents in latents_all]
             images = [self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0].squeeze()
                       for latents in latents_all]
 
@@ -1424,6 +1427,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
         resource_ratios = flops_dict['cur_prunable_flops'] / (self.unet.resource_info_dict['cur_prunable_flops'].squeeze())
 
         if not output_type == "latent":
+            latents = latents.to(dtype=self.vae.dtype, device=self.vae.device)
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
             image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
         else:
@@ -1575,6 +1579,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
                         callback(i, t, latents)
 
         if not output_type == "latent":
+            latents = latents.to(dtype=self.vae.dtype, device=self.vae.device)
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
             image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
         else:

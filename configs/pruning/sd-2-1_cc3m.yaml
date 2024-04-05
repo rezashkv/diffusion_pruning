@@ -42,9 +42,18 @@ data:
   dataset_name: null
   data_files: null
   dataset_config_name: null
-  data_dir: "path/to/coco"
+  data_dir: "path/to/conceptual_captions"
+
+  train_data_dir: "training"
+  train_data_file: "Train-GCC-training.tsv"
+  train_bad_images_path: "path/to/train_cc3m_bad_images.txt"
   max_train_samples: null
+
+  validation_data_dir: "validation"
+  validation_data_file: "Validation-GCC-1.1.0-Validation.tsv"
+  validation_bad_images_path: "/path/to/validation_cc3m_bad_images.txt"
   max_validation_samples: null
+
 
   image_column: "image"
   caption_column: "caption"

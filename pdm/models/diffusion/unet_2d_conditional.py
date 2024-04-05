@@ -52,7 +52,7 @@ from pdm.models.hypernet import HyperStructure
 
 from .blocks import (CrossAttnDownBlock2DWidthDepthGated, CrossAttnUpBlock2DWidthDepthGated,
                      CrossAttnUpBlock2DWidthHalfDepthGated, CrossAttnDownBlock2DWidthHalfDepthGated,
-                     DownBlock2DWidthDepthGated, UpBlock2DWidthDepthGated, DownBlock2DWidthHalfDepthGated,
+                     DownBlock2DWidthDepthGated, DownBlock2DWidthHalfDepthGated,
                      UpBlock2DWidthHalfDepthGated, UNetMidBlock2DCrossAttnWidthGated)
 
 
@@ -404,20 +404,6 @@ def get_up_block(
         )
     elif up_block_type == "UpBlock2DHalfGated":
         return UpBlock2DWidthHalfDepthGated(
-            num_layers=num_layers,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            prev_output_channel=prev_output_channel,
-            temb_channels=temb_channels,
-            dropout=dropout,
-            add_upsample=add_upsample,
-            resnet_eps=resnet_eps,
-            resnet_act_fn=resnet_act_fn,
-            resnet_groups=resnet_groups,
-            resnet_time_scale_shift=resnet_time_scale_shift,
-        )
-    elif up_block_type == "UpBlock2DGated":
-        return UpBlock2DWidthDepthGated(
             num_layers=num_layers,
             in_channels=in_channels,
             out_channels=out_channels,

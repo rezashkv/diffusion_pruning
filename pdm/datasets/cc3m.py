@@ -2,6 +2,7 @@ import logging
 import os
 import pickle
 import PIL
+from PIL import Image
 import pandas as pd
 from PIL import ImageFile
 from datasets import Dataset
@@ -17,7 +18,7 @@ def load_cc3m_dataset(data_dir,  split="train", split_file="Train_GCC-training.t
                            dtype={"caption": str, "link": str})
     # get parent of getcwd() to get to projects/diffusion_pruning/pdm
     names_file = os.path.join(os.getcwd(), "../data", f"{split}_cc3m_names.pkl")
-    if os.path.isfile(names_file):
+    if os.path.exists(names_file):
         with open(names_file, 'rb') as file:
             images = pickle.load(file)
 
@@ -46,13 +47,21 @@ def load_cc3m_dataset(data_dir,  split="train", split_file="Train_GCC-training.t
         PIL.Image.MAX_IMAGE_PIXELS = 933120000
         for image in images:
             try:
-                with PIL.Image.open(image) as img:
-                    imgs.append(img)
-            except PIL.UnidentifiedImageError:
+                Image.open(image)
+                imgs.append(image)
+            except PIL.UnidentifiedImageError as e:
                 bad_images.append(image)
                 logging.info(
-                    f"Image file `{image}` is corrupt and can't be opened."
+                    f"Image file `{image}` is corrupt and can't be opened. {e}"
                 )
+            except FileNotFoundError as e:
+                bad_images.append(image)
+                logging.info(
+                    f"Image file `{image}` is not found. {e}"
+                )
+            except Exception as e:
+                bad_images.append(image)
+                logging.info(f"Unidentified exception {e}")
         images = imgs
         with open(bad_images_path, "w") as f:
             f.write("\n".join(bad_images))

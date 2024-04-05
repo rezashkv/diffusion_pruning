@@ -132,7 +132,7 @@ def main():
             config.pretrained_model_name_or_path, subfolder="text_encoder", revision=config.revision
         )
         vae = AutoencoderKL.from_pretrained(
-                config.pretrained_model_name_or_path, subfolder="vae", revision=config.revision
+            config.pretrained_model_name_or_path, subfolder="vae", revision=config.revision
         )
 
     unet = UNet2DConditionModelGated.from_pretrained(
@@ -191,7 +191,6 @@ def main():
                             model_config=ema_unet.config)
     else:
         ema_unet = None
-
 
     if config.training.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -289,7 +288,7 @@ def main():
             dataset = {"train": load_coco_dataset(os.path.join(data_dir, "images", "train2017"),
                                                   os.path.join(data_dir, "annotations", "captions_train2017.json")),
                        "validation": load_coco_dataset(os.path.join(data_dir, "images", "val2017"),
-                                                      os.path.join(data_dir, "annotations", "captions_val2017.json"))}
+                                                       os.path.join(data_dir, "annotations", "captions_val2017.json"))}
 
         else:
             data_files = {}
