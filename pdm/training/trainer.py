@@ -1,6 +1,7 @@
 import logging
 from pathlib import Path
 
+import numpy as np
 import safetensors
 import torch.nn.functional as F
 import os
@@ -31,6 +32,7 @@ from accelerate.logging import get_logger
 from datasets.utils.logging import set_verbosity_error, set_verbosity_warning
 from packaging import version
 import accelerate
+
 
 from pdm.utils.op_counter_orig import count_ops_and_params
 from pdm.utils.logging_utils import create_image_grid_from_indices, create_heatmap
@@ -73,6 +75,7 @@ class DiffPruningTrainer:
         self.vae = vae
         self.text_encoder = text_encoder
         self.train_dataset = train_dataset
+
         self.clip_loss = clip_loss
         self.resource_loss = resource_loss
         self.eval_dataset = eval_dataset
@@ -275,6 +278,7 @@ class DiffPruningTrainer:
             if self.config.data.prompts is not None:
                 self.prompt_dataset = Dataset.from_dict({"prompts": self.config.data.prompts}).with_transform(
                     preprocess_prompts)
+
 
     def initialize_dataloaders(self, data_collate_fn, prompts_collate_fn):
         train_dataloader = torch.utils.data.DataLoader(
@@ -943,10 +947,6 @@ class DiffPruningTrainer:
                 self.quantizer.eval()
                 self.teacher_model.eval()
                 self.unet.train()
-
-                # Calculating the MACs of each module of the model in the first iteration.
-                # if global_step == initial_global_step:
-                #     self.count_flops(batch)
 
                 loss, diff_loss, distillation_loss, block_loss = self.finetune_step(batch)
                 avg_loss = self.accelerator.reduce(loss, "mean")
