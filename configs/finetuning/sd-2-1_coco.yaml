@@ -93,6 +93,9 @@ training:
     std_loss:
       weight: 0.7
 
+    max_loss:
+      weight: 1.0
+
     distillation_loss:
       weight: 0.5
 

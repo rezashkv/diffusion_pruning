@@ -402,6 +402,12 @@ def main():
             index = torch.mode(train_indices, 0).values.item()
         else:
             index = config.embedding_ind
+
+        filtered_train_indices = torch.where(train_indices == index)[0]
+        filtered_validation_indices = torch.where(validation_indices == index)[0]
+        # save the filtered indices to checkpoint_dir
+        torch.save(filtered_train_indices, os.path.join(config.training.logging.logging_dir, "filtered_train_indices.pt"))
+        torch.save(filtered_validation_indices, os.path.join(config.training.logging.logging_dir, "filtered_validation_indices.pt"))
         dataset["train"] = dataset["train"].select(torch.where(train_indices == index)[0])
         dataset["validation"] = dataset["validation"].select(torch.where(validation_indices == index)[0])
         return dataset
@@ -410,164 +416,167 @@ def main():
     if os.path.exists(os.path.join(config.pruning_ckpt_dir, "train_mapped_indices.pt")) and \
             os.path.exists(os.path.join(config.pruning_ckpt_dir, "validation_mapped_indices.pt")):
         logging.info("Skipping filtering dataset. Loading indices from disk.")
-        tr_indices = torch.load(os.path.join(config.pruning_ckpt_dir, "train_mapped_indices.pt"))
-        val_indices = torch.load(os.path.join(config.pruning_ckpt_dir, "validation_mapped_indices.pt"))
+        tr_indices = torch.load(os.path.join(config.pruning_ckpt_dir, "train_mapped_indices.pt"), map_location="cpu")
+        val_indices = torch.load(os.path.join(config.pruning_ckpt_dir, "validation_mapped_indices.pt"), map_location="cpu")
 
     dataset = filter_dataset(dataset, train_indices=tr_indices, validation_indices=val_indices)
 
 
-    # if config.data.prompts is None:
-    #     config.data.prompts = dataset["validation"][caption_column][:config.data.max_generated_samples]
-    #
-    # # #################################################### Models ####################################################
-    #
-    # # Load scheduler, tokenizer and models.
-    # noise_scheduler = DDIMScheduler.from_pretrained(config.pretrained_model_name_or_path, subfolder="scheduler")
-    #
-    # tokenizer = CLIPTokenizer.from_pretrained(
-    #     config.pretrained_model_name_or_path, subfolder="tokenizer", revision=config.revision
-    # )
-    #
-    # def deepspeed_zero_init_disabled_context_manager():
-    #     """
-    #     returns either a context list that includes one that will disable zero.Init or an empty context list
-    #     """
-    #     deepspeed_plugin = AcceleratorState().deepspeed_plugin if accelerate.state.is_initialized() else None
-    #     if deepspeed_plugin is None:
-    #         return []
-    #
-    #     return [deepspeed_plugin.zero3_init_context_manager(enable=False)]
-    #
-    # # Currently Accelerate doesn't know how to handle multiple models under Deepspeed ZeRO stage 3.
-    # # For this to work properly all models must be run through `accelerate.prepare`. But accelerate
-    # # will try to assign the same optimizer with the same weights to all models during
-    # # `deepspeed.initialize`, which of course doesn't work.
-    # #
-    # # For now the following workaround will partially support Deepspeed ZeRO-3, by excluding the 2
-    # # frozen models from being partitioned during `zero.Init` which gets called during
-    # # `from_pretrained` So CLIPTextModel and AutoencoderKL will not enjoy the parameter sharding
-    # # across multiple gpus and only UNet2DConditionModel will get ZeRO sharded.
-    # with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
-    #     text_encoder = CLIPTextModel.from_pretrained(
-    #         config.pretrained_model_name_or_path, subfolder="text_encoder", revision=config.revision
-    #     )
-    #     vae = AutoencoderKL.from_pretrained(
-    #         config.pretrained_model_name_or_path, subfolder="vae", revision=config.revision
-    #     )
-    #
-    # # load embedding_gs from checkpoint_dir
-    # assert config.pruning_ckpt_dir is not None, "checkpoint_dir must be provided"
-    # assert config.embedding_ind is not None, "embedding_ind must be provided"
-    #
-    # embeddings_gs = torch.load(os.path.join(config.pruning_ckpt_dir, "quantizer_embeddings.pt"), map_location="cpu")
-    #
-    # if config.embedding_ind != -1:
-    #     arch_v = embeddings_gs[config.embedding_ind % embeddings_gs.shape[0]].unsqueeze(0)
-    # else:
-    #     arch_v = torch.ones(1, embeddings_gs.shape[1])
-    #
-    # teacher_unet = UNet2DConditionModel.from_pretrained(
-    #     config.pretrained_model_name_or_path,
-    #     subfolder="unet",
-    #     revision=config.revision,
-    # )
-    #
-    # unet = UNet2DConditionModelPruned.from_pretrained(
-    #     config.pretrained_model_name_or_path,
-    #     subfolder="unet",
-    #     revision=config.non_ema_revision,
-    #     down_block_types=tuple(config.model.unet.unet_down_blocks),
-    #     mid_block_type=config.model.unet.unet_mid_block,
-    #     up_block_types=tuple(config.model.unet.unet_up_blocks),
-    #     gated_ff=config.model.unet.gated_ff,
-    #     ff_gate_width=config.model.unet.ff_gate_width,
-    #     arch_vector=arch_v
-    # )
-    #
-    # r_loss = ResourceLoss(p=config.training.losses.resource_loss.pruning_target,
-    #                       loss_type=config.training.losses.resource_loss.type)
-    #
-    # clip_loss = ClipLoss(
-    #     arch_vector_temperature=config.training.losses.contrastive_clip_loss.arch_vector_temperature,
-    #     prompt_embedding_temperature=config.training.losses.contrastive_clip_loss.prompt_embedding_temperature)
-    #
-    # # Freeze vae and text_encoder and set unet to trainable
-    # vae.requires_grad_(False)
-    # text_encoder.requires_grad_(False)
-    # teacher_unet.requires_grad_(False)
-    #
-    # # Create EMA for the unet.
-    # if config.model.unet.use_ema:
-    #     ema_unet = UNet2DConditionModelPruned.from_pretrained(
-    #         config.pretrained_model_name_or_path,
-    #         subfolder="unet",
-    #         revision=config.revision,
-    #         down_block_types=config.model.unet.unet_down_blocks,
-    #         mid_block_type=config.model.unet.unet_mid_block,
-    #         up_block_types=config.model.unet.unet_up_blocks,
-    #     )
-    #     ema_unet = EMAModel(ema_unet.parameters(),
-    #                         model_cls=UNet2DConditionModelPruned,
-    #                         model_config=ema_unet.config)
-    # else:
-    #     ema_unet = None
-    #
-    # unet.train()
-    #
-    # if config.training.enable_xformers_memory_efficient_attention:
-    #     if is_xformers_available():
-    #         import xformers
-    #
-    #         xformers_version = version.parse(xformers.__version__)
-    #         if xformers_version == version.parse("0.0.16"):
-    #             logger.warn(
-    #                 "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
-    #             )
-    #         unet.enable_xformers_memory_efficient_attention()
-    #     else:
-    #         raise ValueError("xformers is not available. Make sure it is installed correctly")
-    #
-    # if config.training.gradient_checkpointing:
-    #     unet.enable_gradient_checkpointing()
-    #
-    # # Enable TF32 for faster training on Ampere GPUs,
-    # # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
-    # if config.training.allow_tf32:
-    #     torch.backends.cuda.matmul.allow_tf32 = True
-    #
-    # del args, data_dir, data_files, dataset_config_name, dataset_name, dataset_columns, \
-    #     train_data_dir, train_data_file, train_bad_images_path, max_train_samples, validation_data_dir, \
-    #     validation_data_file, validation_bad_images_path, max_validation_samples
-    #
-    # # set hyper_net to an empty module
-    # hyper_net = torch.nn.Module()
-    # n_e = embeddings_gs.shape[0]
-    # quantizer = torch.nn.Module()
-    # quantizer.n_e = n_e
+    if config.data.prompts is None:
+        config.data.prompts = dataset["validation"][caption_column][:config.data.max_generated_samples]
 
-    # trainer = DiffPruningTrainer(config=config,
-    #                              hyper_net=hyper_net,
-    #                              quantizer=quantizer,
-    #                              unet=unet,
-    #                              noise_scheduler=noise_scheduler,
-    #                              vae=vae,
-    #                              text_encoder=text_encoder,
-    #                              clip_loss=clip_loss,
-    #                              resource_loss=r_loss,
-    #                              train_dataset=dataset["train"],
-    #                              preprocess_train=preprocess_train,
-    #                              preprocess_eval=preprocess_validation,
-    #                              preprocess_prompts=preprocess_prompts,
-    #                              data_collator=collate_fn,
-    #                              prompts_collator=prompts_collate_fn,
-    #                              ema_unet=ema_unet,
-    #                              eval_dataset=dataset["validation"],
-    #                              tokenizer=tokenizer,
-    #                              finetuning_arch_vector=arch_v,
-    #                              teacher_model=teacher_unet,
-    #                              )
+    # #################################################### Models ####################################################
+
+    # Load scheduler, tokenizer and models.
+    noise_scheduler = DDIMScheduler.from_pretrained(config.pretrained_model_name_or_path, subfolder="scheduler")
+
+    tokenizer = CLIPTokenizer.from_pretrained(
+        config.pretrained_model_name_or_path, subfolder="tokenizer", revision=config.revision
+    )
+
+    def deepspeed_zero_init_disabled_context_manager():
+        """
+        returns either a context list that includes one that will disable zero.Init or an empty context list
+        """
+        deepspeed_plugin = AcceleratorState().deepspeed_plugin if accelerate.state.is_initialized() else None
+        if deepspeed_plugin is None:
+            return []
+
+        return [deepspeed_plugin.zero3_init_context_manager(enable=False)]
+
+    # Currently Accelerate doesn't know how to handle multiple models under Deepspeed ZeRO stage 3.
+    # For this to work properly all models must be run through `accelerate.prepare`. But accelerate
+    # will try to assign the same optimizer with the same weights to all models during
+    # `deepspeed.initialize`, which of course doesn't work.
     #
-    # trainer.finetune()
+    # For now the following workaround will partially support Deepspeed ZeRO-3, by excluding the 2
+    # frozen models from being partitioned during `zero.Init` which gets called during
+    # `from_pretrained` So CLIPTextModel and AutoencoderKL will not enjoy the parameter sharding
+    # across multiple gpus and only UNet2DConditionModel will get ZeRO sharded.
+    with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
+        text_encoder = CLIPTextModel.from_pretrained(
+            config.pretrained_model_name_or_path, subfolder="text_encoder", revision=config.revision
+        )
+        vae = AutoencoderKL.from_pretrained(
+            config.pretrained_model_name_or_path, subfolder="vae", revision=config.revision
+        )
+
+    # load embedding_gs from checkpoint_dir
+    assert config.pruning_ckpt_dir is not None, "checkpoint_dir must be provided"
+    assert config.embedding_ind is not None, "embedding_ind must be provided"
+
+    embeddings_gs = torch.load(os.path.join(config.pruning_ckpt_dir, "quantizer_embeddings.pt"), map_location="cpu")
+
+    if config.embedding_ind != -1:
+        arch_v = embeddings_gs[config.embedding_ind % embeddings_gs.shape[0]].unsqueeze(0)
+    else:
+        arch_v = torch.ones(1, embeddings_gs.shape[1])
+
+    # save the arch_v to logging_dir
+    torch.save(arch_v, os.path.join(config.training.logging.logging_dir, "arch_vector.pt"))
+
+    teacher_unet = UNet2DConditionModel.from_pretrained(
+        config.pretrained_model_name_or_path,
+        subfolder="unet",
+        revision=config.revision,
+    )
+
+    unet = UNet2DConditionModelPruned.from_pretrained(
+        config.pretrained_model_name_or_path,
+        subfolder="unet",
+        revision=config.non_ema_revision,
+        down_block_types=tuple(config.model.unet.unet_down_blocks),
+        mid_block_type=config.model.unet.unet_mid_block,
+        up_block_types=tuple(config.model.unet.unet_up_blocks),
+        gated_ff=config.model.unet.gated_ff,
+        ff_gate_width=config.model.unet.ff_gate_width,
+        arch_vector=arch_v
+    )
+
+    r_loss = ResourceLoss(p=config.training.losses.resource_loss.pruning_target,
+                          loss_type=config.training.losses.resource_loss.type)
+
+    clip_loss = ClipLoss(
+        arch_vector_temperature=config.training.losses.contrastive_clip_loss.arch_vector_temperature,
+        prompt_embedding_temperature=config.training.losses.contrastive_clip_loss.prompt_embedding_temperature)
+
+    # Freeze vae and text_encoder and set unet to trainable
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    teacher_unet.requires_grad_(False)
+
+    # Create EMA for the unet.
+    if config.model.unet.use_ema:
+        ema_unet = UNet2DConditionModelPruned.from_pretrained(
+            config.pretrained_model_name_or_path,
+            subfolder="unet",
+            revision=config.revision,
+            down_block_types=config.model.unet.unet_down_blocks,
+            mid_block_type=config.model.unet.unet_mid_block,
+            up_block_types=config.model.unet.unet_up_blocks,
+        )
+        ema_unet = EMAModel(ema_unet.parameters(),
+                            model_cls=UNet2DConditionModelPruned,
+                            model_config=ema_unet.config)
+    else:
+        ema_unet = None
+
+    unet.train()
+
+    if config.training.enable_xformers_memory_efficient_attention:
+        if is_xformers_available():
+            import xformers
+
+            xformers_version = version.parse(xformers.__version__)
+            if xformers_version == version.parse("0.0.16"):
+                logger.warn(
+                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
+                )
+            unet.enable_xformers_memory_efficient_attention()
+        else:
+            raise ValueError("xformers is not available. Make sure it is installed correctly")
+
+    if config.training.gradient_checkpointing:
+        unet.enable_gradient_checkpointing()
+
+    # Enable TF32 for faster training on Ampere GPUs,
+    # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
+    if config.training.allow_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    del args, data_dir, data_files, dataset_config_name, dataset_name, dataset_columns, \
+        train_data_dir, train_data_file, train_bad_images_path, max_train_samples, validation_data_dir, \
+        validation_data_file, validation_bad_images_path, max_validation_samples
+
+    # set hyper_net to an empty module
+    hyper_net = torch.nn.Module()
+    n_e = embeddings_gs.shape[0]
+    quantizer = torch.nn.Module()
+    quantizer.n_e = n_e
+
+    trainer = DiffPruningTrainer(config=config,
+                                 hyper_net=hyper_net,
+                                 quantizer=quantizer,
+                                 unet=unet,
+                                 noise_scheduler=noise_scheduler,
+                                 vae=vae,
+                                 text_encoder=text_encoder,
+                                 clip_loss=clip_loss,
+                                 resource_loss=r_loss,
+                                 train_dataset=dataset["train"],
+                                 preprocess_train=preprocess_train,
+                                 preprocess_eval=preprocess_validation,
+                                 preprocess_prompts=preprocess_prompts,
+                                 data_collator=collate_fn,
+                                 prompts_collator=prompts_collate_fn,
+                                 ema_unet=ema_unet,
+                                 eval_dataset=dataset["validation"],
+                                 tokenizer=tokenizer,
+                                 finetuning_arch_vector=arch_v,
+                                 teacher_model=teacher_unet,
+                                 )
+
+    trainer.finetune()
 
 
 if __name__ == "__main__":

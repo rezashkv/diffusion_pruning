@@ -529,7 +529,8 @@ class DiffPruningTrainer:
                     flops_dict, arch_vector_quantized, quantizer_embedding_pairwise_similarity, \
                     batch_resource_ratios = self.step(batch, pretrain=pretrain)
 
-                avg_loss = self.accelerator.reduce(loss, "mean")
+                # avg_loss = self.accelerator.reduce(loss, "mean")
+                avg_loss = loss
                 train_loss += avg_loss.item() / self.config.training.gradient_accumulation_steps
 
                 # Back-propagate
@@ -570,10 +571,6 @@ class DiffPruningTrainer:
                         else:
                             log_dict[f"training/{k}"] = v
 
-                    log_dict["images/arch vector pairwise similarity image"] = wandb.Image(arch_vectors_similarity)
-                    log_dict["images/quantizer_embedding_pairwise_similarity"] = wandb.Image(
-                        quantizer_embedding_pairwise_similarity)
-
                     self.accelerator.log(log_dict)
 
                     logs = {"diff_loss": diff_loss.detach().item(),
@@ -595,14 +592,18 @@ class DiffPruningTrainer:
                     if (global_step % self.config.training.image_logging_steps == 0 or
                             (epoch == self.config.training.num_train_epochs - 1 and step == len(
                                 self.train_dataloader) - 1)):
+                        img_log_dict = {}
+                        img_log_dict["images/arch vector pairwise similarity image"] = wandb.Image(arch_vectors_similarity)
+                        img_log_dict["images/quantizer_embedding_pairwise_similarity"] = wandb.Image(
+                            quantizer_embedding_pairwise_similarity)
 
                         with torch.no_grad():
                             batch_resource_ratios = self.accelerator.gather_for_metrics(
                                 batch_resource_ratios).cpu().numpy()
 
-                        self.accelerator.log({"images/batch resource ratio heatmap": wandb.Image(
-                            create_heatmap(batch_resource_ratios, n_rows=16, n_cols=len(batch_resource_ratios) // 16))},
-                            log_kwargs={"wandb": {"commit": False}})
+                        img_log_dict["images/batch resource ratio heatmap"] = wandb.Image(
+                            create_heatmap(batch_resource_ratios, n_rows=16, n_cols=len(batch_resource_ratios) // 16))
+                        self.accelerator.log(img_log_dict, log_kwargs={"wandb": {"commit": False}})
 
                         # generate some validation images
                         if self.config.data.prompts is not None:
@@ -713,6 +714,7 @@ class DiffPruningTrainer:
 
     def step(self, batch, pretrain=False):
         latents = self.vae.encode(batch["pixel_values"].to(self.weight_dtype)).latent_dist.sample()
+
         latents = latents * self.vae.config.scaling_factor
 
         # Sample noise that we'll add to the latents
@@ -852,7 +854,7 @@ class DiffPruningTrainer:
         del latents, noise, timesteps, noisy_latents, encoder_hidden_states, text_embeddings, arch_vector, arch_vectors_separated, \
             quantizer_embeddings, text_embeddings_list, arch_vector_list, curr_flops, model_pred, target, \
             arch_vector_width_depth_normalized, full_arch_vector, full_model_pred, teacher_block_activations, \
-            student_block_activations
+            student_block_activations, batch
 
         torch.cuda.empty_cache()
 
@@ -948,8 +950,12 @@ class DiffPruningTrainer:
                 self.teacher_model.eval()
                 self.unet.train()
 
+                if global_step == initial_global_step:
+                    self.count_flops(batch)
+
                 loss, diff_loss, distillation_loss, block_loss = self.finetune_step(batch)
-                avg_loss = self.accelerator.reduce(loss, "mean")
+                # avg_loss = self.accelerator.reduce(loss, "mean")
+                avg_loss = loss
                 train_loss += avg_loss.item() / self.config.training.gradient_accumulation_steps
 
                 # Back-propagate
@@ -1055,13 +1061,11 @@ class DiffPruningTrainer:
             target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
         else:
             raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
-
+        torch.cuda.empty_cache()
         with torch.no_grad():
             full_model_pred = self.teacher_model(noisy_latents, timesteps, encoder_hidden_states).sample.detach()
-
         # Predict the noise residual and compute loss
         model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
-
         if self.config.training.losses.diffusion_loss.snr_gamma is None:
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
         else:
@@ -1096,7 +1100,8 @@ class DiffPruningTrainer:
         distillation_loss = F.mse_loss(model_pred.float(), full_model_pred.float(), reduction="mean")
         loss += self.config.training.losses.distillation_loss.weight * distillation_loss
 
-        del latents, noise, timesteps, noisy_latents, encoder_hidden_states, model_pred, target
+        del latents, noise, timesteps, noisy_latents, encoder_hidden_states, model_pred, target, full_model_pred, batch
+
         torch.cuda.empty_cache()
 
         return loss, diff_loss, distillation_loss, block_loss

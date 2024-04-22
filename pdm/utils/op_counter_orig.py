@@ -16,6 +16,7 @@ from diffusers.models.normalization import AdaGroupNorm
 # from diffusers.models.activations import GEGLU
 from diffusers.models.lora import (LoRACompatibleConv, LoRACompatibleLinear)
 from pdm.models.diffusion.blocks import GatedAttention
+from diffusers.models.attention_processor import Attention
 import sys
 from functools import partial
 import torch.nn as nn
@@ -310,6 +311,49 @@ def gated_attention_counter_hook(gated_attention_module, input, output):
     gated_attention_module.__flops__ = gated_attention_module.total_flops
 
 
+def attention_counter_hook(attention_module, input, output):
+    total_flops = 0
+    if attention_module.spatial_norm is not None:
+        total_flops += attention_module.spatial_norm.__flops__
+
+    # GroupNorm
+    if attention_module.group_norm is not None:
+        total_flops += attention_module.group_norm.__flops__
+
+    # NormCross
+    if attention_module.norm_cross:
+       total_flops += attention_module.norm_cross.__flops__
+
+    # to_q
+    total_flops += attention_module.to_q.__flops__
+
+    # to_k
+    total_flops += attention_module.to_k.__flops__
+
+    # to_v
+    total_flops += attention_module.to_v.__flops__
+
+
+    attn_flops = 0
+    batch_size, seq_len, dim = output.shape
+    num_heads, head_dim = attention_module.heads, dim // attention_module.heads
+
+    head_flops = (
+            (seq_len * seq_len * head_dim)  # QK^T
+            + (seq_len * seq_len)  # softmax
+            + (seq_len * seq_len * head_dim)  # AV
+    )
+
+    attn_flops += num_heads * head_flops
+
+    total_flops += attn_flops
+
+    # to_out
+    total_flops += attention_module.to_out[0].__flops__
+
+    attention_module.__flops__ = total_flops
+
+
 CUSTOM_MODULES_MAPPING = {}
 
 MODULES_MAPPING = {
@@ -375,6 +419,7 @@ MODULES_MAPPING = {
     nn.GRUCell: rnn_cell_flops_counter_hook,
     nn.MultiheadAttention: multihead_attention_counter_hook,
 
+    Attention: attention_counter_hook,
     GatedAttention: gated_attention_counter_hook,
 }
 

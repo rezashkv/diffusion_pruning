@@ -16,6 +16,7 @@
 import logging
 import os
 import random
+import datetime
 
 from accelerate.utils import set_seed
 from omegaconf import OmegaConf
@@ -32,7 +33,7 @@ from datasets import load_dataset, Dataset, concatenate_datasets
 from packaging import version
 from pdm.datasets.coco import load_coco_dataset
 from torchvision import transforms
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, AutoModel
 from transformers.utils import ContextManagers
 
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
@@ -40,8 +41,9 @@ from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate
 from diffusers.utils.import_utils import is_xformers_available
 
-from pdm.models.diffusion import UNet2DConditionModelPruned, UNet2DConditionModelMagnitudePruned
-from pdm.utils.op_counter_orig import count_ops_and_params
+from pdm.models.diffusion import UNet2DConditionModelPruned
+from pdm.models import HyperStructure
+from pdm.models import StructureVectorQuantizer
 from pdm.losses import ClipLoss, ResourceLoss
 from pdm.utils.arg_utils import parse_args
 from pdm.datasets.cc3m import load_cc3m_dataset
@@ -80,6 +82,7 @@ def main():
                 " use `--variant=non_ema` instead."
             ),
         )
+
     config.training.logging.logging_dir = os.path.join(config.training.logging.logging_dir,
                                                        os.getcwd().split('/')[-2],
                                                        config.base_config_path.split('/')[-2],
@@ -93,6 +96,14 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
+
+    # ########################### Hypernet and Quantizer for Dataset Preprocessing #####################################
+
+    hyper_net = HyperStructure.from_pretrained(config.pruning_ckpt_dir, subfolder="hypernet")
+    quantizer = StructureVectorQuantizer.from_pretrained(config.pruning_ckpt_dir, subfolder="quantizer")
+
+    mpnet_tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-mpnet-base-v2')
+    mpnet_model = AutoModel.from_pretrained('sentence-transformers/all-mpnet-base-v2')
 
     # #################################################### Datasets ####################################################
 
@@ -127,30 +138,7 @@ def main():
         )
 
     else:
-        if "aesthetics" in data_dir:
-            data_dir = os.path.join(data_dir, "data")
-            if data_files is None:
-                # datafiles a list of 5-char strs from 00000 to 00250.
-                data_files = [f"{i:05d}" for i in range(max_train_samples // 10000 + 1)]
-            train_data = load_main_laion_dataset(data_dir, list(data_files))
-            val_data = load_main_laion_dataset(data_dir, ["01000"])
-            # Convert the loaded data into a Hugging Face Dataset
-            tr_datasets = []
-            for dataset_name, dataset in train_data.items():
-                tr_datasets.append(Dataset.from_list(dataset))
-
-            val_datasets = []
-            for dataset_name, dataset in val_data.items():
-                val_datasets.append(Dataset.from_list(dataset))
-            if max_train_samples is None:
-                max_train_samples = len(tr_datasets[0]) * 10000
-            if max_validation_samples is None:
-                max_validation_samples = len(val_datasets[0])
-            dataset = {'train': concatenate_datasets(tr_datasets).select(range(max_train_samples)),
-                       'validation': concatenate_datasets(val_datasets).select(range(max_validation_samples))}
-            del tr_datasets, val_datasets, train_data, val_data
-
-        elif "conceptual_captions" in data_dir:
+        if "conceptual_captions" in data_dir or "cc3m" in data_dir:
             dataset = {"train": load_cc3m_dataset(data_dir,
                                                   split="train",
                                                   split_file=train_data_file,
@@ -229,6 +217,35 @@ def main():
         )
         return inputs.input_ids
 
+    def get_mpnet_embeddings(capts, is_train=True):
+        # Mean Pooling - Take attention mask into account for correct averaging
+        def mean_pooling(model_output, attention_mask):
+            token_embeddings = model_output[0]  # First element of model_output contains all token embeddings
+            input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+            return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1),
+                                                                                      min=1e-9)
+
+        captions = []
+        for caption in capts:
+            if isinstance(caption, str):
+                captions.append(caption)
+            elif isinstance(caption, (list, np.ndarray)):
+                # take a random caption if there are multiple
+                captions.append(random.choice(caption) if is_train else caption[0])
+            else:
+                raise ValueError(
+                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
+                )
+
+        encoded_input = mpnet_tokenizer(captions, padding=True, truncation=True, return_tensors="pt")
+        encoded_input = {k: v.to(mpnet_model.device) for k, v in encoded_input.items()}
+        # Compute token embeddings
+        with torch.no_grad():
+            model_output = mpnet_model(**encoded_input)
+        sentence_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
+        # sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
+        return sentence_embeddings
+
     # Preprocessing the datasets.
     train_transforms = transforms.Compose(
         [
@@ -273,6 +290,7 @@ def main():
         images = [image.convert("RGB") if image is not None else image for image in examples[image_column]]
         examples["pixel_values"] = [train_transforms(image) if image is not None else image for image in images]
         examples["input_ids"] = tokenize_captions(examples)
+        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples[caption_column], is_train=True)
         return examples
 
     def preprocess_validation(examples):
@@ -295,23 +313,84 @@ def main():
         images = [image.convert("RGB") if image is not None else image for image in examples[image_column]]
         examples["pixel_values"] = [validation_transforms(image) if image is not None else image for image in images]
         examples["input_ids"] = tokenize_captions(examples, is_train=False)
+        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples[caption_column], is_train=False)
         return examples
 
     def preprocess_prompts(examples):
+        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples["prompts"], is_train=False)
         return examples
 
     def collate_fn(examples):
         examples = [example for example in examples if example["pixel_values"] is not None]
         if len(examples) == 0:
-            return {"pixel_values": torch.tensor([]), "input_ids": torch.tensor([])}
+            return {"pixel_values": torch.tensor([]), "input_ids": torch.tensor([]),
+                    "mpnet_embeddings": torch.tensor([])}
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
         input_ids = torch.stack([example["input_ids"] for example in examples])
-        return {"pixel_values": pixel_values, "input_ids": input_ids}
+        mpnet_embeddings = torch.stack([example["mpnet_embeddings"] for example in examples])
+        mpnet_embeddings = mpnet_embeddings.to(memory_format=torch.contiguous_format).float()
+        return {"pixel_values": pixel_values, "input_ids": input_ids, "mpnet_embeddings": mpnet_embeddings}
 
     def prompts_collate_fn(examples):
         prompts = [example["prompts"] for example in examples]
-        return {"prompts": prompts}
+        prompt_embdeddings = torch.stack([example["mpnet_embeddings"] for example in examples])
+        prompt_embdeddings = prompt_embdeddings.to(memory_format=torch.contiguous_format).float()
+        return {"prompts": prompts, "mpnet_embeddings": prompt_embdeddings}
+
+    def filter_dataset(dataset, train_indices=None, validation_indices=None):
+        if train_indices is None:
+            train_captions = dataset["train"][caption_column]
+            validation_captions = dataset["validation"][caption_column]
+            train_filtering_dataloader = torch.utils.data.DataLoader(train_captions, batch_size=2048, shuffle=False)
+            validation_filtering_dataloader = torch.utils.data.DataLoader(validation_captions, batch_size=2048,
+                                                                          shuffle=False)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            hyper_net.to(device)
+            quantizer.to(device)
+            mpnet_model.to(device)
+            hyper_net.eval()
+            quantizer.eval()
+            train_indices = []
+            validation_indices = []
+            with torch.no_grad():
+                for batch in train_filtering_dataloader:
+                    batch = get_mpnet_embeddings(batch, is_train=True)
+                    arch_v = hyper_net(batch)
+                    indices = quantizer.get_cosine_sim_min_encoding_indices(arch_v)
+                    train_indices.append(indices)
+                for batch in validation_filtering_dataloader:
+                    batch = get_mpnet_embeddings(batch, is_train=False)
+                    arch_v = hyper_net(batch)
+                    indices = quantizer.get_cosine_sim_min_encoding_indices(arch_v)
+                    validation_indices.append(indices)
+            train_indices = torch.cat(train_indices, dim=0)
+            validation_indices = torch.cat(validation_indices, dim=0)
+            torch.save(train_indices, os.path.join(config.pruning_ckpt_dir, "train_mapped_indices.pt"))
+            torch.save(validation_indices, os.path.join(config.pruning_ckpt_dir, "validation_mapped_indices.pt"))
+        if config.embedding_ind == -1:
+            index = torch.mode(train_indices, 0).values.item()
+        else:
+            index = config.embedding_ind
+
+        filtered_train_indices = torch.where(train_indices == index)[0]
+        filtered_validation_indices = torch.where(validation_indices == index)[0]
+        # save the filtered indices to checkpoint_dir
+        torch.save(filtered_train_indices, os.path.join(config.training.logging.logging_dir, "filtered_train_indices.pt"))
+        torch.save(filtered_validation_indices, os.path.join(config.training.logging.logging_dir, "filtered_validation_indices.pt"))
+        dataset["train"] = dataset["train"].select(torch.where(train_indices == index)[0])
+        dataset["validation"] = dataset["validation"].select(torch.where(validation_indices == index)[0])
+        return dataset
+
+    tr_indices, val_indices = None, None
+    if os.path.exists(os.path.join(config.pruning_ckpt_dir, "train_mapped_indices.pt")) and \
+            os.path.exists(os.path.join(config.pruning_ckpt_dir, "validation_mapped_indices.pt")):
+        logging.info("Skipping filtering dataset. Loading indices from disk.")
+        tr_indices = torch.load(os.path.join(config.pruning_ckpt_dir, "train_mapped_indices.pt"), map_location="cpu")
+        val_indices = torch.load(os.path.join(config.pruning_ckpt_dir, "validation_mapped_indices.pt"), map_location="cpu")
+
+    dataset = filter_dataset(dataset, train_indices=tr_indices, validation_indices=val_indices)
+
 
     if config.data.prompts is None:
         config.data.prompts = dataset["validation"][caption_column][:config.data.max_generated_samples]
@@ -352,36 +431,34 @@ def main():
             config.pretrained_model_name_or_path, subfolder="vae", revision=config.revision
         )
 
+    # load embedding_gs from checkpoint_dir
+    assert config.pruning_ckpt_dir is not None, "checkpoint_dir must be provided"
+    assert config.embedding_ind is not None, "embedding_ind must be provided"
+
+    embeddings_gs = torch.load(os.path.join(config.pruning_ckpt_dir, "quantizer_embeddings.pt"), map_location="cpu")
+
+    if config.embedding_ind != -1:
+        arch_v = embeddings_gs[config.embedding_ind % embeddings_gs.shape[0]].unsqueeze(0)
+    else:
+        arch_v = torch.ones(1, embeddings_gs.shape[1])
+
     teacher_unet = UNet2DConditionModel.from_pretrained(
         config.pretrained_model_name_or_path,
         subfolder="unet",
         revision=config.revision,
     )
 
-
-    sample_inputs = {'sample': torch.randn(1, teacher_unet.config.in_channels, teacher_unet.config.sample_size, teacher_unet.config.sample_size),
-                      'timestep': torch.ones((1,)).long(),
-                      'encoder_hidden_states': text_encoder(torch.tensor([[100]]))[0],
-                      }
-
-
-    teacher_flops, teacher_params = count_ops_and_params(teacher_unet, sample_inputs)
-
-    unet = UNet2DConditionModelMagnitudePruned.from_pretrained(
+    unet = UNet2DConditionModelPruned.from_pretrained(
         config.pretrained_model_name_or_path,
         subfolder="unet",
         revision=config.non_ema_revision,
-        target_pruning_rate=config.training.pruning_target,
-        pruning_method=config.training.pruning_method,
-        sample_inputs=sample_inputs
+        down_block_types=tuple(config.model.unet.unet_down_blocks),
+        mid_block_type=config.model.unet.unet_mid_block,
+        up_block_types=tuple(config.model.unet.unet_up_blocks),
+        gated_ff=config.model.unet.gated_ff,
+        ff_gate_width=config.model.unet.ff_gate_width,
+        arch_vector=arch_v
     )
-
-    unet_flops, unet_params = count_ops_and_params(unet, sample_inputs)
-
-    print(f"Teacher FLOPs: {teacher_flops/1e9}G, Teacher Params: {teacher_params/1e6}M")
-    print(f"Magnitude Pruned UNet FLOPs: {unet_flops/1e9}G, Magnitude Pruned UNet Params: {unet_params/1e6}M")
-    print(f"Pruning Raio: {unet_flops/teacher_flops:.2f}")
-
 
     r_loss = ResourceLoss(p=config.training.losses.resource_loss.pruning_target,
                           loss_type=config.training.losses.resource_loss.type)
@@ -440,7 +517,9 @@ def main():
 
     # set hyper_net to an empty module
     hyper_net = torch.nn.Module()
+    n_e = embeddings_gs.shape[0]
     quantizer = torch.nn.Module()
+    quantizer.n_e = n_e
 
     trainer = DiffPruningTrainer(config=config,
                                  hyper_net=hyper_net,
@@ -460,7 +539,7 @@ def main():
                                  ema_unet=ema_unet,
                                  eval_dataset=dataset["validation"],
                                  tokenizer=tokenizer,
-                                 finetuning_arch_vector=None,
+                                 finetuning_arch_vector=arch_v,
                                  teacher_model=teacher_unet,
                                  )
 

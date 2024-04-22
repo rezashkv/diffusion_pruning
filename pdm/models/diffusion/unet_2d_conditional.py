@@ -2714,7 +2714,7 @@ class UNet2DConditionModelMagnitudePruned(UNet2DConditionModel):
         low_cpu_mem_usage = kwargs.pop("low_cpu_mem_usage", _LOW_CPU_MEM_USAGE_DEFAULT)
         variant = kwargs.pop("variant", None)
         use_safetensors = kwargs.pop("use_safetensors", None)
-        target_pruning_ratio = kwargs.pop("target_pruning_rate", None)
+        target_pruning_rate = kwargs.pop("target_pruning_rate", None)
         pruning_method = kwargs.pop("pruning_method", "magnitude")
         sample_inputs = kwargs.pop("sample_inputs", None)
 
@@ -2966,7 +2966,7 @@ class UNet2DConditionModelMagnitudePruned(UNet2DConditionModel):
 
         model.register_to_config(_name_or_path=pretrained_model_name_or_path)
 
-        if target_pruning_ratio is not None:
+        if target_pruning_rate is not None:
             assert sample_inputs is not None, "sample_inputs should be provided for magnitude pruning"
             import torch_pruning as tp
             if pruning_method == "magnitude":
@@ -2995,7 +2995,7 @@ class UNet2DConditionModelMagnitudePruned(UNet2DConditionModel):
                 iterative_steps=1,
                 global_pruning=True,
                 out_channel_groups=channel_groups,
-                pruning_ratio=0.6,
+                pruning_ratio=target_pruning_rate,
                 ignored_layers=ignored_layers,
             )
 
@@ -3003,6 +3003,14 @@ class UNet2DConditionModelMagnitudePruned(UNet2DConditionModel):
             model.eval()
 
             pruner.step()
+
+            # Update static attributes
+            from diffusers.models.resnet import Upsample2D, Downsample2D
+
+            for m in model.modules():
+                if isinstance(m, (Upsample2D, Downsample2D)):
+                    m.channels = m.conv.in_channels
+                    m.out_channels == m.conv.out_channels
 
             model.zero_grad()
             del pruner
