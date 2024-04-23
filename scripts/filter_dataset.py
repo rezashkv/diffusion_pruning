@@ -185,13 +185,11 @@ def main():
 
 
         elif "coco" in data_dir:
-            dataset = {"train": load_coco_dataset(os.path.join(data_dir, "images", "train2017"),
-
-                                                  os.path.join(data_dir, "annotations", "captions_train2017.json")),
-
-                       "validation": load_coco_dataset(os.path.join(data_dir, "images", "val2017"),
-
-                                                       os.path.join(data_dir, "annotations", "captions_val2017.json"))}
+            year = config.data.year
+            dataset = {"train": load_coco_dataset(os.path.join(data_dir, "images", f"train{year}"),
+                                                  os.path.join(data_dir, "annotations", f"captions_train{year}.json")),
+                       "validation": load_coco_dataset(os.path.join(data_dir, "images", f"val{year}"),
+                                                       os.path.join(data_dir, "annotations", f"captions_val{year}.json"))}
 
         else:
             data_files = {}

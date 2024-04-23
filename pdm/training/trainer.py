@@ -950,9 +950,6 @@ class DiffPruningTrainer:
                 self.teacher_model.eval()
                 self.unet.train()
 
-                if global_step == initial_global_step:
-                    self.count_flops(batch)
-
                 loss, diff_loss, distillation_loss, block_loss = self.finetune_step(batch)
                 # avg_loss = self.accelerator.reduce(loss, "mean")
                 avg_loss = loss
@@ -1004,6 +1001,9 @@ class DiffPruningTrainer:
             # checkpoint at the end of each epoch
             if epoch % self.config.training.logging.checkpoint_step == 0 and self.accelerator.is_main_process:
                 self.save_checkpoint(logging_dir, global_step)
+                # copy arch_vector.pt to logging_dir
+                shutil.copy(os.path.join(logging_dir, "arch_vector.pt"), os.path.join(logging_dir,
+                                                                                      f"checkpoint-{global_step}", "unet"))
 
             # Create the pipeline using the trained modules and save it.
             self.accelerator.wait_for_everyone()

@@ -2567,6 +2567,8 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
 
         model.register_to_config(_name_or_path=pretrained_model_name_or_path)
 
+        if os.path.exists(os.path.join(pretrained_model_name_or_path, "arch_vector.pt")):
+            arch_vector = torch.load(os.path.join(pretrained_model_name_or_path, "arch_vector.pt"))
 
         if arch_vector is not None:
             arch_vector_separated = HyperStructure.transform_arch_vector(arch_vector, model.get_structure())

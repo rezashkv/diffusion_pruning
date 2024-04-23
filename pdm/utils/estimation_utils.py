@@ -27,8 +27,8 @@ def vector_gumbel_softmax(logits, temperature, offset=0, force_width_non_zero=Fa
             y_out_h = hard_concrete(y_out).sum(dim=1)
             ind = (y_out_h == 0)
             new_y_out = y_out.clone()
-            new_y_out[ind, :] = y_out[ind, :] + 0.99
-            return y_out
+            new_y_out[ind, 0] = y_out[ind, 0] + 0.5
+            return new_y_out
 
 
 def gumbel_softmax_sample(logits, temperature, offset=0, force_width_non_zero=False, fixed_seed=False):

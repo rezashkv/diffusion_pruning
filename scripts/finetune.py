@@ -97,6 +97,8 @@ def main():
                                                        config.wandb_run_name
                                                        )
 
+    os.makedirs(config.training.logging.logging_dir, exist_ok=True)
+
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -185,13 +187,11 @@ def main():
 
 
         elif "coco" in data_dir:
-            dataset = {"train": load_coco_dataset(os.path.join(data_dir, "images", "train2017"),
-
-                                                  os.path.join(data_dir, "annotations", "captions_train2017.json")),
-
-                       "validation": load_coco_dataset(os.path.join(data_dir, "images", "val2017"),
-
-                                                       os.path.join(data_dir, "annotations", "captions_val2017.json"))}
+            year = config.data.year
+            dataset = {"train": load_coco_dataset(os.path.join(data_dir, "images", f"train{year}"),
+                                                  os.path.join(data_dir, "annotations", f"captions_train{year}.json")),
+                       "validation": load_coco_dataset(os.path.join(data_dir, "images", f"val{year}"),
+                                                       os.path.join(data_dir, "annotations", f"captions_val{year}.json"))}
 
         else:
             data_files = {}
@@ -408,8 +408,8 @@ def main():
         # save the filtered indices to checkpoint_dir
         torch.save(filtered_train_indices, os.path.join(config.training.logging.logging_dir, "filtered_train_indices.pt"))
         torch.save(filtered_validation_indices, os.path.join(config.training.logging.logging_dir, "filtered_validation_indices.pt"))
-        dataset["train"] = dataset["train"].select(torch.where(train_indices == index)[0])
-        dataset["validation"] = dataset["validation"].select(torch.where(validation_indices == index)[0])
+        dataset["train"] = dataset["train"].select(filtered_train_indices)
+        dataset["validation"] = dataset["validation"].select(filtered_validation_indices)
         return dataset
 
     tr_indices, val_indices = None, None

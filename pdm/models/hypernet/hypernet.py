@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.nn.utils.parametrizations import weight_norm
 from diffusers import ModelMixin, ConfigMixin
 from diffusers.configuration_utils import register_to_config
+from pdm.utils.estimation_utils import hard_concrete
 
 
 class SimpleGate(nn.Module):
@@ -92,7 +93,7 @@ class HyperStructure(ModelMixin, ConfigMixin):
         return {"width": width_list, "depth": depth_list}
 
     @classmethod
-    def transform_arch_vector(cls, inputs, structure):
+    def transform_arch_vector(cls, inputs, structure, force_width_non_zero=False):
         width_list = [w for sub_width_list in structure['width'] for w in sub_width_list]
         depth_list = [d for sub_depth_list in structure['depth'] for d in sub_depth_list]
         assert inputs.shape[1] == (sum(width_list) + sum(depth_list))
@@ -103,7 +104,15 @@ class HyperStructure(ModelMixin, ConfigMixin):
         d_list = []
         for i in range(len(width_list)):
             end = start + width_list[i]
-            w_list.append(width_vectors[:, start:end])
+            w_sub_list = width_vectors[:, start:end]
+            # This shouldn't be necessary, but just in case
+            if force_width_non_zero:
+                w_sub_list_sum = hard_concrete(w_sub_list).sum(dim=1)
+                if not w_sub_list_sum.all():
+                    ind = (w_sub_list_sum == 0)
+                    w_sub_list = w_sub_list.clone()
+                    w_sub_list[ind, 0] = w_sub_list[ind, 0] + 0.5
+            w_list.append(w_sub_list)
             start = end
 
         for i in range(sum(depth_list)):

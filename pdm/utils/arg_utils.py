@@ -36,6 +36,12 @@ def parse_args():
         help="Path to the saved pruning checkpoint dir. used for finetuning.",
     )
     parser.add_argument(
+        "--finetuning_ckpt_dir",
+        type=str,
+        default=None,
+        help="Path to the saved finetuning checkpoint dir. used for image generation.",
+    )
+    parser.add_argument(
         "--name",
         type=str,
         default="",
