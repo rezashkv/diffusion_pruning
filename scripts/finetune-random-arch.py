@@ -466,7 +466,7 @@ def main():
 
     # set hyper_net to an empty module
     hyper_net = torch.nn.Module()
-    n_e = config.num_embeddings
+    n_e = config.model.quantizer.num_arch_vq_codebook_embeddings
     quantizer = torch.nn.Module()
     quantizer.n_e = n_e
 
