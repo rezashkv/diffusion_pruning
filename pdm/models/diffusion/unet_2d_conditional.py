@@ -2312,7 +2312,7 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
         mid_block_type = kwargs.pop("mid_block_type", None)
         up_block_types = kwargs.pop("up_block_types", None)
         arch_vector = kwargs.pop("arch_vector", None)
-        random_pruning_ratio = kwargs.pop("random_arch_ratio", None)
+        random_pruning_ratio = kwargs.pop("random_pruning_ratio", None)
 
         allow_pickle = False
         if use_safetensors is None:
