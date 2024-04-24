@@ -376,10 +376,6 @@ def main():
             config.pretrained_model_name_or_path, subfolder="vae", revision=config.revision
         )
 
-    # load embedding_gs from checkpoint_dir
-    assert config.pruning_ckpt_dir is not None, "checkpoint_dir must be provided"
-    assert config.embedding_ind is not None, "embedding_ind must be provided"
-
 
     teacher_unet = UNet2DConditionModel.from_pretrained(
         config.pretrained_model_name_or_path,
