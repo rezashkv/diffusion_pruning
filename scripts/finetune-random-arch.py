@@ -395,7 +395,7 @@ def main():
         up_block_types=tuple(config.model.unet.unet_up_blocks),
         gated_ff=config.model.unet.gated_ff,
         ff_gate_width=config.model.unet.ff_gate_width,
-        arch_vector=arch_v
+        random_pruning_ratio=config.training.random_pruning_ratio
     )
 
     r_loss = ResourceLoss(p=config.training.losses.resource_loss.pruning_target,
@@ -455,7 +455,7 @@ def main():
 
     # set hyper_net to an empty module
     hyper_net = torch.nn.Module()
-    n_e = embeddings_gs.shape[0]
+    n_e = config.num_embeddings
     quantizer = torch.nn.Module()
     quantizer.n_e = n_e
 
@@ -477,7 +477,6 @@ def main():
                                  ema_unet=ema_unet,
                                  eval_dataset=dataset["validation"],
                                  tokenizer=tokenizer,
-                                 finetuning_arch_vector=arch_v,
                                  teacher_model=teacher_unet,
                                  )
 

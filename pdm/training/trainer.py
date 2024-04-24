@@ -61,7 +61,6 @@ class DiffPruningTrainer:
                  eval_dataset: Dataset = None,
                  tokenizer: Optional[PreTrainedTokenizerBase] = None,
                  optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
-                 finetuning_arch_vector=None,
                  teacher_model: Optional[nn.Module] = None,
                  ):
 
@@ -112,8 +111,6 @@ class DiffPruningTrainer:
         self.optimizers = optimizers
         self.init_prompts()
         self.prepare_with_accelerator()
-
-        self.finetuning_arch_vector = finetuning_arch_vector
 
     def create_accelerator(self):
         logging_dir = self.config.training.logging.logging_dir

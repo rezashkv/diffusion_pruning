@@ -572,7 +572,6 @@ def main():
                                  ema_unet=ema_unet,
                                  eval_dataset=dataset["validation"],
                                  tokenizer=tokenizer,
-                                 finetuning_arch_vector=arch_v,
                                  teacher_model=teacher_unet,
                                  )
 
