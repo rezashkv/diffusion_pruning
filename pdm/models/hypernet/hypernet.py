@@ -25,7 +25,7 @@ class SimpleGate(nn.Module):
 
 class HyperStructure(ModelMixin, ConfigMixin):
     @register_to_config
-    def __init__(self, structure, input_dim=768, wn_flag=True, linear_bias=False):
+    def __init__(self, structure, input_dim=768, wn_flag=True, linear_bias=False, single_arch_param=False):
         super(HyperStructure, self).__init__()
 
         self.structure = structure
@@ -48,8 +48,15 @@ class HyperStructure(ModelMixin, ConfigMixin):
         self.mh_fc = torch.nn.ModuleList(linear_list)
         self.initialize_weights()
         self.iteration = 0
+        self.single_arch_param = single_arch_param
+        if self.single_arch_param:
+            self.arch = nn.Parameter(torch.randn(1, sum(self.width_list) + sum(self.depth_list)))
 
     def forward(self, x):
+        if self.single_arch_param:
+            # repeat the same architecture for all samples in the batch
+            return self.arch.repeat(x.shape[0], 1)
+
         self.iteration += 1
         out = self._forward(x)
         return out
@@ -144,4 +151,3 @@ class HyperStructure(ModelMixin, ConfigMixin):
         arch_vectors = torch.cat(arch_vectors, dim=1)
         return arch_vectors
 
-        return {"width": w_list, "depth": d_list}
