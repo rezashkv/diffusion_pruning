@@ -63,12 +63,6 @@ def main():
                 " use `--variant=non_ema` instead."
             ),
         )
-    config.training.logging.logging_dir = os.path.join(config.training.logging.logging_dir,
-                                                       os.getcwd().split('/')[-2],
-                                                       config.base_config_path.split('/')[-2],
-                                                       config.base_config_path.split('/')[-1].split('.')[0],
-                                                       config.wandb_run_name
-                                                       )
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(

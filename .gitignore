@@ -159,6 +159,8 @@ pbs_scripts/
 .idea/
 .vscode/
 
+data/
+
 *reza*
 
 # PyCharm

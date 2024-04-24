@@ -16,39 +16,24 @@
 import logging
 import os
 import random
-import datetime
 
 from accelerate.utils import set_seed
 from omegaconf import OmegaConf
 
 import PIL
-import accelerate
 import numpy as np
-import requests
 import torch
 import torch.utils.checkpoint
 from accelerate.logging import get_logger
-from accelerate.state import AcceleratorState
 from datasets import load_dataset, Dataset, concatenate_datasets
-from packaging import version
 from pdm.datasets.coco import load_coco_dataset
-from torchvision import transforms
-from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, AutoModel
-from transformers.utils import ContextManagers
-
-from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
-from diffusers.training_utils import EMAModel
+from transformers import AutoTokenizer, AutoModel
 from diffusers.utils import check_min_version, deprecate
-from diffusers.utils.import_utils import is_xformers_available
-
-from pdm.models.diffusion import UNet2DConditionModelPruned
 from pdm.models import HyperStructure
 from pdm.models import StructureVectorQuantizer
-from pdm.losses import ClipLoss, ResourceLoss
 from pdm.utils.arg_utils import parse_args
 from pdm.datasets.cc3m import load_cc3m_dataset
 from pdm.datasets.laion_aes import load_main_laion_dataset
-from pdm.training.trainer import DiffPruningTrainer
 import torch._dynamo
 
 DATASET_NAME_MAPPING = {
@@ -82,20 +67,6 @@ def main():
                 " use `--variant=non_ema` instead."
             ),
         )
-    # get current date only
-    now = datetime.datetime.now().strftime("%Y-%m-%dT%H")
-
-    if config.name != "":
-        nowname = now + f"_{config.name}"
-    else:
-        nowname = now
-
-    config.training.logging.logging_dir = os.path.join(config.training.logging.logging_dir,
-                                                       os.getcwd().split('/')[-2],
-                                                       config.base_config_path.split('/')[-2],
-                                                       config.base_config_path.split('/')[-1].split('.')[0],
-                                                       config.wandb_run_name
-                                                       )
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -225,26 +196,6 @@ def main():
                 f"--caption_column' value '{config.data.caption_column}' needs to be one of: {', '.join(column_names)}"
             )
 
-    # Preprocessing the datasets.
-    # We need to tokenize input captions and transform the images.
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[caption_column]:
-            if isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
-            else:
-                raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
-                )
-
-        inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-        )
-        return inputs.input_ids
-
     def get_mpnet_embeddings(capts, is_train=True):
         # Mean Pooling - Take attention mask into account for correct averaging
         def mean_pooling(model_output, attention_mask):
@@ -274,97 +225,7 @@ def main():
         # sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
         return sentence_embeddings
 
-    # Preprocessing the datasets.
-    train_transforms = transforms.Compose(
-        [
-            transforms.Resize(config.model.unet.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(
-                config.model.unet.resolution) if config.data.dataloader.center_crop else transforms.RandomCrop(
-                config.model.unet.resolution),
-            transforms.RandomHorizontalFlip() if config.data.dataloader.random_flip else transforms.Lambda(lambda x: x),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-        ]
-    )
 
-    validation_transforms = transforms.Compose(
-        [
-            transforms.Resize(config.model.unet.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(
-                config.model.unet.resolution) if config.data.dataloader.center_crop else transforms.RandomCrop(
-                config.model.unet.resolution),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-        ]
-    )
-
-    def preprocess_train(examples):
-        # if image_column contains urls or paths to files, convert to bytes
-        # check if image_column path exists:
-        if isinstance(examples[image_column][0], str):
-            if not os.path.exists(examples[image_column][0]):
-                downloaded_images = []
-                for image in examples[image_column]:
-                    try:
-                        # download image and convert it to a PIL image
-                        downloaded_images.append(PIL.Image.open(requests.get(image, stream=True).raw))
-                    except:
-                        # remove the caption if the image is not found
-                        downloaded_images.append(None)
-                examples[image_column] = downloaded_images
-            else:
-                examples[image_column] = [PIL.Image.open(image) for image in examples[image_column]]
-
-        images = [image.convert("RGB") if image is not None else image for image in examples[image_column]]
-        examples["pixel_values"] = [train_transforms(image) if image is not None else image for image in images]
-        examples["input_ids"] = tokenize_captions(examples)
-        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples[caption_column], is_train=True)
-        return examples
-
-    def preprocess_validation(examples):
-        # if image_column contains urls or paths to files, convert to bytes
-        # check if image_column path exists:
-        if isinstance(examples[image_column][0], str):
-            if not os.path.exists(examples[image_column][0]):
-                downloaded_images = []
-                for image in examples[image_column]:
-                    try:
-                        # download image and convert it to a PIL image
-                        downloaded_images.append(PIL.Image.open(requests.get(image, stream=True).raw))
-                    except:
-                        # remove the caption if the image is not found
-                        downloaded_images.append(None)
-                examples[image_column] = downloaded_images
-            else:
-                examples[image_column] = [PIL.Image.open(image) for image in examples[image_column]]
-
-        images = [image.convert("RGB") if image is not None else image for image in examples[image_column]]
-        examples["pixel_values"] = [validation_transforms(image) if image is not None else image for image in images]
-        examples["input_ids"] = tokenize_captions(examples, is_train=False)
-        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples[caption_column], is_train=False)
-        return examples
-
-    def preprocess_prompts(examples):
-        examples["mpnet_embeddings"] = get_mpnet_embeddings(examples["prompts"], is_train=False)
-        return examples
-
-    def collate_fn(examples):
-        examples = [example for example in examples if example["pixel_values"] is not None]
-        if len(examples) == 0:
-            return {"pixel_values": torch.tensor([]), "input_ids": torch.tensor([]),
-                    "mpnet_embeddings": torch.tensor([])}
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        input_ids = torch.stack([example["input_ids"] for example in examples])
-        mpnet_embeddings = torch.stack([example["mpnet_embeddings"] for example in examples])
-        mpnet_embeddings = mpnet_embeddings.to(memory_format=torch.contiguous_format).float()
-        return {"pixel_values": pixel_values, "input_ids": input_ids, "mpnet_embeddings": mpnet_embeddings}
-
-    def prompts_collate_fn(examples):
-        prompts = [example["prompts"] for example in examples]
-        prompt_embdeddings = torch.stack([example["mpnet_embeddings"] for example in examples])
-        prompt_embdeddings = prompt_embdeddings.to(memory_format=torch.contiguous_format).float()
-        return {"prompts": prompts, "mpnet_embeddings": prompt_embdeddings}
 
     def filter_dataset(dataset, train_indices=None, validation_indices=None):
         if train_indices is None:
