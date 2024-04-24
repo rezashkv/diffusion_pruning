@@ -126,6 +126,7 @@ class HyperStructure(ModelMixin, ConfigMixin):
         width_list = [w for sub_width_list in structure['width'] for w in sub_width_list]
         depth_list = [d for sub_depth_list in structure['depth'] for d in sub_depth_list]
         arch_vectors = []
+        start = 0
         for i in range(len(width_list)):
             end = start + width_list[i]
             w_sub_list = torch.zeros(1, width_list[i])
