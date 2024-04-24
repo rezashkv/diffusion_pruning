@@ -36,7 +36,8 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
             non_zero_width: bool = True,
             sinkhorn_epsilon: float = 0.05,
             sinkhorn_iterations: int = 3,
-            resource_aware_normalization: bool = True
+            resource_aware_normalization: bool = True,
+            optimal_transport: bool = True,
     ):
         super().__init__()
 
@@ -105,6 +106,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         # we don't actually want to remove the whole block.
         self.non_zero_width = non_zero_width
 
+        self.optimal_transport = optimal_transport
         self.sinkhorn_epsilon = sinkhorn_epsilon
         self.sinkhorn_iterations = sinkhorn_iterations
 
@@ -140,7 +142,10 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         if self.training:
             embedding_gs = self.gumbel_sigmoid_trick(self.embedding.weight)
             self.embedding_gs.data = embedding_gs.detach()
-            min_encoding_indices = self.get_optimal_transport_min_encoding_indices(z_flattened)
+            if self.optimal_transport:
+                min_encoding_indices = self.get_optimal_transport_min_encoding_indices(z_flattened)
+            else:
+                min_encoding_indices = self.get_cosine_sim_min_encoding_indices(z_flattened)
         else:
             embedding_gs = self.embedding_gs.detach()
             min_encoding_indices = self.get_cosine_sim_min_encoding_indices(z_flattened)
