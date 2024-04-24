@@ -2312,6 +2312,7 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
         mid_block_type = kwargs.pop("mid_block_type", None)
         up_block_types = kwargs.pop("up_block_types", None)
         arch_vector = kwargs.pop("arch_vector", None)
+        random_pruning_ratio = kwargs.pop("random_arch_ratio", None)
 
         allow_pickle = False
         if use_safetensors is None:
@@ -2569,6 +2570,9 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
 
         if os.path.exists(os.path.join(pretrained_model_name_or_path, "arch_vector.pt")):
             arch_vector = torch.load(os.path.join(pretrained_model_name_or_path, "arch_vector.pt"))
+
+        if random_pruning_ratio is not None:
+            arch_vector = HyperStructure.get_random_arch_vector(random_pruning_ratio, model.get_structure())
 
         if arch_vector is not None:
             arch_vector_separated = HyperStructure.transform_arch_vector(arch_vector, model.get_structure())

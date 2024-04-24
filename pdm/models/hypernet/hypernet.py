@@ -125,9 +125,7 @@ class HyperStructure(ModelMixin, ConfigMixin):
         # randomly generate the width and depth vectors so each sublist has target_ratio of elements greater than 0.5
         width_list = [w for sub_width_list in structure['width'] for w in sub_width_list]
         depth_list = [d for sub_depth_list in structure['depth'] for d in sub_depth_list]
-        w_list = []
-        d_list = []
-        start = 0
+        arch_vectors = []
         for i in range(len(width_list)):
             end = start + width_list[i]
             w_sub_list = torch.zeros(1, width_list[i])
@@ -136,10 +134,13 @@ class HyperStructure(ModelMixin, ConfigMixin):
             non_zero_indices = torch.randperm(width_list[i])[:num_non_zero]
             w_sub_list[0, non_zero_indices] = 0.9
 
-            w_list.append(w_sub_list)
+            arch_vectors.append(w_sub_list)
             start = end
 
         for i in range(sum(depth_list)):
-            d_list.append(torch.tensor([[0.9]]))
+            arch_vectors.append(torch.tensor([[0.9]]))
+
+        arch_vectors = torch.cat(arch_vectors, dim=1)
+        return arch_vectors
 
         return {"width": w_list, "depth": d_list}
