@@ -154,6 +154,7 @@ cython_debug/
 
 slurm_scripts/
 slurm_examples
+pbs_scripts/
 
 .idea/
 .vscode/
