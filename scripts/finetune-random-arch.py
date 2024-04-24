@@ -406,7 +406,7 @@ def main():
     unet_flops, unet_params = count_ops_and_params(unet, sample_inputs)
 
     print(f"Teacher FLOPs: {teacher_flops/1e9}G, Teacher Params: {teacher_params/1e6}M")
-    print(f"Magnitude Pruned UNet FLOPs: {unet_flops/1e9}G, Magnitude Pruned UNet Params: {unet_params/1e6}M")
+    print(f"Pruned UNet FLOPs: {unet_flops/1e9}G, Magnitude Pruned UNet Params: {unet_params/1e6}M")
     print(f"Pruning Raio: {unet_flops/teacher_flops:.2f}")
 
     r_loss = ResourceLoss(p=config.training.losses.resource_loss.pruning_target,
