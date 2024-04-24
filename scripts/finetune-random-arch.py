@@ -32,6 +32,7 @@ from accelerate.state import AcceleratorState
 from datasets import load_dataset, Dataset, concatenate_datasets
 from packaging import version
 from pdm.datasets.coco import load_coco_dataset
+from pdm.utils.op_counter_orig import count_ops_and_params
 from torchvision import transforms
 from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, AutoModel
 from transformers.utils import ContextManagers
@@ -386,6 +387,14 @@ def main():
         revision=config.revision,
     )
 
+    sample_inputs = {'sample': torch.randn(1, teacher_unet.config.in_channels, teacher_unet.config.sample_size,
+                                           teacher_unet.config.sample_size),
+                     'timestep': torch.ones((1,)).long(),
+                     'encoder_hidden_states': text_encoder(torch.tensor([[100]]))[0],
+                     }
+
+    teacher_flops, teacher_params = count_ops_and_params(teacher_unet, sample_inputs)
+
     unet = UNet2DConditionModelPruned.from_pretrained(
         config.pretrained_model_name_or_path,
         subfolder="unet",
@@ -397,6 +406,12 @@ def main():
         ff_gate_width=config.model.unet.ff_gate_width,
         random_pruning_ratio=config.training.random_pruning_ratio
     )
+
+    unet_flops, unet_params = count_ops_and_params(unet, sample_inputs)
+
+    print(f"Teacher FLOPs: {teacher_flops/1e9}G, Teacher Params: {teacher_params/1e6}M")
+    print(f"Magnitude Pruned UNet FLOPs: {unet_flops/1e9}G, Magnitude Pruned UNet Params: {unet_params/1e6}M")
+    print(f"Pruning Raio: {unet_flops/teacher_flops:.2f}")
 
     r_loss = ResourceLoss(p=config.training.losses.resource_loss.pruning_target,
                           loss_type=config.training.losses.resource_loss.type)
