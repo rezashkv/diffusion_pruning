@@ -39,7 +39,6 @@ class HyperStructure(ModelMixin, ConfigMixin):
         self.single_arch_param = single_arch_param
         if self.single_arch_param:
             self.arch = nn.Parameter(torch.randn(1, sum(self.width_list) + sum(self.depth_list)))
-            #initialize an empty parameter for arch_gs
             self.arch_gs = torch.zeros(1, sum(self.width_list) + sum(self.depth_list))
         else:
             width_linear_list = [nn.Linear(self.input_dim, self.width_list[i], bias=linear_bias) for i in
