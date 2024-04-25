@@ -36,30 +36,31 @@ class HyperStructure(ModelMixin, ConfigMixin):
         self.width_list = [w for sub_width_list in self.structure['width'] for w in sub_width_list]
         self.depth_list = [d for sub_depth_list in self.structure['depth'] for d in sub_depth_list]
 
-        width_linear_list = [nn.Linear(self.input_dim, self.width_list[i], bias=linear_bias) for i in
-                             range(len(self.width_list))]
-        depth_linear_layer = nn.Linear(self.input_dim, sum(self.depth_list), bias=linear_bias)
-
-        linear_list = width_linear_list + [depth_linear_layer]
-
-        if wn_flag:
-            linear_list = [weight_norm(linear) for linear in linear_list]
-
-        self.mh_fc = torch.nn.ModuleList(linear_list)
-        self.initialize_weights()
-        self.iteration = 0
         self.single_arch_param = single_arch_param
         if self.single_arch_param:
             self.arch = nn.Parameter(torch.randn(1, sum(self.width_list) + sum(self.depth_list)))
+        else:
+            width_linear_list = [nn.Linear(self.input_dim, self.width_list[i], bias=linear_bias) for i in
+                                 range(len(self.width_list))]
+            depth_linear_layer = nn.Linear(self.input_dim, sum(self.depth_list), bias=linear_bias)
+
+            linear_list = width_linear_list + [depth_linear_layer]
+
+            if wn_flag:
+                linear_list = [weight_norm(linear) for linear in linear_list]
+
+            self.mh_fc = torch.nn.ModuleList(linear_list)
+            self.initialize_weights()
+
+
 
     def forward(self, x):
         if self.single_arch_param:
             # repeat the same architecture for all samples in the batch
             return self.arch.repeat(x.shape[0], 1)
+        else:
+            return self._forward(x)
 
-        self.iteration += 1
-        out = self._forward(x)
-        return out
 
     def initialize_weights(self):
         for name, param in self.named_parameters():
