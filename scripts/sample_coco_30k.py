@@ -10,8 +10,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, required=True,
                         help="Path to the COCO dataset directory.")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--num_samples", type=int, default=30000,
                         help="Number of samples to take from the COCO 2014 validation set.")
     return parser.parse_args()
@@ -45,7 +44,7 @@ def main(args):
         image_id = annotations['annotations'][i]['image_id']
         # read the image and save it as a npy file
         image_path = os.path.join(images_dir, f"COCO_val2014_{image_id:012d}.jpg")
-        img = Image.open(image_path)
+        img = Image.open(image_path).convert("RGB")
         data = np.asarray(img)
         output_path = os.path.join(output_dir, f"COCO_val2014_{image_id:012d}.npy")
         np.save(output_path, data)

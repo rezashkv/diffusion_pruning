@@ -745,6 +745,9 @@ class DiffPruningTrainer:
         arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
 
         arch_vector = self.quantizer.module.gumbel_sigmoid_trick(arch_vector)
+        if self.hyper_net.module.single_arch_param:
+            self.hyper_net.module.arch_gs = arch_vector
+
         arch_vector_width_depth_normalized = self.quantizer.module.width_depth_normalize(arch_vector)
         with torch.no_grad():
             quantizer_embeddings = self.quantizer.module.get_codebook_entry_gumbel_sigmoid(
