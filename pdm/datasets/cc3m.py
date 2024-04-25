@@ -47,8 +47,8 @@ def load_cc3m_dataset(data_dir,  split="train", split_file="Train_GCC-training.t
         PIL.Image.MAX_IMAGE_PIXELS = 933120000
         for image in images:
             try:
-                Image.open(image)
-                imgs.append(image)
+                with Image.open(image) as img:
+                    imgs.append(image)
             except PIL.UnidentifiedImageError as e:
                 bad_images.append(image)
                 logging.info(
