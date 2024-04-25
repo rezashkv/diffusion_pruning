@@ -20,11 +20,20 @@ def main(args):
     annotations_path = os.path.join(args.data_dir, "annotations", "captions_val2014.json")
     images_dir = os.path.join(args.data_dir, "images", "val2014")
     output_dir = os.path.join(args.data_dir, "images", "val2014_30k")
-    output_annotations_path = os.path.join(output_dir, "captions_val2014_30k.json")
+    output_annotations_path = os.path.join(args.data_dir, "annotations", "captions_val2014_30k.json")
 
     os.makedirs(output_dir, exist_ok=True)
 
     annotations = json.load(open(annotations_path))
+    # deduplicate the annotations
+    image_ids = set()
+    deduplicated_annotations = []
+    for ann in annotations['annotations']:
+        if ann['image_id'] not in image_ids:
+            deduplicated_annotations.append(ann)
+            image_ids.add(ann['image_id'])
+
+    annotations['annotations'] = deduplicated_annotations
     np.random.seed(args.seed)
     indices = np.random.choice(len(annotations['annotations']), args.num_samples, replace=False)
     selected_annotations = [annotations['annotations'][i] for i in indices]
