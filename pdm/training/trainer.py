@@ -33,7 +33,6 @@ from datasets.utils.logging import set_verbosity_error, set_verbosity_warning
 from packaging import version
 import accelerate
 
-
 from pdm.utils.op_counter_orig import count_ops_and_params
 from pdm.utils.logging_utils import create_image_grid_from_indices, create_heatmap
 
@@ -275,7 +274,6 @@ class DiffPruningTrainer:
             if self.config.data.prompts is not None:
                 self.prompt_dataset = Dataset.from_dict({"prompts": self.config.data.prompts}).with_transform(
                     preprocess_prompts)
-
 
     def initialize_dataloaders(self, data_collate_fn, prompts_collate_fn):
         train_dataloader = torch.utils.data.DataLoader(
@@ -590,7 +588,8 @@ class DiffPruningTrainer:
                             (epoch == self.config.training.num_train_epochs - 1 and step == len(
                                 self.train_dataloader) - 1)):
                         img_log_dict = {}
-                        img_log_dict["images/arch vector pairwise similarity image"] = wandb.Image(arch_vectors_similarity)
+                        img_log_dict["images/arch vector pairwise similarity image"] = wandb.Image(
+                            arch_vectors_similarity)
                         img_log_dict["images/quantizer_embedding_pairwise_similarity"] = wandb.Image(
                             quantizer_embedding_pairwise_similarity)
 
@@ -998,9 +997,10 @@ class DiffPruningTrainer:
             # checkpoint at the end of each epoch
             if epoch % self.config.training.logging.checkpoint_step == 0 and self.accelerator.is_main_process:
                 self.save_checkpoint(logging_dir, global_step)
-                # copy arch_vector.pt to logging_dir
-                shutil.copy(os.path.join(logging_dir, "arch_vector.pt"), os.path.join(logging_dir,
-                                                                                      f"checkpoint-{global_step}", "unet"))
+                # copy arch_vector.pt to logging_dir if it exists
+                if os.path.exists(os.path.join(logging_dir, "arch_vector.pt")):
+                    shutil.copy(os.path.join(logging_dir, "arch_vector.pt"),
+                                os.path.join(logging_dir, f"checkpoint-{global_step}", "unet"))
 
             # Create the pipeline using the trained modules and save it.
             self.accelerator.wait_for_everyone()
