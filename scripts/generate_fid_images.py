@@ -140,11 +140,11 @@ def main():
 
     )
 
-    noise_scheduler = DDIMScheduler.from_pretrained(config.pretrained_model_name_or_path, subfolder="scheduler")
+    # noise_scheduler = DDIMScheduler.from_pretrained(config.pretrained_model_name_or_path, subfolder="scheduler")
     pipeline = StableDiffusionPipeline.from_pretrained(
         config.pretrained_model_name_or_path,
         unet=unet,
-        scheduler=noise_scheduler,
+        # scheduler=noise_scheduler,
     )
 
     if config.enable_xformers_memory_efficient_attention:
