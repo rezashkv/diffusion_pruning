@@ -27,7 +27,7 @@ from accelerate.logging import get_logger
 from datasets import load_dataset
 from pdm.datasets.coco import load_coco_dataset
 
-from diffusers import DDIMScheduler
+from diffusers import PNDMScheduler
 from diffusers.utils import check_min_version
 from diffusers import StableDiffusionPipeline
 
@@ -140,11 +140,11 @@ def main():
 
     )
 
-    # noise_scheduler = DDIMScheduler.from_pretrained(config.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = PNDMScheduler.from_pretrained(config.pretrained_model_name_or_path, subfolder="scheduler")
     pipeline = StableDiffusionPipeline.from_pretrained(
         config.pretrained_model_name_or_path,
         unet=unet,
-        # scheduler=noise_scheduler,
+        scheduler=noise_scheduler,
     )
 
     if config.enable_xformers_memory_efficient_attention:
