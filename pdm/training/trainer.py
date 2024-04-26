@@ -1003,7 +1003,7 @@ class DiffPruningTrainer:
                 # copy arch_vector.pt to logging_dir if it exists
                 if os.path.exists(os.path.join(logging_dir, "arch_vector.pt")):
                     shutil.copy(os.path.join(logging_dir, "arch_vector.pt"),
-                                os.path.join(logging_dir, f"checkpoint-{global_step}", "unet"))
+                                os.path.join(logging_dir, f"checkpoint-{global_step}"))
 
             # Create the pipeline using the trained modules and save it.
             self.accelerator.wait_for_everyone()

@@ -2569,12 +2569,15 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
         model.register_to_config(_name_or_path=pretrained_model_name_or_path)
 
         if os.path.exists(os.path.join(pretrained_model_name_or_path, "arch_vector.pt")):
+            logger.info("Loading architecture vector from %s" % os.path.join(pretrained_model_name_or_path, "arch_vector.pt"))
             arch_vector = torch.load(os.path.join(pretrained_model_name_or_path, "arch_vector.pt"))
 
         if random_pruning_ratio is not None:
+            logger.info("loading arch vector with random pruning ratio %f" % random_pruning_ratio)
             arch_vector = HyperStructure.get_random_arch_vector(random_pruning_ratio, model.get_structure())
 
         if arch_vector is not None:
+            logger.info("Pruning model with architecture vector")
             arch_vector_separated = HyperStructure.transform_arch_vector(arch_vector, model.get_structure())
             model.set_structure(arch_vector_separated)
 
