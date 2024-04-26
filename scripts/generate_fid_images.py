@@ -116,16 +116,20 @@ def main():
     dataset = filter_dataset(dataset, validation_indices=val_indices)
     dataset = dataset["validation"]
 
-    #deduplicate dataset based on image path
-    dataset = dataset.unique("image")
-
     logger.info("Dataset of size %d loaded." % len(dataset))
+
+    def collate_fn(examples):
+        # get a list of images and captions from examples which is a list of dictionaries
+        images = [example["image"] for example in examples]
+        captions = [example["caption"] for example in examples]
+        return {"image": images, "caption": captions}
 
     dataloader = torch.utils.data.DataLoader(
        dataset,
         shuffle=False,
         batch_size=config.data.dataloader.image_generation_batch_size * accelerator.num_processes,
         num_workers=config.data.dataloader.dataloader_num_workers,
+        collate_fn=collate_fn
     )
 
     dataloader = accelerator.prepare(dataloader)
