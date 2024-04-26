@@ -167,7 +167,8 @@ def main():
                                                ).images
         # save the images. save with caption as name
         for idx, caption in enumerate(batch["caption"]):
-            image_path = os.path.join(image_output_dir, f"{caption}.png")
+            image_name = batch["image"][idx].split("/")[-1]
+            image_path = os.path.join(image_output_dir, f"{image_name}.npy")
             np.save(image_path, gen_images[idx])
 
 
