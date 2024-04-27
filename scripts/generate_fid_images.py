@@ -108,7 +108,7 @@ def main():
         return dataset
 
     assert config.embedding_ind is not None, "embedding_ind must be provided"
-    assert os.path.exists(os.path.join(config.finetuning_ckpt_dir, "..", ".." "fid_validation_mapped_indices.pt")), \
+    assert os.path.exists(os.path.join(config.finetuning_ckpt_dir, "..", "..", "fid_validation_mapped_indices.pt")), \
         "fid_validation_mapped_indices.pt must be present in the checkpoint parent directory"
     val_indices = torch.load(os.path.join(config.finetuning_ckpt_dir, "..", "..", "fid_validation_mapped_indices.pt"),
                              map_location="cpu")
