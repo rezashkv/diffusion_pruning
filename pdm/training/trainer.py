@@ -1016,6 +1016,13 @@ class DiffPruningTrainer:
                         commit_message="End of training",
                         ignore_patterns=["step_*", "epoch_*"],
                     )
+        #checkpoint at the end of training
+        if self.accelerator.is_main_process:
+            self.save_checkpoint(logging_dir, global_step)
+            # copy arch_vector.pt to logging_dir if it exists
+            if os.path.exists(os.path.join(logging_dir, "arch_vector.pt")):
+                shutil.copy(os.path.join(logging_dir, "arch_vector.pt"),
+                            os.path.join(logging_dir, f"checkpoint-{global_step}"))
 
         self.accelerator.end_training()
 
