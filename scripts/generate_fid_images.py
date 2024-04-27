@@ -108,10 +108,10 @@ def main():
         return dataset
 
     assert config.embedding_ind is not None, "embedding_ind must be provided"
-    assert os.path.exists(os.path.join(config.finetuning_ckpt_dir, "..", "..", "fid_validation_mapped_indices.pt")), \
-        f"fid_validation_mapped_indices.pt must be present in the checkpoint parent directory {config.finetuning_ckpt_dir}"
-    val_indices = torch.load(os.path.join(config.finetuning_ckpt_dir, "..", "..", "fid_validation_mapped_indices.pt"),
-                             map_location="cpu")
+    fid_val_indices_path = os.path.abspath(os.path.join(config.finetuning_ckpt_dir, "..", "..", "fid_validation_mapped_indices.pt"))
+    assert os.path.exists(fid_val_indices_path), \
+        f"fid_validation_mapped_indices.pt must be present in two upper directory of the checkpoint directory {config.finetuning_ckpt_dir}"
+    val_indices = torch.load(fid_val_indices_path, map_location="cpu")
 
     dataset = filter_dataset(dataset, validation_indices=val_indices)
     dataset = dataset["validation"]
