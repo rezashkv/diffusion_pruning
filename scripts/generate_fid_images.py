@@ -108,9 +108,9 @@ def main():
         return dataset
 
 
-    assert os.path.exists(os.path.join(config.finetuning_ckpt_dir, "..", "filtered_validation_indices.pt")), \
+    assert os.path.exists(os.path.join(config.finetuning_ckpt_dir, "..", "fid_validation_mapped_indices.pt")), \
         "filtered_validation_indices.pt must be present in the checkpoint parent directory"
-    val_indices = torch.load(os.path.join(config.finetuning_ckpt_dir, "..", "filtered_validation_indices.pt"),
+    val_indices = torch.load(os.path.join(config.finetuning_ckpt_dir, "..", "fid_validation_mapped_indices.pt"),
                              map_location="cpu")
 
     dataset = filter_dataset(dataset, validation_indices=val_indices)
