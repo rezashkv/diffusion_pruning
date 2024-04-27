@@ -192,14 +192,14 @@ def main():
                     indices = quantizer.get_cosine_sim_min_encoding_indices(arch_v)
                     validation_indices.append(indices)
             validation_indices = torch.cat(validation_indices, dim=0)
-            torch.save(validation_indices, os.path.join(config.pruning_ckpt_dir, "fid_validation_mapped_indices.pt"))
+            torch.save(validation_indices, os.path.join(config.finetuning_ckpt_dir, "fid_validation_mapped_indices.pt"))
 
         return dataset
 
     val_indices = None
-    if os.path.exists(os.path.join(config.pruning_ckpt_dir, "fid_validation_mapped_indices.pt")):
+    if os.path.exists(os.path.join(config.finetuning_ckpt_dir, "fid_validation_mapped_indices.pt")):
         logging.info("Skipping filtering fid dataset. Loading indices from disk.")
-        val_indices = torch.load(os.path.join(config.pruning_ckpt_dir, "fid_validation_mapped_indices.pt"), map_location="cpu")
+        val_indices = torch.load(os.path.join(config.finetuning_ckpt_dir, "fid_validation_mapped_indices.pt"), map_location="cpu")
 
     filter_dataset(dataset, validation_indices=val_indices)
 

@@ -257,12 +257,7 @@ def main():
             validation_indices = torch.cat(validation_indices, dim=0)
             torch.save(train_indices, os.path.join(config.pruning_ckpt_dir, "train_mapped_indices.pt"))
             torch.save(validation_indices, os.path.join(config.pruning_ckpt_dir, "validation_mapped_indices.pt"))
-        if config.embedding_ind == -1:
-            index = torch.mode(train_indices, 0).values.item()
-        else:
-            index = config.embedding_ind
-        dataset["train"] = dataset["train"].select(torch.where(train_indices == index)[0])
-        dataset["validation"] = dataset["validation"].select(torch.where(validation_indices == index)[0])
+
         return dataset
 
     tr_indices, val_indices = None, None
