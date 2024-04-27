@@ -93,13 +93,7 @@ def main():
     # download the dataset.
     dataset_name = getattr(config.data, "dataset_name", None)
     dataset_config_name = getattr(config.data, "dataset_config_name", None)
-    data_files = getattr(config.data, "data_files", None)
     data_dir = getattr(config.data, "data_dir", None)
-
-    train_data_dir = getattr(config.data, "train_data_dir", None)
-    train_data_file = getattr(config.data, "train_data_file", None)
-    train_bad_images_path = getattr(config.data, "train_bad_images_path", None)
-    max_train_samples = getattr(config.data, "max_train_samples", None)
 
     validation_data_dir = getattr(config.data, "validation_data_dir", None)
     validation_data_file = getattr(config.data, "validation_data_file", None)
@@ -200,12 +194,10 @@ def main():
             validation_indices = torch.cat(validation_indices, dim=0)
             torch.save(validation_indices, os.path.join(config.pruning_ckpt_dir, "fid_validation_mapped_indices.pt"))
 
-        index = config.embedding_ind
-        dataset["validation"] = dataset["validation"].select(torch.where(validation_indices == index)[0])
         return dataset
 
     val_indices = None
-    if  os.path.exists(os.path.join(config.pruning_ckpt_dir, "fid_validation_mapped_indices.pt")):
+    if os.path.exists(os.path.join(config.pruning_ckpt_dir, "fid_validation_mapped_indices.pt")):
         logging.info("Skipping filtering fid dataset. Loading indices from disk.")
         val_indices = torch.load(os.path.join(config.pruning_ckpt_dir, "fid_validation_mapped_indices.pt"), map_location="cpu")
 
