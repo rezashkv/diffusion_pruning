@@ -169,10 +169,12 @@ def main():
         gen_images = pipeline(batch["caption"], num_inference_steps=config.training.num_inference_steps,
                                                generator=generator, output_type="np"
                                                ).images
+
+
         # save the images. save with caption as name
         for idx, caption in enumerate(batch["caption"]):
             image_name = batch["image"][idx].split("/")[-1]
-            image_path = os.path.join(image_output_dir, f"{image_name}.npy")
+            image_path = os.path.join(image_output_dir, f"{image_name[:-4]}.npy")
             np.save(image_path, gen_images[idx])
 
 
