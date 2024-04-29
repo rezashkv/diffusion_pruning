@@ -21,6 +21,7 @@ from omegaconf import OmegaConf
 
 import accelerate
 import numpy as np
+import cv2
 import torch
 import torch.utils.checkpoint
 from accelerate.logging import get_logger
@@ -175,7 +176,9 @@ def main():
         for idx, caption in enumerate(batch["caption"]):
             image_name = batch["image"][idx].split("/")[-1]
             image_path = os.path.join(image_output_dir, f"{image_name[:-4]}.npy")
-            np.save(image_path, gen_images[idx])
+            img = gen_images[idx]
+            img = cv2.resize(img, (256, 256), interpolation=cv2.INTER_AREA)
+            np.save(image_path, img)
 
 
 if __name__ == "__main__":
