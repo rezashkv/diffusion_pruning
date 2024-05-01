@@ -105,11 +105,12 @@ def main():
             raise ValueError(f"Dataset {data_dir} not supported.")
 
     def filter_dataset(dataset, validation_indices):
-        dataset["validation"] = dataset["validation"].select(torch.where(validation_indices==config.embedding_ind)[0])
+        dataset["validation"] = dataset["validation"].select(torch.where(validation_indices == config.embedding_ind)[0])
         return dataset
 
     assert config.embedding_ind is not None, "embedding_ind must be provided"
-    fid_val_indices_path = os.path.abspath(os.path.join(config.finetuning_ckpt_dir, "..", "..", "fid_validation_mapped_indices.pt"))
+    fid_val_indices_path = os.path.abspath(
+        os.path.join(config.finetuning_ckpt_dir, "..", "..", "fid_validation_mapped_indices.pt"))
     assert os.path.exists(fid_val_indices_path), \
         f"fid_validation_mapped_indices.pt must be present in two upper directory of the checkpoint directory {config.finetuning_ckpt_dir}"
     val_indices = torch.load(fid_val_indices_path, map_location="cpu")
@@ -126,7 +127,7 @@ def main():
         return {"image": images, "caption": captions}
 
     dataloader = torch.utils.data.DataLoader(
-       dataset,
+        dataset,
         shuffle=False,
         batch_size=config.data.dataloader.image_generation_batch_size * accelerator.num_processes,
         num_workers=config.data.dataloader.dataloader_num_workers,
@@ -168,16 +169,17 @@ def main():
         else:
             generator = torch.Generator(device=accelerator.device).manual_seed(config.seed)
         gen_images = pipeline(batch["caption"], num_inference_steps=config.training.num_inference_steps,
-                                               generator=generator, output_type="np"
-                                               ).images
-
+                              height=256, width=256,
+                              generator=generator, output_type="np"
+                              ).images
 
         # save the images. save with caption as name
         for idx, caption in enumerate(batch["caption"]):
             image_name = batch["image"][idx].split("/")[-1]
             image_path = os.path.join(image_output_dir, f"{image_name[:-4]}.npy")
             img = gen_images[idx]
-            img = cv2.resize(img, (256, 256), interpolation=cv2.INTER_AREA)
+            img = img * 255
+            img = img.astype(np.uint8)
             np.save(image_path, img)
 
 
