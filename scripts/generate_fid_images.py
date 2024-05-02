@@ -16,12 +16,12 @@
 
 import os
 
+import safetensors
 from accelerate.utils import set_seed
 from omegaconf import OmegaConf
 
 import accelerate
 import numpy as np
-import cv2
 import torch
 import torch.utils.checkpoint
 from accelerate.logging import get_logger
@@ -114,7 +114,6 @@ def main():
     assert os.path.exists(fid_val_indices_path), \
         f"fid_validation_mapped_indices.pt must be present in two upper directory of the checkpoint directory {config.finetuning_ckpt_dir}"
     val_indices = torch.load(fid_val_indices_path, map_location="cpu")
-
     dataset = filter_dataset(dataset, validation_indices=val_indices)
     dataset = dataset["validation"]
 
@@ -137,14 +136,23 @@ def main():
     dataloader = accelerator.prepare(dataloader)
 
     # #################################################### Models ####################################################
+    assert config.pruning_ckpt_dir is not None, "pruning_ckpt_dir must be provided"
+    embeddings_gs = torch.load(os.path.join(config.pruning_ckpt_dir, "quantizer_embeddings.pt"), map_location="cpu")
+    arch_v = embeddings_gs[config.embedding_ind % embeddings_gs.shape[0]].unsqueeze(0)
 
     unet = UNet2DConditionModelPruned.from_pretrained(
-        config.finetuning_ckpt_dir,
+        config.pretrained_model_name_or_path,
         subfolder="unet",
-        low_cpu_mem_usage=False,
-        ignore_mismatched_sizes=True
-
+        revision=config.revision,
+        down_block_types=config.model.unet.unet_down_blocks,
+        mid_block_type=config.model.unet.unet_mid_block,
+        up_block_types=config.model.unet.unet_up_blocks,
+        arch_vector=arch_v
     )
+
+    state_dict = safetensors.torch.load_file(os.path.join(config.finetuning_ckpt_dir, "unet",
+                                                          "diffusion_pytorch_model.safetensors"))
+    unet.load_state_dict(state_dict)
 
     noise_scheduler = PNDMScheduler.from_pretrained(config.pretrained_model_name_or_path, subfolder="scheduler")
     pipeline = StableDiffusionPipeline.from_pretrained(
@@ -169,11 +177,9 @@ def main():
         else:
             generator = torch.Generator(device=accelerator.device).manual_seed(config.seed)
         gen_images = pipeline(batch["caption"], num_inference_steps=config.training.num_inference_steps,
-                              height=256, width=256,
-                              generator=generator, output_type="np"
+                              height=256, width=256, generator=generator, output_type="np"
                               ).images
 
-        # save the images. save with caption as name
         for idx, caption in enumerate(batch["caption"]):
             image_name = batch["image"][idx].split("/")[-1]
             image_path = os.path.join(image_output_dir, f"{image_name[:-4]}.npy")
