@@ -20,6 +20,7 @@ import safetensors
 from accelerate.utils import set_seed
 from omegaconf import OmegaConf
 
+import cv2
 import accelerate
 import numpy as np
 import torch
@@ -136,9 +137,7 @@ def main():
     dataloader = accelerator.prepare(dataloader)
 
     # #################################################### Models ####################################################
-    assert config.pruning_ckpt_dir is not None, "pruning_ckpt_dir must be provided"
-    embeddings_gs = torch.load(os.path.join(config.pruning_ckpt_dir, "quantizer_embeddings.pt"), map_location="cpu")
-    arch_v = embeddings_gs[config.embedding_ind % embeddings_gs.shape[0]].unsqueeze(0)
+    arch_v = torch.load(os.path.join(config.finetuning_ckpt_dir, "arch_vector.pt"), map_location="cpu")
 
     unet = UNet2DConditionModelPruned.from_pretrained(
         config.pretrained_model_name_or_path,
@@ -177,7 +176,7 @@ def main():
         else:
             generator = torch.Generator(device=accelerator.device).manual_seed(config.seed)
         gen_images = pipeline(batch["caption"], num_inference_steps=config.training.num_inference_steps,
-                              height=256, width=256, generator=generator, output_type="np"
+                              generator=generator, output_type="np"
                               ).images
 
         for idx, caption in enumerate(batch["caption"]):
@@ -186,6 +185,7 @@ def main():
             img = gen_images[idx]
             img = img * 255
             img = img.astype(np.uint8)
+            img = cv2.resize(img, (256, 256))
             np.save(image_path, img)
 
 
