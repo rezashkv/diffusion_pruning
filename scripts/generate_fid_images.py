@@ -195,7 +195,7 @@ def main():
                               ).images
 
         for idx, caption in enumerate(batch["caption"]):
-            if 'image' in batch:
+            if 'key' not in batch:
                 image_name = batch["image"][idx].split("/")[-1]
             else:
                 image_name = batch["key"][idx] + ".jpg"
