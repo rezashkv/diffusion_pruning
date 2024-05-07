@@ -79,8 +79,8 @@ def main():
     def collate_fn(examples):
         # get a list of images and captions from examples which is a list of dictionaries
         captions = [example["caption"] for example in examples]
-        if "image" in examples[0]:
-            images = [example["image"] for example in examples]
+        images = [example["image"] for example in examples]
+        if "__key__" not in examples[0]:
             return {"image": images, "caption": captions}
         else:
             return {"caption": captions, "key": [example["__key__"] for example in examples]}
@@ -97,7 +97,7 @@ def main():
     else:
         if "conceptual_captions" in data_dir or "cc3m" in data_dir:
             dataset_name = "cc3m"
-            dataset = load_cc3m_webdataset(data_dir, split="validation", return_image=False)
+            dataset = load_cc3m_webdataset(data_dir, split="validation", resampled=False)
 
             fid_val_indices_path = os.path.abspath(
                 os.path.join(config.finetuning_ckpt_dir, "..", "..", f"{dataset_name}_validation_mapped_indices.pkl"))
@@ -106,11 +106,15 @@ def main():
             val_indices = pickle.load(open(fid_val_indices_path, "rb"))
             length = len([x for x in val_indices if val_indices[x] == config.embedding_ind])
             dataset = dataset.select(lambda x: val_indices[x["__key__"]] == config.embedding_ind)
-            dataset = dataset.batched(accelerator.num_processes * config.data.dataloader.image_generation_batch_size,
-                                      collation_fn=collate_fn).with_epoch(length)
+            dataset = dataset.batched(config.data.dataloader.image_generation_batch_size,
+                                      collation_fn=collate_fn)
 
-            dataloader = wds.WebLoader(dataset, batch_size=None, shuffle=False, pin_memory=True,
+            dataloader = wds.WebLoader(dataset,
+                                       batch_size=None,
+                                       shuffle=False, pin_memory=True,
                                        num_workers=config.data.dataloader.dataloader_num_workers)
+
+            logger.info("Dataset of size %d loaded." % length)
 
         elif "coco" in data_dir:
             dataset_name = "coco"

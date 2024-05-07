@@ -8,14 +8,14 @@ import pandas as pd
 from PIL import ImageFile
 from datasets import Dataset
 from webdataset import WebDataset
-from webdataset.filters import map, select
+import webdataset as wds
+from .dist_utils import nodesplitter
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
-def load_cc3m_dataset(data_dir,  split="train", split_file="Train_GCC-training.tsv",
+def load_cc3m_dataset(data_dir, split="train", split_file="Train_GCC-training.tsv",
                       split_dir="training", max_samples=1000, bad_images_path=None):
-
     captions = pd.read_csv(os.path.join(data_dir, split_file),
                            sep="\t", header=None, names=["caption", "link"],
                            dtype={"caption": str, "link": str})
@@ -76,14 +76,23 @@ def load_cc3m_dataset(data_dir,  split="train", split_file="Train_GCC-training.t
     return dataset
 
 
-def load_cc3m_webdataset(data_dir, split="training", return_image=False):
+def load_cc3m_webdataset(data_dir, split="training", resampled=True):
+    training = split == "training"
     data_files = glob.glob(os.path.join(data_dir, split, "*.tar"))
     data_files = sorted(data_files)
-    dataset = WebDataset(data_files).decode("pil")
+    dataset = (
+        WebDataset(
+            data_files,
+            repeat=training,
+            shardshuffle=1000 if training else False,
+            resampled=resampled if training else False,
+            handler=wds.ignore_and_continue,
+            nodesplitter=None if (training and resampled) else nodesplitter,
+        )
+        .shuffle(5000 if training else 0)
+        .decode("pil")
+        .to_tuple("jpg", "txt", handler=wds.ignore_and_continue)
+    )
     dataset = dataset.rename(caption="txt", image="jpg")
-    if not return_image:
-        dataset = dataset.map(lambda x: {"caption": x["caption"]})
-    else:
-        dataset = dataset.map(lambda x: {"caption": x["caption"], "image": x["image"]})
-
+    dataset = dataset.map(lambda x: {"caption": x["caption"], "image": x["image"]})
     return dataset
