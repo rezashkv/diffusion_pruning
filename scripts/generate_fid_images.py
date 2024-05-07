@@ -15,6 +15,7 @@
 
 
 import os
+import pickle
 
 import safetensors
 from accelerate.utils import set_seed
@@ -35,7 +36,7 @@ from diffusers import StableDiffusionPipeline
 
 from pdm.models.diffusion import UNet2DConditionModelPruned
 from pdm.utils.arg_utils import parse_args
-from pdm.datasets.cc3m import load_cc3m_dataset
+from pdm.datasets.cc3m import load_cc3m_dataset, load_cc3m_webdataset
 import torch._dynamo
 
 DATASET_NAME_MAPPING = {
@@ -72,10 +73,7 @@ def main():
     dataset_config_name = getattr(config.data, "dataset_config_name", None)
     data_dir = getattr(config.data, "data_dir", None)
 
-    validation_data_dir = getattr(config.data, "validation_data_dir", None)
-    validation_data_file = getattr(config.data, "validation_data_file", None)
-    validation_bad_images_path = getattr(config.data, "validation_bad_images_path", None)
-    max_validation_samples = getattr(config.data, "max_validation_samples", None)
+    assert config.embedding_ind is not None, "embedding_ind must be provided"
 
     if dataset_name is not None:
         # Downloading and loading a dataset from the hub.
@@ -88,35 +86,38 @@ def main():
 
     else:
         if "conceptual_captions" in data_dir or "cc3m" in data_dir:
-            dataset = {"validation": load_cc3m_dataset(data_dir,
-                                                       split="validation",
-                                                       split_file=validation_data_file,
-                                                       split_dir=validation_data_dir,
-                                                       max_samples=max_validation_samples,
-                                                       bad_images_path=validation_bad_images_path)}
+            dataset_name = "cc3m"
+            dataset = load_cc3m_webdataset(data_dir, split="validation", return_image=False)
 
+            fid_val_indices_path = os.path.abspath(
+                os.path.join(config.finetuning_ckpt_dir, "..", "..", f"{dataset_name}_validation_mapped_indices.pkl"))
+            assert os.path.exists(fid_val_indices_path), \
+                f"{dataset_name}_validation_mapped_indices.pkl must be present in two upper directory of the checkpoint directory {config.finetuning_ckpt_dir}"
+            val_indices = pickle.load(open(fid_val_indices_path, "rb"))
+            dataset = dataset.filter(lambda x: val_indices[x["__key__"]] == config.embedding_ind)
 
         elif "coco" in data_dir:
+            dataset_name = "coco"
             year = config.data.year
             dataset = {
                 "validation": load_coco_dataset(os.path.join(data_dir, "images", f"val{year}"),
                                                 os.path.join(data_dir, "annotations", f"captions_val{year}.json"))}
 
+            def filter_dataset(dataset, validation_indices):
+                dataset["validation"] = dataset["validation"].select(
+                    torch.where(validation_indices == config.embedding_ind)[0])
+                return dataset
+
+            fid_val_indices_path = os.path.abspath(
+                os.path.join(config.finetuning_ckpt_dir, "..", "..", f"{dataset_name}_validation_mapped_indices.pt"))
+            assert os.path.exists(fid_val_indices_path), \
+                f"{dataset_name}_validation_mapped_indices.pt must be present in two upper directory of the checkpoint directory {config.finetuning_ckpt_dir}"
+            val_indices = torch.load(fid_val_indices_path, map_location="cpu")
+            dataset = filter_dataset(dataset, validation_indices=val_indices)
+            dataset = dataset["validation"]
+
         else:
             raise ValueError(f"Dataset {data_dir} not supported.")
-
-    def filter_dataset(dataset, validation_indices):
-        dataset["validation"] = dataset["validation"].select(torch.where(validation_indices == config.embedding_ind)[0])
-        return dataset
-
-    assert config.embedding_ind is not None, "embedding_ind must be provided"
-    fid_val_indices_path = os.path.abspath(
-        os.path.join(config.finetuning_ckpt_dir, "..", "..", "fid_validation_mapped_indices.pt"))
-    assert os.path.exists(fid_val_indices_path), \
-        f"fid_validation_mapped_indices.pt must be present in two upper directory of the checkpoint directory {config.finetuning_ckpt_dir}"
-    val_indices = torch.load(fid_val_indices_path, map_location="cpu")
-    dataset = filter_dataset(dataset, validation_indices=val_indices)
-    dataset = dataset["validation"]
 
     logger.info("Dataset of size %d loaded." % len(dataset))
 
@@ -167,7 +168,7 @@ def main():
 
     pipeline.to(accelerator.device)
 
-    image_output_dir = os.path.join(config.finetuning_ckpt_dir, "..", "..", "fid_images")
+    image_output_dir = os.path.join(config.finetuning_ckpt_dir, "..", "..", f"fid_images_{dataset_name}")
     os.makedirs(image_output_dir, exist_ok=True)
 
     for step, batch in enumerate(dataloader):
