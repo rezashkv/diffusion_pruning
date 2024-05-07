@@ -169,7 +169,7 @@ def main():
                     batch[caption_column] = get_mpnet_embeddings(batch[caption_column], is_train=False)
                     arch_v = hyper_net(batch[caption_column])
                     indices = quantizer.get_cosine_sim_min_encoding_indices(arch_v)
-                    for i, idx in indices:
+                    for i, idx in enumerate(indices):
                         idx = idx.item()
                         validation_indices[idx].append(batch["__key__"][i])
 
