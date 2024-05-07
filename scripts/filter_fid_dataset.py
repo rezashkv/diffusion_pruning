@@ -171,7 +171,7 @@ def main():
                     indices = quantizer.get_cosine_sim_min_encoding_indices(arch_v)
                     for idx in indices:
                         idx = idx.item()
-                        validation_indices[idx].append(batch[idx]["__key__"])
+                        validation_indices[idx].append(batch["__key__"][idx])
 
             # save validation indices to disk as a pk file
             pickle.dump(validation_indices, open(os.path.join(config.finetuning_ckpt_dir, "cc3m_validation_mapped_indices.pkl"), "wb"))
