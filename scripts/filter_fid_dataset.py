@@ -153,6 +153,7 @@ def main():
         return sentence_embeddings
 
     def filter_cc3m_webdataset(dataset, validation_indices=None):
+        dataset = dataset["validation"]
         if validation_indices is None:
             validation_filtering_dataloader = torch.utils.data.DataLoader(dataset, batch_size=2048,
                                                                           shuffle=False)
