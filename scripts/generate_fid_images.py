@@ -131,7 +131,7 @@ def main():
         shuffle=False,
         batch_size=config.data.dataloader.image_generation_batch_size * accelerator.num_processes,
         num_workers=config.data.dataloader.dataloader_num_workers,
-        collate_fn=collate_fn
+        # collate_fn=collate_fn
     )
 
     dataloader = accelerator.prepare(dataloader)
