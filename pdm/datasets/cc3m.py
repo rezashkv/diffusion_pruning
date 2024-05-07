@@ -79,7 +79,7 @@ def load_cc3m_dataset(data_dir,  split="train", split_file="Train_GCC-training.t
 def load_cc3m_webdataset(data_dir, split="training", return_image=False):
     data_files = glob.glob(os.path.join(data_dir, split, "*.tar"))
     data_files = sorted(data_files)
-    dataset = WebDataset(data_files, resampled=True).decode("pil")
+    dataset = WebDataset(data_files).decode("pil")
     dataset = dataset.rename(caption="txt", image="jpg")
     if not return_image:
         dataset = dataset.map(lambda x: {"caption": x["caption"]})
