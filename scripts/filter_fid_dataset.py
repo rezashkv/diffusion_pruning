@@ -169,9 +169,9 @@ def main():
                     batch[caption_column] = get_mpnet_embeddings(batch[caption_column], is_train=False)
                     arch_v = hyper_net(batch[caption_column])
                     indices = quantizer.get_cosine_sim_min_encoding_indices(arch_v)
-                    for idx in indices:
+                    for i, idx in indices:
                         idx = idx.item()
-                        validation_indices[idx].append(batch["__key__"][idx])
+                        validation_indices[idx].append(batch["__key__"][i])
 
             # save validation indices to disk as a pk file
             pickle.dump(validation_indices, open(os.path.join(config.finetuning_ckpt_dir, "cc3m_validation_mapped_indices.pkl"), "wb"))
