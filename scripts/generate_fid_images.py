@@ -115,11 +115,10 @@ def main():
             val_indices = torch.load(fid_val_indices_path, map_location="cpu")
             dataset = filter_dataset(dataset, validation_indices=val_indices)
             dataset = dataset["validation"]
+            logger.info("Dataset of size %d loaded." % len(dataset))
 
         else:
             raise ValueError(f"Dataset {data_dir} not supported.")
-
-    logger.info("Dataset of size %d loaded." % len(dataset))
 
     def collate_fn(examples):
         # get a list of images and captions from examples which is a list of dictionaries
