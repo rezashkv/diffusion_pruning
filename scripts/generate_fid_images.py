@@ -194,7 +194,7 @@ def main():
             if 'image' in batch:
                 image_name = batch["image"][idx].split("/")[-1]
             else:
-                image_name =
+                image_name = batch["key"][idx] + ".jpg"
             image_path = os.path.join(image_output_dir, f"{image_name[:-4]}.npy")
             img = gen_images[idx]
             img = img * 255
