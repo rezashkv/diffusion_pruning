@@ -170,7 +170,7 @@ def main():
     image_output_dir = os.path.join(config.finetuning_ckpt_dir, "..", "..", f"fid_images_{dataset_name}")
     os.makedirs(image_output_dir, exist_ok=True)
 
-    for step, batch in enumerate(dataloader):
+    for batch in dataloader:
         if config.seed is None:
             generator = None
         else:
