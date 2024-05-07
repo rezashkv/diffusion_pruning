@@ -37,6 +37,7 @@ from diffusers import StableDiffusionPipeline
 from pdm.models.diffusion import UNet2DConditionModelPruned
 from pdm.utils.arg_utils import parse_args
 from pdm.datasets.cc3m import load_cc3m_dataset, load_cc3m_webdataset
+import webdataset as wds
 import torch._dynamo
 
 DATASET_NAME_MAPPING = {
@@ -75,6 +76,12 @@ def main():
 
     assert config.embedding_ind is not None, "embedding_ind must be provided"
 
+    def collate_fn(examples):
+        # get a list of images and captions from examples which is a list of dictionaries
+        images = [example["image"] for example in examples]
+        captions = [example["caption"] for example in examples]
+        return {"image": images, "caption": captions}
+
     if dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         dataset = load_dataset(
@@ -95,6 +102,10 @@ def main():
                 f"{dataset_name}_validation_mapped_indices.pkl must be present in two upper directory of the checkpoint directory {config.finetuning_ckpt_dir}"
             val_indices = pickle.load(open(fid_val_indices_path, "rb"))
             dataset = dataset.select(lambda x: val_indices[x["__key__"]] == config.embedding_ind)
+            dataset = dataset.batched(accelerator.num_processes * config.data.dataloader.image_generation_batch_size).with_epochs(len(val_indices))
+
+            dataloader = wds.WebLoader(dataset, batch_size=None, shuffle=False, pin_memory=True,
+                                       num_workers=config.data.dataloader.dataloader_num_workers, collate_fn=collate_fn)
 
         elif "coco" in data_dir:
             dataset_name = "coco"
@@ -117,22 +128,18 @@ def main():
             dataset = dataset["validation"]
             logger.info("Dataset of size %d loaded." % len(dataset))
 
+
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                shuffle=False,
+                batch_size=config.data.dataloader.image_generation_batch_size * accelerator.num_processes,
+                num_workers=config.data.dataloader.dataloader_num_workers,
+                collate_fn=collate_fn
+            )
+
         else:
             raise ValueError(f"Dataset {data_dir} not supported.")
 
-    def collate_fn(examples):
-        # get a list of images and captions from examples which is a list of dictionaries
-        images = [example["image"] for example in examples]
-        captions = [example["caption"] for example in examples]
-        return {"image": images, "caption": captions}
-
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        shuffle=False,
-        batch_size=config.data.dataloader.image_generation_batch_size * accelerator.num_processes,
-        num_workers=config.data.dataloader.dataloader_num_workers,
-        # collate_fn=collate_fn
-    )
 
     dataloader = accelerator.prepare(dataloader)
 
