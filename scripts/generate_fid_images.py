@@ -83,7 +83,7 @@ def main():
             images = [example["image"] for example in examples]
             return {"image": images, "caption": captions}
         else:
-            return {"caption": captions}
+            return {"caption": captions, "key": [example["__key__"] for example in examples]}
 
     if dataset_name is not None:
         # Downloading and loading a dataset from the hub.
@@ -191,7 +191,10 @@ def main():
                               ).images
 
         for idx, caption in enumerate(batch["caption"]):
-            image_name = batch["image"][idx].split("/")[-1]
+            if 'image' in batch:
+                image_name = batch["image"][idx].split("/")[-1]
+            else:
+                image_name =
             image_path = os.path.join(image_output_dir, f"{image_name[:-4]}.npy")
             img = gen_images[idx]
             img = img * 255
