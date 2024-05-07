@@ -163,7 +163,7 @@ def main():
             mpnet_model.to(device)
             hyper_net.eval()
             quantizer.eval()
-            validation_indices = {i: [] for i in range(quantizer.n_e)}
+            validation_indices = {}
             with torch.no_grad():
                 for batch in validation_filtering_dataloader:
                     batch[caption_column] = get_mpnet_embeddings(batch[caption_column], is_train=False)
@@ -171,7 +171,7 @@ def main():
                     indices = quantizer.get_cosine_sim_min_encoding_indices(arch_v)
                     for i, idx in enumerate(indices):
                         idx = idx.item()
-                        validation_indices[idx].append(batch["__key__"][i])
+                        validation_indices[batch["__key__"][i]] = idx
 
             # save validation indices to disk as a pk file
             pickle.dump(validation_indices, open(os.path.join(config.finetuning_ckpt_dir, "cc3m_validation_mapped_indices.pkl"), "wb"))
