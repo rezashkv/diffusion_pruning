@@ -94,7 +94,7 @@ def main():
             assert os.path.exists(fid_val_indices_path), \
                 f"{dataset_name}_validation_mapped_indices.pkl must be present in two upper directory of the checkpoint directory {config.finetuning_ckpt_dir}"
             val_indices = pickle.load(open(fid_val_indices_path, "rb"))
-            dataset = dataset.filter(lambda x: val_indices[x["__key__"]] == config.embedding_ind)
+            dataset = dataset.select(lambda x: val_indices[x["__key__"]] == config.embedding_ind)
 
         elif "coco" in data_dir:
             dataset_name = "coco"
