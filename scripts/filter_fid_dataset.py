@@ -107,7 +107,7 @@ def main():
         )
 
     else:
-        if "conceptual_captions" in data_dir:
+        if "conceptual_captions" in data_dir or "cc3m" in data_dir:
             dataset_name = "cc3m"
             dataset = {"validation":
                            load_cc3m_webdataset(data_dir, split="validation", return_image=False)}
