@@ -1,3 +1,4 @@
+import glob
 import logging
 import os
 import pickle
@@ -6,6 +7,8 @@ from PIL import Image
 import pandas as pd
 from PIL import ImageFile
 from datasets import Dataset
+from webdataset import WebDataset
+from webdataset.filters import map, select
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -70,4 +73,17 @@ def load_cc3m_dataset(data_dir,  split="train", split_file="Train_GCC-training.t
     captions = captions.iloc[image_indices].caption.values.tolist()
     dataset = Dataset.from_dict({"image": images, "caption": captions})
     del images, captions, image_indices, bad_images
+    return dataset
+
+
+def load_cc3m_webdataset(data_dir, split="training", return_image=False):
+    data_files = glob.glob(os.path.join(data_dir, split, "*.tar"))
+    data_files = sorted(data_files)
+    dataset = WebDataset(data_files).decode("pil")
+    dataset = dataset.rename(caption="txt", image="jpg")
+    if not return_image:
+        dataset = dataset.map(lambda x: {"caption": x["caption"]})
+    else:
+        dataset = dataset.map(lambda x: {"caption": x["caption"], "image": x["image"]})
+
     return dataset

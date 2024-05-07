@@ -16,6 +16,7 @@
 import logging
 import os
 import random
+import pickle
 
 from accelerate.utils import set_seed
 from omegaconf import OmegaConf
@@ -32,12 +33,13 @@ from diffusers.utils import check_min_version, deprecate
 from pdm.models import HyperStructure
 from pdm.models import StructureVectorQuantizer
 from pdm.utils.arg_utils import parse_args
-from pdm.datasets.cc3m import load_cc3m_dataset
-from pdm.datasets.laion_aes import load_main_laion_dataset
+from pdm.datasets.cc3m import load_cc3m_dataset, load_cc3m_webdataset
 import torch._dynamo
 
 DATASET_NAME_MAPPING = {
     "lambdalabs/pokemon-blip-captions": ("image", "text"),
+    "cc3m": ("image", "caption"),
+    "coco": ("image", "caption"),
 }
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -95,11 +97,6 @@ def main():
     dataset_config_name = getattr(config.data, "dataset_config_name", None)
     data_dir = getattr(config.data, "data_dir", None)
 
-    validation_data_dir = getattr(config.data, "validation_data_dir", None)
-    validation_data_file = getattr(config.data, "validation_data_file", None)
-    validation_bad_images_path = getattr(config.data, "validation_bad_images_path", None)
-    max_validation_samples = getattr(config.data, "max_validation_samples", None)
-
     if dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         dataset = load_dataset(
@@ -111,37 +108,21 @@ def main():
 
     else:
         if "conceptual_captions" in data_dir:
-            dataset = {}
-            dataset["validation"] = load_cc3m_dataset(data_dir,
-                                                      split="validation",
-                                                      split_file=validation_data_file,
-                                                      split_dir=validation_data_dir,
-                                                      max_samples=max_validation_samples,
-                                                      bad_images_path=validation_bad_images_path)
-
+            dataset_name = "cc3m"
+            dataset = {"validation":
+                           load_cc3m_webdataset(data_dir, split="validation", return_image=False)}
 
         elif "coco" in data_dir:
+            dataset_name = "coco"
             year = config.data.year
             dataset = {"validation": load_coco_dataset(os.path.join(data_dir, "images", f"val{year}"),
-                                                       os.path.join(data_dir, "annotations", f"captions_val{year}.json"))}
+                                                       os.path.join(data_dir, "annotations",
+                                                                    f"captions_val{year}.json"))}
 
         else:
             raise ValueError(f"Dataset {data_dir} not supported.")
 
-    # 6. Get the column names for input/target.
-    column_names = dataset["validation"].column_names
-
-    # 6. Get the column names for input/target.
-    dataset_columns = DATASET_NAME_MAPPING.get(config.data.dataset_name, None)
-
-    if config.data.caption_column is None:
-        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
-    else:
-        caption_column = config.data.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"--caption_column' value '{config.data.caption_column}' needs to be one of: {', '.join(column_names)}"
-            )
+    caption_column = DATASET_NAME_MAPPING[dataset_name][1]
 
     def get_mpnet_embeddings(capts, is_train=True):
         # Mean Pooling - Take attention mask into account for correct averaging
@@ -171,7 +152,28 @@ def main():
         sentence_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
         return sentence_embeddings
 
+    def filter_cc3m_webdataset(dataset, validation_indices=None):
+        if validation_indices is None:
+            validation_filtering_dataloader = torch.utils.data.DataLoader(dataset, batch_size=2048,
+                                                                          shuffle=False)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            hyper_net.to(device)
+            quantizer.to(device)
+            mpnet_model.to(device)
+            hyper_net.eval()
+            quantizer.eval()
+            validation_indices = {i: [] for i in range(quantizer.num_embeddings)}
+            with torch.no_grad():
+                for batch in validation_filtering_dataloader:
+                    batch[caption_column] = get_mpnet_embeddings(batch[caption_column], is_train=False)
+                    arch_v = hyper_net(batch[caption_column])
+                    indices = quantizer.get_cosine_sim_min_encoding_indices(arch_v)
+                    for idx in indices:
+                        validation_indices[idx].append(batch[idx]["__key__"])
 
+            # save validation indices to disk as a pk file
+            pickle.dump(validation_indices, open(os.path.join(config.finetuning_ckpt_dir, "cc3m_validation_mapped_indices.pkl"), "wb"))
+        return dataset
 
     def filter_dataset(dataset, validation_indices=None):
         if validation_indices is None:
@@ -196,12 +198,22 @@ def main():
 
         return dataset
 
-    val_indices = None
-    if os.path.exists(os.path.join(config.finetuning_ckpt_dir, "fid_validation_mapped_indices.pt")):
-        logging.info("Skipping filtering fid dataset. Loading indices from disk.")
-        val_indices = torch.load(os.path.join(config.finetuning_ckpt_dir, "fid_validation_mapped_indices.pt"), map_location="cpu")
+    if dataset_name == "coco":
+        val_indices = None
+        if os.path.exists(os.path.join(config.finetuning_ckpt_dir, f"{dataset_name}_validation_mapped_indices.pt")):
+            logging.info("Skipping filtering dataset. Loading indices from disk.")
+            val_indices = torch.load(
+                os.path.join(config.finetuning_ckpt_dir, f"{dataset_name}_validation_mapped_indices.pt"),
+                map_location="cpu")
 
-    filter_dataset(dataset, validation_indices=val_indices)
+        filter_dataset(dataset, validation_indices=val_indices)
+    elif dataset_name == "cc3m":
+        val_indices = None
+        if os.path.exists(os.path.join(config.finetuning_ckpt_dir, "cc3m_validation_mapped_indices.pkl")):
+            logging.info("Skipping filtering dataset. Loading indices from disk.")
+            val_indices = pickle.load(
+                open(os.path.join(config.finetuning_ckpt_dir, "cc3m_validation_mapped_indices.pkl"), "rb"))
+        filter_cc3m_webdataset(dataset, validation_indices=val_indices)
 
 
 if __name__ == "__main__":
