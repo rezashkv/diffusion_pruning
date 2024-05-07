@@ -78,9 +78,12 @@ def main():
 
     def collate_fn(examples):
         # get a list of images and captions from examples which is a list of dictionaries
-        images = [example["image"] for example in examples]
         captions = [example["caption"] for example in examples]
-        return {"image": images, "caption": captions}
+        if "image" in examples[0]:
+            images = [example["image"] for example in examples]
+            return {"image": images, "caption": captions}
+        else:
+            return {"caption": captions}
 
     if dataset_name is not None:
         # Downloading and loading a dataset from the hub.
