@@ -170,6 +170,7 @@ def main():
                     arch_v = hyper_net(batch[caption_column])
                     indices = quantizer.get_cosine_sim_min_encoding_indices(arch_v)
                     for idx in indices:
+                        idx = idx.item()
                         validation_indices[idx].append(batch[idx]["__key__"])
 
             # save validation indices to disk as a pk file
