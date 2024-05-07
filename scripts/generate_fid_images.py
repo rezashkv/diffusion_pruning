@@ -102,7 +102,7 @@ def main():
                 f"{dataset_name}_validation_mapped_indices.pkl must be present in two upper directory of the checkpoint directory {config.finetuning_ckpt_dir}"
             val_indices = pickle.load(open(fid_val_indices_path, "rb"))
             dataset = dataset.select(lambda x: val_indices[x["__key__"]] == config.embedding_ind)
-            dataset = dataset.batched(accelerator.num_processes * config.data.dataloader.image_generation_batch_size).with_epochs(len(val_indices))
+            dataset = dataset.batched(accelerator.num_processes * config.data.dataloader.image_generation_batch_size).with_epoch(len(val_indices))
 
             dataloader = wds.WebLoader(dataset, batch_size=None, shuffle=False, pin_memory=True,
                                        num_workers=config.data.dataloader.dataloader_num_workers, collate_fn=collate_fn)
