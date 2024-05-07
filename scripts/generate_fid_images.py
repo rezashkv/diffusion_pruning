@@ -83,7 +83,7 @@ def main():
         if "__key__" not in examples[0]:
             return {"image": images, "caption": captions}
         else:
-            return {"caption": captions, "key": [example["__key__"] for example in examples]}
+            return {"caption": captions, "key": [example["__key__"] for example in examples], "image": images}
 
     if dataset_name is not None:
         # Downloading and loading a dataset from the hub.
@@ -106,8 +106,7 @@ def main():
             val_indices = pickle.load(open(fid_val_indices_path, "rb"))
             length = len([x for x in val_indices if val_indices[x] == config.embedding_ind])
             dataset = dataset.select(lambda x: val_indices[x["__key__"]] == config.embedding_ind)
-            dataset = dataset.batched(config.data.dataloader.image_generation_batch_size,
-                                      collation_fn=collate_fn)
+            dataset = dataset.batched(config.data.dataloader.image_generation_batch_size, collation_fn=collate_fn)
 
             dataloader = wds.WebLoader(dataset,
                                        batch_size=None,

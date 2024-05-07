@@ -91,7 +91,6 @@ def load_cc3m_webdataset(data_dir, split="training", resampled=True):
         )
         .shuffle(5000 if training else 0)
         .decode("pil")
-        .to_tuple("jpg", "txt", handler=wds.ignore_and_continue)
     )
     dataset = dataset.rename(caption="txt", image="jpg")
     dataset = dataset.map(lambda x: {"caption": x["caption"], "image": x["image"]})
