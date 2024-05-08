@@ -176,7 +176,7 @@ def get_clip_features(dataloader, model, flag):
         data = batch_data['real']
         names.append(batch_data['name'])
         feature = forward_modality(model, data, flag)
-        features = feature / feature.norm(dim=1, keepdim=True).to(torch.float32)
+        feature = feature / feature.norm(dim=1, keepdim=True).to(torch.float32)
         features.append(feature)
     return torch.cat(features, dim=0), names
 
