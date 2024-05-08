@@ -215,7 +215,7 @@ def clip_score(real_path, fake_path, clip_model='ViT-B/32', num_workers=None, ba
     print('Calculating CLIP Score:')
     score = calculate_clip_score(dataloader, model,
                                  "npy", "img")
-    print('CLIP Score: ', score)
+    print(f'{clip_model} CLIP Score: ', score)
     return clip_score
 
 
@@ -253,7 +253,7 @@ def clip_features(dataset_path, clip_model='ViT-B/32', num_workers=None, batch_s
     print('Calculating CLIP Features:')
     features, names = get_clip_features(dataloader, model, 'txt')
     features = features.cpu().numpy()
-    save_path = os.path.join(os.path.dirname(dataset_path), 'clip_features')
+    save_path = os.path.join(os.path.dirname(dataset_path), f'{clip_model}_clip_features')
     os.makedirs(save_path, exist_ok=True)
 
     for i, name in enumerate(names):
