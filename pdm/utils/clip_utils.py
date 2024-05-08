@@ -174,7 +174,7 @@ def get_clip_features(dataloader, model, flag):
     names = []
     for batch_data in tqdm(dataloader):
         data = batch_data['real']
-        names.append(batch_data['name'])
+        names.extend(batch_data['name'])
         feature = forward_modality(model, data, flag)
         feature = feature / feature.norm(dim=1, keepdim=True).to(torch.float32)
         features.append(feature)
