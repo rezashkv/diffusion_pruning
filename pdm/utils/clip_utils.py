@@ -183,7 +183,7 @@ def get_clip_features(dataloader, model, flag):
 
 def forward_modality(model, data, flag):
     device = next(model.parameters()).device
-    if flag == 'img' or flag == 'npy':
+    if flag == 'img':
         features = model.encode_image(data.to(device))
     elif flag == 'txt':
         features = model.encode_text(data.to(device))
@@ -214,7 +214,7 @@ def clip_score(real_path, fake_path, clip_model='ViT-B/32', num_workers=None, ba
 
     print('Calculating CLIP Score:')
     score = calculate_clip_score(dataloader, model,
-                                 "npy", "npy")
+                                 "npy", "img")
     print('CLIP Score: ', score)
     return clip_score
 
