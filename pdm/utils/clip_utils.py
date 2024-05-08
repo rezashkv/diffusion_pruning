@@ -150,6 +150,8 @@ def calculate_clip_score(dataloader, model, real_flag, fake_flag):
             real_features = forward_modality(model, real, real_flag)
         else:
             real_features = batch_data['real']
+            device = next(model.parameters()).device
+            real_features = real_features.to(device)
 
         fake = batch_data['fake']
         fake_features = forward_modality(model, fake, fake_flag)
