@@ -254,8 +254,9 @@ def clip_features(dataset_path, clip_model='ViT-B/32', num_workers=None, batch_s
     print('Calculating CLIP Features:')
     features, names = get_clip_features(dataloader, model, 'txt')
     features = features.cpu().numpy()
-    save_path = os.path.dirname(dataset_path)
+    save_path = os.path.join(os.path.dirname(dataset_path), 'clip_features')
+    os.makedirs(save_path, exist_ok=True)
 
     for i, name in enumerate(names):
-        np.save(os.path.join(save_path, f"clip-features", f'{name}.npy'), features[i])
+        np.save(os.path.join(save_path, f'{name[:-4]}.npy'), features[i])
     print('CLIP Features saved successfully!')
