@@ -257,5 +257,5 @@ def clip_features(dataset_path, clip_model='ViT-B/32', num_workers=None, batch_s
     save_path = os.path.dirname(dataset_path)
 
     for i, name in enumerate(names):
-        np.savez(os.path.join(save_path, f"clip-features", f'{name}.npz'), features=features[i])
+        np.save(os.path.join(save_path, f"clip-features", f'{name}.npy'), features[i])
     print('CLIP Features saved successfully!')
