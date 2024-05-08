@@ -183,7 +183,7 @@ def get_clip_features(dataloader, model, flag):
 
 def forward_modality(model, data, flag):
     device = next(model.parameters()).device
-    if flag == 'img':
+    if flag == 'img' or flag == 'npy':
         features = model.encode_image(data.to(device))
     elif flag == 'txt':
         features = model.encode_text(data.to(device))
