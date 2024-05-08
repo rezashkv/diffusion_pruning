@@ -52,7 +52,7 @@ TEXT_EXTENSIONS = {'txt'}
 
 
 class DummyDataset(Dataset):
-    FLAGS = ['img', 'txt' 'npy']
+    FLAGS = ['img', 'txt', 'npy']
 
     def __init__(self, real_path, fake_path,
                  real_flag: str = 'img',
@@ -62,9 +62,7 @@ class DummyDataset(Dataset):
                  mode="orig") -> None:
         super().__init__()
         assert real_flag in self.FLAGS and fake_flag in self.FLAGS, \
-            'CLIP Score only support modality of {}. However, get {} and {}'.format(
-                self.FLAGS, real_flag, fake_flag
-            )
+            "Got unexpected modality flag: {} or {}".format(real_flag, fake_flag)
         self.real_folder = self._combine_without_prefix(real_path)
         self.real_flag = real_flag
         self.fake_foler = self._combine_without_prefix(fake_path)
@@ -261,15 +259,3 @@ def clip_features(dataset_path, clip_model='ViT-B/32', num_workers=None, batch_s
     for i, name in enumerate(names):
         np.savez(os.path.join(save_path, f"clip-features", f'{name}.npz'), features=features[i])
     print('CLIP Features saved successfully!')
-
-
-if __name__ == '__main__':
-    parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
-    args = parser.parse_args()
-    clip_features(args.real_path)
-
-
-
-
-
-
