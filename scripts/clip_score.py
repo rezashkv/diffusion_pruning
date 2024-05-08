@@ -14,6 +14,7 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=None)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--result_dir', type=str, required=True, help="Directory to save the results")
+    parser.add_argument('--dataset_name', type=str, required=True, help="Dataset name")
     return parser.parse_args()
 
 
@@ -25,7 +26,7 @@ def main():
 
     os.makedirs(args.result_dir, exist_ok=True)
 
-    with open(f"{args.result_dir}/clip_score.txt", "a") as f:
+    with open(f"{args.result_dir}/clip_score_{args.dataset_name}.txt", "a") as f:
         f.write(f"{args.gen_dir} {score}\n")
 
 
