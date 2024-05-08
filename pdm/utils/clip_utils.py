@@ -218,7 +218,7 @@ def clip_score(real_path, fake_path, clip_model='ViT-B/32', num_workers=None, ba
     score = calculate_clip_score(dataloader, model,
                                  "npy", "img")
     print(f'{clip_model.replace("/", "-")} CLIP Score: {score:.4f}')
-    return clip_score
+    return score
 
 
 def clip_features(dataset_path, clip_model='ViT-B/32', num_workers=None, batch_size=64):
