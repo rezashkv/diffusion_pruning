@@ -80,19 +80,19 @@ class DummyDataset(Dataset):
             raise IndexError
         real_path = self.real_folder[index]
         fake_path = self.fake_foler[index]
-        real_data = self._load_modality(real_path, self.real_flag)
-        fake_data = self._load_modality(fake_path, self.fake_flag)
+        real_data = self._load_modality(real_path, self.real_flag, mode=self.mode)
+        fake_data = self._load_modality(fake_path, self.fake_flag, mode="orig")
 
         sample = dict(real=real_data, fake=fake_data, name=os.path.basename(real_path))
         return sample
 
-    def _load_modality(self, path, modality):
+    def _load_modality(self, path, modality, mode="orig"):
         if modality == 'img':
             data = self._load_img(path)
         elif modality == 'txt':
             data = self._load_txt(path)
         elif modality == 'npy':
-            data = self._load_npy(path)
+            data = self._load_npy(path, mode=mode)
         else:
             raise TypeError("Got unexpected modality: {}".format(modality))
         return data
@@ -103,9 +103,9 @@ class DummyDataset(Dataset):
             img = self.transform(img)
         return img
 
-    def _load_npy(self, path):
+    def _load_npy(self, path, mode="orig"):
         data = np.load(path)
-        if self.mode == 'stats':
+        if mode == 'stats':
             return data
         img = Image.fromarray(data)
         if self.transform is not None:
@@ -192,7 +192,7 @@ def forward_modality(model, data, flag):
     return features
 
 
-def clip_score(real_path, fake_path, clip_model='ViT-B/32', num_workers=None, batch_size=64, save_dir=None):
+def clip_score(real_path, fake_path, clip_model='ViT-B/32', num_workers=None, batch_size=64):
     device = torch.device('cuda' if (torch.cuda.is_available()) else 'cpu')
 
     if num_workers is None:
@@ -213,10 +213,9 @@ def clip_score(real_path, fake_path, clip_model='ViT-B/32', num_workers=None, ba
                             num_workers=num_workers, pin_memory=True)
 
     print('Calculating CLIP Score:')
-    clip_score = calculate_clip_score(dataloader, model,
-                                      "npy", "npy")
-    clip_score = clip_score.cpu().item()
-    print('CLIP Score: ', clip_score)
+    score = calculate_clip_score(dataloader, model,
+                                 "npy", "npy")
+    print('CLIP Score: ', score)
     return clip_score
 
 
