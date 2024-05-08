@@ -20,6 +20,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    logging.info(f"Calculating CLIP score for {args.gen_images_dir} using {args.text_features_dir} as text features.")
     score = clip_score(args.text_features_dir, args.gen_images_dir, clip_model=args.clip_model, num_workers=args.num_workers,
                        batch_size=args.batch_size)
     logging.info(f"CLIP score: {score}")
