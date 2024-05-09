@@ -155,11 +155,10 @@ def main():
                 collate_fn=collate_fn
             )
 
-            dataloader = accelerator.prepare(dataloader)
-
         else:
             raise ValueError(f"Dataset {data_dir} not supported.")
 
+        dataloader = accelerator.prepare(dataloader)
 
     # #################################################### Models ####################################################
     arch_v = torch.load(os.path.join(config.finetuning_ckpt_dir, "arch_vector.pt"), map_location="cpu")
