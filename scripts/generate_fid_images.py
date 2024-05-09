@@ -120,7 +120,6 @@ def main():
                 num_workers=config.data.dataloader.dataloader_num_workers,
                 collate_fn=collate_fn
             )
-            dataloader = accelerator.prepare(dataloader)
 
 
             logger.info("Dataset of size %d loaded." % length)
@@ -154,11 +153,11 @@ def main():
                 num_workers=config.data.dataloader.dataloader_num_workers,
                 collate_fn=collate_fn
             )
-            dataloader = accelerator.prepare(dataloader)
 
         else:
             raise ValueError(f"Dataset {data_dir} not supported.")
 
+    dataloader = accelerator.prepare(dataloader)
 
     # #################################################### Models ####################################################
     arch_v = torch.load(os.path.join(config.finetuning_ckpt_dir, "arch_vector.pt"), map_location="cpu")
