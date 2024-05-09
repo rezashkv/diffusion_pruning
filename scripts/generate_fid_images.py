@@ -106,20 +106,21 @@ def main():
             val_indices = pickle.load(open(fid_val_indices_path, "rb"))
             length = len([x for x in val_indices if val_indices[x] == config.embedding_ind])
             dataset = dataset.select(lambda x: val_indices[x["__key__"]] == config.embedding_ind)
-            # dataset = dataset.batched(config.data.dataloader.image_generation_batch_size, collation_fn=collate_fn)
+            dataset = dataset.batched(config.data.dataloader.image_generation_batch_size * accelerator.num_processes,
+                                      collation_fn=collate_fn)
 
-            # dataloader = wds.WebLoader(dataset,
-            #                            batch_size=None,
-            #                            shuffle=False, pin_memory=True, collate_fn=collate_fn,
-            #                            num_workers=config.data.dataloader.dataloader_num_workers)
+            dataloader = wds.WebLoader(dataset,
+                                       batch_size=None,
+                                       shuffle=False, pin_memory=True,
+                                       num_workers=config.data.dataloader.dataloader_num_workers)
 
-            dataloader = torch.utils.data.DataLoader(
-                dataset,
-                shuffle=False,
-                batch_size=config.data.dataloader.image_generation_batch_size * accelerator.num_processes,
-                num_workers=config.data.dataloader.dataloader_num_workers,
-                collate_fn=collate_fn
-            )
+            # dataloader = torch.utils.data.DataLoader(
+            #     dataset,
+            #     shuffle=False,
+            #     batch_size=config.data.dataloader.image_generation_batch_size * accelerator.num_processes,
+            #     num_workers=config.data.dataloader.dataloader_num_workers,
+            #     collate_fn=collate_fn
+            # )
 
 
             logger.info("Dataset of size %d loaded." % length)
