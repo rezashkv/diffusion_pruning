@@ -154,7 +154,9 @@ def main():
     hyper_net = HyperStructure(input_dim=mpnet_model.config.hidden_size,
                                structure=unet_structure,
                                wn_flag=config.model.hypernet.weight_norm,
-                               linear_bias=config.model.hypernet.linear_bias)
+                               linear_bias=config.model.hypernet.linear_bias,
+                               single_arch_param=config.model.hypernet.single_arch_param
+                               )
 
     quantizer = StructureVectorQuantizer(n_e=config.model.quantizer.num_arch_vq_codebook_embeddings,
                                          structure=unet_structure,
@@ -163,7 +165,8 @@ def main():
                                          base=config.model.quantizer.quantizer_base,
                                          depth_order=list(config.model.quantizer.depth_order),
                                          non_zero_width=config.model.quantizer.non_zero_width,
-                                         resource_aware_normalization=config.model.quantizer.resource_aware_normalization
+                                         resource_aware_normalization=config.model.quantizer.resource_aware_normalization,
+                                         optimal_transport=config.model.quantizer.optimal_transport
                                          )
 
     r_loss = ResourceLoss(p=config.training.losses.resource_loss.pruning_target,
