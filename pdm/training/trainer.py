@@ -20,7 +20,7 @@ from diffusers import UNet2DConditionModel, EMAModel, get_scheduler
 from diffusers.utils import make_image_grid, is_wandb_available
 from huggingface_hub import upload_folder, create_repo
 from pdm.models import UNet2DConditionModelGated, HyperStructure, StructureVectorQuantizer
-from pdm.models.diffusion import UNet2DConditionModelPruned
+from pdm.models.diffusion import UNet2DConditionModelPruned, UNet2DConditionModelMagnitudePruned
 from pdm.pipelines import StableDiffusionPruningPipeline
 from pdm.utils import compute_snr
 from torch import nn
@@ -48,7 +48,7 @@ class DiffPruningTrainer:
                  noise_scheduler: nn.Module,
                  vae: nn.Module,
                  text_encoder: nn.Module,
-                 clip_loss: nn.Module,
+                 contrastive_loss: nn.Module,
                  resource_loss: nn.Module,
                  train_dataset: Dataset,
                  preprocess_train: Optional[Callable] = None,
@@ -74,8 +74,10 @@ class DiffPruningTrainer:
         self.text_encoder = text_encoder
         self.train_dataset = train_dataset
 
-        self.clip_loss = clip_loss
+        self.contrastive_loss = contrastive_loss
         self.resource_loss = resource_loss
+
+
         self.eval_dataset = eval_dataset
         self.prepare_datasets(preprocess_train, preprocess_eval, preprocess_prompts)
         self.tokenizer = tokenizer
@@ -156,7 +158,7 @@ class DiffPruningTrainer:
             for _ in range(len(models)):
                 # pop models so that they are not loaded again
                 model = models.pop()
-                if isinstance(model, UNet2DConditionModelPruned):
+                if isinstance(model, (UNet2DConditionModelPruned, UNet2DConditionModelMagnitudePruned)):
                     state_dict = safetensors.torch.load_file(os.path.join(input_dir, "unet",
                                                                           "diffusion_pytorch_model.safetensors"))
                     model.load_state_dict(state_dict)
@@ -772,8 +774,8 @@ class DiffPruningTrainer:
         else:
             arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
 
-        contrastive_loss, arch_vectors_similarity = self.clip_loss(text_embeddings_list, arch_vector_list,
-                                                                   return_similarity=True)
+        contrastive_loss, arch_vectors_similarity = self.contrastive_loss(text_embeddings_list, arch_vector_list,
+                                                                          return_similarity=True)
 
         # Get the target for loss depending on the prediction type
         if self.config.model.unet.prediction_type is not None:
@@ -844,7 +846,7 @@ class DiffPruningTrainer:
 
         diff_loss = loss.clone().detach().mean()
         loss += self.config.training.losses.resource_loss.weight * resource_loss
-        loss += self.config.training.losses.contrastive_clip_loss.weight * contrastive_loss
+        loss += self.config.training.losses.contrastive_loss.weight * contrastive_loss
         loss += self.config.training.losses.std_loss.weight * std_loss
         loss += self.config.training.losses.max_loss.weight * max_loss
         loss += self.config.training.losses.distillation_loss.weight * distillation_loss
@@ -1000,9 +1002,9 @@ class DiffPruningTrainer:
             # checkpoint at the end of each epoch
             if epoch % self.config.training.logging.checkpoint_step == 0 and self.accelerator.is_main_process:
                 self.save_checkpoint(logging_dir, global_step)
-                # copy arch_vector.pt to logging_dir if it exists
-                if os.path.exists(os.path.join(logging_dir, "arch_vector.pt")):
-                    shutil.copy(os.path.join(logging_dir, "arch_vector.pt"),
+                # copy arch_vector0.pt to logging_dir if it exists
+                if os.path.exists(os.path.join(logging_dir, "arch_vector0.pt")):
+                    shutil.copy(os.path.join(logging_dir, "arch_vector0.pt"),
                                 os.path.join(logging_dir, f"checkpoint-{global_step}"))
 
             # Create the pipeline using the trained modules and save it.
@@ -1019,9 +1021,9 @@ class DiffPruningTrainer:
         #checkpoint at the end of training
         if self.accelerator.is_main_process:
             self.save_checkpoint(logging_dir, global_step)
-            # copy arch_vector.pt to logging_dir if it exists
-            if os.path.exists(os.path.join(logging_dir, "arch_vector.pt")):
-                shutil.copy(os.path.join(logging_dir, "arch_vector.pt"),
+            # copy arch_vector0.pt to logging_dir if it exists
+            if os.path.exists(os.path.join(logging_dir, "arch_vector0.pt")):
+                shutil.copy(os.path.join(logging_dir, "arch_vector0.pt"),
                             os.path.join(logging_dir, f"checkpoint-{global_step}"))
 
         self.accelerator.end_training()

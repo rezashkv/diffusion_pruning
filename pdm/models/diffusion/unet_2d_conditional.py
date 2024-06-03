@@ -57,7 +57,6 @@ from .blocks import (CrossAttnDownBlock2DWidthDepthGated, CrossAttnUpBlock2DWidt
                      DownBlock2DWidthDepthGated, DownBlock2DWidthHalfDepthGated,
                      UpBlock2DWidthHalfDepthGated, UNetMidBlock2DCrossAttnWidthGated)
 
-
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
@@ -1115,7 +1114,6 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         reversed_transformer_layers_per_block = list(reversed(transformer_layers_per_block))
         only_cross_attention = list(reversed(only_cross_attention))
 
-
         output_channel = reversed_block_out_channels[0]
         for i, up_block_type in enumerate(up_block_types):
             is_final_block = i == len(block_out_channels) - 1
@@ -1351,7 +1349,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
                 assert len(m_structure['width']) == len(m_structure['depth'])
                 structure['width'] = structure['width'] + m_structure['width']
                 structure['depth'] = structure['depth'] + m_structure['depth']
-            
+
             # Middle Blocks
             assert hasattr(self.mid_block, "get_gate_structure")
             mid_structure = self.mid_block.get_gate_structure()
@@ -1390,7 +1388,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
                 if m_structure['depth'][i] == [1]:
                     block_vectors['depth'].append(depth_vectors.pop(0))
             m.set_gate_structure(block_vectors)
-        
+
         # Middle Block
         assert hasattr(self.mid_block, "get_gate_structure")
         mid_structure = self.mid_block.get_gate_structure()
@@ -2568,9 +2566,10 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
 
         model.register_to_config(_name_or_path=pretrained_model_name_or_path)
 
-        if os.path.exists(os.path.join(pretrained_model_name_or_path, "arch_vector.pt")):
-            logger.info("Loading architecture vector from %s" % os.path.join(pretrained_model_name_or_path, "arch_vector.pt"))
-            arch_vector = torch.load(os.path.join(pretrained_model_name_or_path, "arch_vector.pt"))
+        if os.path.exists(os.path.join(pretrained_model_name_or_path, "arch_vector0.pt")):
+            logger.info(
+                "Loading architecture vector from %s" % os.path.join(pretrained_model_name_or_path, "arch_vector0.pt"))
+            arch_vector = torch.load(os.path.join(pretrained_model_name_or_path, "arch_vector0.pt"))
 
         if random_pruning_ratio is not None:
             logger.info("loading arch vector with random pruning ratio %f" % random_pruning_ratio)
@@ -2596,6 +2595,7 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
             return model, loading_info
 
         return model
+
 
 class UNet2DConditionModelMagnitudePruned(UNet2DConditionModel):
     @classmethod
@@ -2726,7 +2726,6 @@ class UNet2DConditionModelMagnitudePruned(UNet2DConditionModel):
         target_pruning_rate = kwargs.pop("target_pruning_rate", None)
         pruning_method = kwargs.pop("pruning_method", "magnitude")
         sample_inputs = kwargs.pop("sample_inputs", None)
-
 
         allow_pickle = False
         if use_safetensors is None:

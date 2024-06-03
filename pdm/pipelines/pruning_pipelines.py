@@ -1039,7 +1039,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
                    num_inference_steps (`int`, *optional*, defaults to 50):
                        The number of denoising steps. More denoising steps usually lead to a higher quality image at the
                        expense of slower inference.
-                   guidance_scale (`float`, *optional*, defaults to 7.5):
+                   (`float`, *optional*, defaults to 7.5):
                        A higher guidance scale value encourages the model to generate images closely linked to the text
                        `prompt` at the expense of lower image quality. Guidance scale is enabled when `guidance_scale > 1`.
                    negative_prompt (`str` or `List[str]`, *optional*):
@@ -1051,7 +1051,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
                        Corresponds to parameter eta (η) from the [DDIM](https://arxiv.org/abs/2010.02502) paper. Only applies
                        to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
                    generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
-                       A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
+                       A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make guidance_scale
                        generation deterministic.
                    latents (`torch.FloatTensor`, *optional*):
                        Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image

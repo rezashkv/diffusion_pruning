@@ -9,7 +9,7 @@ from PIL import ImageFile
 from datasets import Dataset
 from webdataset import WebDataset
 import webdataset as wds
-from .dist_utils import nodesplitter
+from pdm.utils.dist_utils import nodesplitter
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
