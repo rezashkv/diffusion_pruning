@@ -1,3 +1,6 @@
+# credit to taming-transformers:
+# https://github.com/CompVis/taming-transformers/blob/3ba01b241669f5ade541ce990f7650a3b8f65318/taming/modules/vqvae/quantize.py#L112
+import os
 from typing import Tuple
 
 import numpy as np
@@ -284,6 +287,8 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
     @torch.no_grad()
     def get_optimal_transport_min_encoding_indices(self, a: torch.Tensor) -> torch.Tensor:
+        # credit to
+        # https://github.com/facebookresearch/swav/blob/06b1b7cbaf6ba2a792300d79c7299db98b93b7f9/main_swav.py#L354
         @torch.no_grad()
         def distributed_sinkhorn(out):
             Q = torch.exp(out / self.sinkhorn_epsilon).t()  # Q is K-by-B for consistency with notations from the paper

@@ -1,116 +1,100 @@
-import logging
-from pathlib import Path
+# T2I training skeleton from the diffusers repo:
+# https://github.com/huggingface/diffusers/blob/main/examples/text_to_image/train_text_to_image.py
 
-import numpy as np
-import safetensors
-import torch.nn.functional as F
 import os
 import shutil
-from typing import Optional, Tuple, Dict, Callable
+import logging
+import math
+from pathlib import Path
+from functools import partial
+from typing import Dict
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torchvision
+
+import safetensors
+
+import accelerate
+from accelerate import Accelerator
+from accelerate.state import AcceleratorState
+from accelerate.logging import get_logger
+from accelerate.utils import ProjectConfiguration
+
+import transformers
+from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, AutoModel
+from transformers.utils import ContextManagers
 
 import diffusers
-import math
-import torch
-import torchvision
-import transformers
-import wandb
-from accelerate.utils import ProjectConfiguration
-from datasets import Dataset
+from diffusers import AutoencoderKL, DDIMScheduler
 from diffusers import UNet2DConditionModel, EMAModel, get_scheduler
-from diffusers.utils import make_image_grid, is_wandb_available
+from diffusers.utils import make_image_grid, is_xformers_available, is_wandb_available
+
+from datasets import Dataset
+from datasets.utils.logging import set_verbosity_error, set_verbosity_warning
+
+import wandb
 from huggingface_hub import upload_folder, create_repo
+
+from omegaconf import DictConfig, OmegaConf
+from packaging import version
+from tqdm.auto import tqdm
+
+from pdm.losses import ContrastiveLoss, ResourceLoss
 from pdm.models import UNet2DConditionModelGated, HyperStructure, StructureVectorQuantizer
 from pdm.models.diffusion import UNet2DConditionModelPruned, UNet2DConditionModelMagnitudePruned
 from pdm.pipelines import StableDiffusionPruningPipeline
 from pdm.utils import compute_snr
-from torch import nn
-from omegaconf import DictConfig, OmegaConf
-from tqdm.auto import tqdm
-from transformers import PreTrainedTokenizerBase, DataCollator
-from accelerate import Accelerator
-from accelerate.logging import get_logger
-from datasets.utils.logging import set_verbosity_error, set_verbosity_warning
-from packaging import version
-import accelerate
-
-from pdm.utils.op_counter_orig import count_ops_and_params
+from pdm.utils.data_utils import (get_dataset, get_transforms, preprocess_samples, collate_fn,
+                                  preprocess_prompts, prompts_collate_fn)
 from pdm.utils.logging_utils import create_image_grid_from_indices, create_heatmap
+from pdm.utils.op_counter_orig import count_ops_and_params
+from pdm.utils.dist_utils import get_module_attribute, set_module_attribute, call_module_method
 
 logger = get_logger(__name__)
 
 
-class DiffPruningTrainer:
-    def __init__(self,
-                 config: DictConfig,
-                 hyper_net: nn.Module,
-                 quantizer: nn.Module,
-                 unet: nn.Module,
-                 noise_scheduler: nn.Module,
-                 vae: nn.Module,
-                 text_encoder: nn.Module,
-                 contrastive_loss: nn.Module,
-                 resource_loss: nn.Module,
-                 train_dataset: Dataset,
-                 preprocess_train: Optional[Callable] = None,
-                 preprocess_eval: Optional[Callable] = None,
-                 preprocess_prompts: Optional[Callable] = None,
-                 data_collator: Optional[DataCollator] = None,
-                 prompts_collator: Optional[DataCollator] = None,
-                 ema_unet: nn.Module = None,
-                 eval_dataset: Dataset = None,
-                 tokenizer: Optional[PreTrainedTokenizerBase] = None,
-                 optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
-                 teacher_model: Optional[nn.Module] = None,
-                 ):
+class Pruner:
+    def __init__(self, config: DictConfig):
 
         self.config = config
+
         self.accelerator = self.create_accelerator()
-        self.hyper_net = hyper_net
-        self.quantizer = quantizer
-        self.unet = unet
-        self.teacher_model = teacher_model
-        self.noise_scheduler = noise_scheduler
-        self.vae = vae
-        self.text_encoder = text_encoder
-        self.train_dataset = train_dataset
 
-        self.contrastive_loss = contrastive_loss
-        self.resource_loss = resource_loss
+        (self.tokenizer, self.text_encoder, self.vae, self.noise_scheduler, self.mpnet_tokenizer,
+         self.mpnet_model, self.unet, self.hyper_net, self.quantizer) = self.init_models()
 
+        dataset = self.init_datasets()
+        self.train_dataset = dataset["train"]
+        self.eval_dataset = dataset["validation"]
 
-        self.eval_dataset = eval_dataset
+        # used for sampling during pruning
+        if self.config.data.prompts is None:
+            self.config.data.prompts = dataset["validation"][self.config.data.caption_column][
+                                       :self.config.data.max_generated_samples]
+        self.init_prompts()
+
+        (preprocess_train, preprocess_eval, preprocess_prompts) = self.init_dataset_preprocessors(dataset)
         self.prepare_datasets(preprocess_train, preprocess_eval, preprocess_prompts)
-        self.tokenizer = tokenizer
-        self.configure_logging()
+        (self.train_dataloader, self.eval_dataloader,
+         self.prompt_dataloader, self.quantizer_embeddings_dataloader) = self.initialize_dataloaders(collate_fn,
+                                                                                                     prompts_collate_fn)
 
+        self.optimizer = self.initialize_optimizer()
+        self.lr_scheduler = self.initialize_lr_scheduler()
+
+        (self.ddpm_loss, self.resource_loss, self.contrastive_loss) = self.init_losses()
+
+        self.configure_logging()
         self.create_logging_dir()
 
-        if config.use_ema:
-            self.ema_unet = ema_unet
         if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
             self.init_accelerate_customized_saving_hooks()
-
-        (self.train_dataloader, self.eval_dataloader,
-         self.prompt_dataloader, self.quantizer_embeddings_dataloader) = self.initialize_dataloaders(data_collator,
-                                                                                                     prompts_collator)
 
         self.overrode_max_train_steps = False
         self.update_config_params()
 
-        if optimizers[0] is None:
-            optimizer = self.initialize_optimizer()
-        else:
-            optimizer = optimizers[0]
-        self.optimizer = optimizer
-
-        if optimizers[1] is None:
-            lr_scheduler = self.initialize_lr_scheduler()
-        else:
-            lr_scheduler = optimizers[1]
-        self.lr_scheduler = lr_scheduler
-
-        self.optimizers = optimizers
-        self.init_prompts()
         self.prepare_with_accelerator()
 
     def create_accelerator(self):
@@ -126,13 +110,170 @@ class DiffPruningTrainer:
             project_config=accelerator_project_config,
         )
 
+    def init_models(self):
+
+        def deepspeed_zero_init_disabled_context_manager():
+            """
+            returns either a context list that includes one that will disable zero.Init or an empty context list
+            """
+            deepspeed_plugin = AcceleratorState().deepspeed_plugin if accelerate.state.is_initialized() else None
+            if deepspeed_plugin is None:
+                return []
+
+            return [deepspeed_plugin.zero3_init_context_manager(enable=False)]
+
+        noise_scheduler = DDIMScheduler.from_pretrained(self.config.pretrained_model_name_or_path,
+                                                        subfolder="scheduler")
+
+        tokenizer = CLIPTokenizer.from_pretrained(
+            self.config.pretrained_model_name_or_path, subfolder="tokenizer", revision=self.config.revision
+        )
+
+        # Currently Accelerate doesn't know how to handle multiple models under Deepspeed ZeRO stage 3.
+        # For this to work properly all models must be run through `accelerate.prepare`. But accelerate
+        # will try to assign the same optimizer with the same weights to all models during
+        # `deepspeed.initialize`, which of course doesn't work.
+        #
+        # For now the following workaround will partially support Deepspeed ZeRO-3, by excluding the 2
+        # frozen models from being partitioned during `zero.Init` which gets called during
+        # `from_pretrained` So CLIPTextModel and AutoencoderKL will not enjoy the parameter sharding
+        # across multiple gpus and only UNet2DConditionModel will get ZeRO sharded.
+        with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
+            text_encoder = CLIPTextModel.from_pretrained(
+                self.config.pretrained_model_name_or_path, subfolder="text_encoder", revision=self.config.revision
+            )
+            vae = AutoencoderKL.from_pretrained(
+                self.config.pretrained_model_name_or_path, subfolder="vae", revision=self.config.revision
+            )
+
+        vae.requires_grad_(False)
+        text_encoder.requires_grad_(False)
+
+        mpnet_tokenizer = AutoTokenizer.from_pretrained(self.config.prompt_encoder_model_name_or_path)
+        mpnet_model = AutoModel.from_pretrained(self.config.prompt_encoder_model_name_or_path)
+
+        unet = UNet2DConditionModelGated.from_pretrained(
+            self.config.pretrained_model_name_or_path,
+            subfolder="unet",
+            revision=self.config.non_ema_revision,
+            down_block_types=tuple(self.config.model.unet.unet_down_blocks),
+            mid_block_type=self.config.model.unet.unet_mid_block,
+            up_block_types=tuple(self.config.model.unet.unet_up_blocks),
+            gated_ff=self.config.model.unet.gated_ff,
+            ff_gate_width=self.config.model.unet.ff_gate_width,
+
+        )
+
+        unet.freeze()
+
+        if self.config.training.enable_xformers_memory_efficient_attention:
+            if is_xformers_available():
+                import xformers
+
+                xformers_version = version.parse(xformers.__version__)
+                if xformers_version == version.parse("0.0.16"):
+                    logger.warn(
+                        "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
+                    )
+                unet.enable_xformers_memory_efficient_attention()
+            else:
+                raise ValueError("xformers is not available. Make sure it is installed correctly")
+
+        if self.config.training.gradient_checkpointing:
+            unet.enable_gradient_checkpointing()
+
+        unet_structure = unet.get_structure()
+
+        hyper_net = HyperStructure(input_dim=mpnet_model.config.hidden_size,
+                                   structure=unet_structure,
+                                   wn_flag=self.config.model.hypernet.weight_norm,
+                                   linear_bias=self.config.model.hypernet.linear_bias,
+                                   single_arch_param=self.config.model.hypernet.single_arch_param
+                                   )
+
+        quantizer = StructureVectorQuantizer(n_e=self.config.model.quantizer.num_arch_vq_codebook_embeddings,
+                                             structure=unet_structure,
+                                             beta=self.config.model.quantizer.arch_vq_beta,
+                                             temperature=self.config.model.quantizer.quantizer_T,
+                                             base=self.config.model.quantizer.quantizer_base,
+                                             depth_order=list(self.config.model.quantizer.depth_order),
+                                             non_zero_width=self.config.model.quantizer.non_zero_width,
+                                             resource_aware_normalization=self.config.model.quantizer.resource_aware_normalization,
+                                             optimal_transport=self.config.model.quantizer.optimal_transport
+                                             )
+
+        return tokenizer, text_encoder, vae, noise_scheduler, mpnet_tokenizer, mpnet_model, unet, hyper_net, quantizer
+
+    def init_datasets(self):
+        logger.info("Loading datasets...")
+        dataset = get_dataset(self.config)
+        return dataset
+
+    def init_dataset_preprocessors(self, dataset):
+
+        # Get the column names for input/target.
+        column_names = dataset["train"].column_names
+        image_column = self.config.data.image_column
+        if image_column not in column_names:
+            raise ValueError(
+                f"--image_column' value '{self.config.data.image_column}' needs to be one of: {', '.join(column_names)}"
+            )
+
+        caption_column = self.config.data.caption_column
+        if caption_column not in column_names:
+            raise ValueError(
+                f"--caption_column' value '{self.config.data.caption_column}' needs to be one of: {', '.join(column_names)}"
+            )
+
+        # Preprocessors and transformers
+        train_transform, validation_transform = get_transforms(self.config)
+        preprocess_train = partial(preprocess_samples, tokenizer=self.tokenizer, mpnet_model=self.mpnet_model,
+                                   mpnet_tokenizer=self.mpnet_tokenizer, transform=train_transform,
+                                   image_column=image_column, caption_column=caption_column, is_train=True)
+
+        preprocess_validation = partial(preprocess_samples, tokenizer=self.tokenizer, mpnet_model=self.mpnet_model,
+                                        mpnet_tokenizer=self.mpnet_tokenizer, transform=validation_transform,
+                                        image_column=image_column, caption_column=caption_column, is_train=False)
+
+        preprocess_prompts_ = partial(preprocess_prompts, mpnet_model=self.mpnet_model,
+                                      mpnet_tokenizer=self.mpnet_tokenizer)
+
+        return preprocess_train, preprocess_validation, preprocess_prompts_
+
+    def prepare_datasets(self, preprocess_train, preprocess_eval, preprocess_prompts):
+        with self.accelerator.main_process_first():
+            if self.config.data.max_train_samples is not None:
+                self.train_dataset = self.train_dataset.select(
+                    range(min(self.config.data.max_train_samples, len(self.train_dataset))))
+            self.train_dataset = self.train_dataset.with_transform(preprocess_train)
+
+            if self.eval_dataset is not None:
+                if self.config.data.max_validation_samples is not None:
+                    self.eval_dataset = self.eval_dataset.select(
+                        range(min(self.config.data.max_validation_samples, len(self.eval_dataset))))
+                self.eval_dataset = self.eval_dataset.with_transform(preprocess_eval)
+
+            if self.config.data.prompts is not None:
+                self.prompt_dataset = Dataset.from_dict({"prompts": self.config.data.prompts}).with_transform(
+                    preprocess_prompts)
+
+    def init_losses(self):
+        resource_loss = ResourceLoss(p=self.config.training.losses.resource_loss.pruning_target,
+                                     loss_type=self.config.training.losses.resource_loss.type)
+
+        contrastive_loss = ContrastiveLoss(
+            arch_vector_temperature=self.config.training.losses.contrastive_loss.arch_vector_temperature,
+            prompt_embedding_temperature=self.config.training.losses.contrastive_loss.prompt_embedding_temperature)
+
+        ddpm_loss = F.mse_loss
+
+        return ddpm_loss, resource_loss, contrastive_loss
+
     def init_accelerate_customized_saving_hooks(self):
 
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             if self.accelerator.is_main_process:
-                if self.config.use_ema:
-                    self.ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
                 for i, model in enumerate(models):
                     if isinstance(model, (UNet2DConditionModel, UNet2DConditionModelGated)):
                         logger.info("Save UNet")
@@ -150,11 +291,6 @@ class DiffPruningTrainer:
                     weights.pop()
 
         def load_model_hook(models, input_dir):
-            if self.config.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel)
-                self.ema_unet.load_state_dict(load_model.state_dict())
-                self.ema_unet.to(self.accelerator.device)
-                del load_model
             for _ in range(len(models)):
                 # pop models so that they are not loaded again
                 model = models.pop()
@@ -236,9 +372,6 @@ class DiffPruningTrainer:
                                                      self.quantizer
                                                      ))
 
-        if self.config.use_ema:
-            self.ema_unet.to(self.accelerator.device)
-
     def init_prompts(self):
         if os.path.isfile(self.config.data.prompts[0]):
             with open(self.config.data.prompts[0], "r") as f:
@@ -257,25 +390,6 @@ class DiffPruningTrainer:
         if self.config.data.max_generated_samples is not None:
             self.config.data.prompts = self.config.data.prompts[
                                        :self.config.data.max_generated_samples]
-
-    def prepare_datasets(self, preprocess_train, preprocess_eval, preprocess_prompts):
-        with self.accelerator.main_process_first():
-            if self.config.data.max_train_samples is not None:
-                self.train_dataset = self.train_dataset.select(
-                    range(min(self.config.data.max_train_samples, len(self.train_dataset))))
-            # Set the training transforms
-            self.train_dataset = self.train_dataset.with_transform(preprocess_train)
-
-            if self.eval_dataset is not None:
-                if self.config.data.max_validation_samples is not None:
-                    self.eval_dataset = self.eval_dataset.select(
-                        range(min(self.config.data.max_validation_samples, len(self.eval_dataset))))
-                    # Set the validation transforms
-                self.eval_dataset = self.eval_dataset.with_transform(preprocess_eval)
-
-            if self.config.data.prompts is not None:
-                self.prompt_dataset = Dataset.from_dict({"prompts": self.config.data.prompts}).with_transform(
-                    preprocess_prompts)
 
     def initialize_dataloaders(self, data_collate_fn, prompts_collate_fn):
         train_dataloader = torch.utils.data.DataLoader(
@@ -300,7 +414,6 @@ class DiffPruningTrainer:
         if self.config.data.prompts is None:
             self.config.data.prompts = []
 
-        # create a torch dataloader from given prompts
         prompt_dataloader = torch.utils.data.DataLoader(self.prompt_dataset,
                                                         batch_size=self.config.data.dataloader.image_generation_batch_size * self.accelerator.num_processes,
                                                         shuffle=False,
@@ -308,7 +421,7 @@ class DiffPruningTrainer:
                                                         num_workers=self.config.data.dataloader.dataloader_num_workers)
 
         n_e = self.quantizer.n_e
-
+        # used for generating unconditional samples from experts. Can be removed if not needed.
         q_embedding_dataloader = torch.utils.data.DataLoader(torch.arange(n_e),
                                                              batch_size=self.config.data.dataloader.image_generation_batch_size * self.accelerator.num_processes,
                                                              shuffle=False,
@@ -438,8 +551,9 @@ class DiffPruningTrainer:
         return initial_global_step, first_epoch
 
     def init_weight_dtype(self):
-        # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
-        # as these weights are only used for inference, keeping weights in full precision is not required.
+        # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet)
+        # to half-precision as these weights are only used for inference, keeping weights in full precision is not
+        # required.
         self.weight_dtype = torch.float32
         if self.accelerator.mixed_precision == "fp16":
             self.weight_dtype = torch.float16
@@ -496,8 +610,6 @@ class DiffPruningTrainer:
             disable=not self.accelerator.is_main_process,
         )
 
-        self.unet.module.freeze()
-
         self.block_activations = {}
         self.cast_block_act_hooks(self.unet, self.block_activations)
 
@@ -515,7 +627,7 @@ class DiffPruningTrainer:
                 # Calculating the MACs of each module of the model in the first iteration.
                 if global_step == initial_global_step:
                     self.count_flops(batch)
-                    self.quantizer.module.set_prunable_flops_template(self.unet.module.prunable_flops_list)
+                    call_module_method(self.quantizer, "set_prunable_flops_template", self.unet.prunable_flops_list)
 
                 # pruning target is for total flops. we calculate loss for prunable flops.
                 if global_step == 0:
@@ -746,14 +858,16 @@ class DiffPruningTrainer:
         arch_vector = self.hyper_net(text_embeddings)
         arch_vector_quantized, q_loss, _ = self.quantizer(arch_vector)
 
-        arch_vector = self.quantizer.module.gumbel_sigmoid_trick(arch_vector)
-        if self.hyper_net.module.single_arch_param:
-            self.hyper_net.module.arch_gs = arch_vector
+        arch_vector = call_module_method(self.quantizer, "gumbel_sigmoid_trick", arch_vector)
+        if get_module_attribute(self.hyper_net, "single_arch_param"):
+            set_module_attribute(self.hyper_net, "arch_gs", arch_vector)
 
-        arch_vector_width_depth_normalized = self.quantizer.module.width_depth_normalize(arch_vector)
+        arch_vector_width_depth_normalized = call_module_method(self.quantizer, "width_depth_normalize", arch_vector)
         with torch.no_grad():
-            quantizer_embeddings = self.quantizer.module.get_codebook_entry_gumbel_sigmoid(
-                torch.arange(self.quantizer.module.n_e, device=self.accelerator.device), hard=True).detach()
+            quantizer_embeddings = call_module_method(self.quantizer, 'get_codebook_entry_gumbel_sigmoid',
+                                                      torch.arange(get_module_attribute(self.quantizer, 'n_e'),
+                                                                   device=self.accelerator.device),
+                                                      hard=True).detach()
             quantizer_embeddings /= quantizer_embeddings.norm(dim=-1, keepdim=True)
             quantizer_embeddings_pairwise_similarity = quantizer_embeddings @ quantizer_embeddings.t()
 
@@ -761,8 +875,14 @@ class DiffPruningTrainer:
                                     range(self.accelerator.num_processes)]
             arch_vector_list = [torch.zeros_like(arch_vector) for _ in
                                 range(self.accelerator.num_processes)]
-            torch.distributed.all_gather(text_embeddings_list, text_embeddings)
-            torch.distributed.all_gather(arch_vector_list, arch_vector_width_depth_normalized)
+
+            if self.accelerator.num_processes > 1:
+                torch.distributed.all_gather(text_embeddings_list, text_embeddings)
+                torch.distributed.all_gather(arch_vector_list, arch_vector_width_depth_normalized)
+            else:
+                text_embeddings_list[self.accelerator.process_index] = text_embeddings
+                arch_vector_list[self.accelerator.process_index] = arch_vector_width_depth_normalized
+
         text_embeddings_list[self.accelerator.process_index] = text_embeddings
         arch_vector_list[self.accelerator.process_index] = arch_vector_width_depth_normalized
         text_embeddings_list = torch.cat(text_embeddings_list, dim=0)
@@ -770,9 +890,10 @@ class DiffPruningTrainer:
 
         # During hyper_net pretraining, we don't cluster the architecture vector and directly use it.
         if pretrain:
-            arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector)
+            arch_vectors_separated = call_module_method(self.hyper_net, "transform_structure_vector", arch_vector)
         else:
-            arch_vectors_separated = self.hyper_net.module.transform_structure_vector(arch_vector_quantized)
+            arch_vectors_separated = call_module_method(self.hyper_net, "transform_structure_vector",
+                                                        arch_vector_quantized)
 
         contrastive_loss, arch_vectors_similarity = self.contrastive_loss(text_embeddings_list, arch_vector_list,
                                                                           return_similarity=True)
@@ -791,18 +912,18 @@ class DiffPruningTrainer:
 
         with torch.no_grad():
             full_arch_vector = torch.ones_like(arch_vector)
-            full_arch_vector = self.hyper_net.module.transform_structure_vector(full_arch_vector)
-            self.unet.module.set_structure(full_arch_vector)
+            full_arch_vector = call_module_method(self.hyper_net, "transform_structure_vector", full_arch_vector)
+            call_module_method(self.unet, "set_structure", full_arch_vector)
             full_model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample.detach()
             teacher_block_activations = self.block_activations.copy()
 
-        self.unet.module.set_structure(arch_vectors_separated)
+        call_module_method(self.unet, "set_structure", arch_vectors_separated)
         # Predict the noise residual and compute loss
         model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
         student_block_activations = self.block_activations.copy()
 
         if self.config.training.losses.diffusion_loss.snr_gamma is None:
-            loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+            loss = self.ddpm_loss(model_pred.float(), target.float(), reduction="mean")
         else:
             # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
             # Since we predict the noise instead of x_0, the original formulation is slightly changed.
@@ -818,31 +939,32 @@ class DiffPruningTrainer:
                         dim=1).min(dim=1)[0] / snr
             )
 
-            loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+            loss = self.ddpm_loss(model_pred.float(), target.float(), reduction="none")
             loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
             loss = loss.mean()
 
-        distillation_loss = F.mse_loss(model_pred.float(), full_model_pred.float(), reduction="mean")
+        distillation_loss = self.ddpm_loss(model_pred.float(), full_model_pred.float(), reduction="mean")
 
         block_loss = torch.tensor(0.0, device=self.accelerator.device)
         for key in student_block_activations.keys():
-            block_loss += F.mse_loss(student_block_activations[key], teacher_block_activations[key].detach(),
-                                     reduction="mean")
+            block_loss += self.ddpm_loss(student_block_activations[key], teacher_block_activations[key].detach(),
+                                         reduction="mean")
         block_loss /= len(student_block_activations)
 
-        flops_dict = self.unet.module.calc_flops()
+        flops_dict = call_module_method(self.unet, "calc_flops")
         curr_flops = flops_dict['cur_prunable_flops']
 
         # The reason is that sanity['prunable_flops'] does not have depth-related pruning flops
         # like skip connections of resnets in it.
-        resource_ratios = (curr_flops / (self.unet.module.resource_info_dict['cur_prunable_flops'].squeeze()))
+        resource_ratios = (curr_flops / (
+            get_module_attribute(self.unet, 'resource_info_dict')['cur_prunable_flops'].squeeze()))
         resource_loss = self.resource_loss(resource_ratios.mean())
 
         max_loss = 1. - torch.max(resource_ratios)
         std_loss = -torch.std(resource_ratios)
         with torch.no_grad():
             batch_resource_ratios = flops_dict['cur_prunable_flops'] / (
-                self.unet.module.resource_info_dict['cur_prunable_flops'].squeeze())
+                get_module_attribute(self.unet, 'resource_info_dict')['cur_prunable_flops'].squeeze())
 
         diff_loss = loss.clone().detach().mean()
         loss += self.config.training.losses.resource_loss.weight * resource_loss
@@ -1018,7 +1140,7 @@ class DiffPruningTrainer:
                         commit_message="End of training",
                         ignore_patterns=["step_*", "epoch_*"],
                     )
-        #checkpoint at the end of training
+        # checkpoint at the end of training
         if self.accelerator.is_main_process:
             self.save_checkpoint(logging_dir, global_step)
             # copy arch_vector0.pt to logging_dir if it exists
@@ -1143,7 +1265,6 @@ class DiffPruningTrainer:
             if batch["pixel_values"].numel() == 0:
                 continue
             loss, diff_loss, distillation_loss, block_loss = self.finetune_step(batch)
-            # Gather the losses across all processes for logging (if we use distributed training).
             total_val_loss += loss.item()
             total_diff_loss += diff_loss.item()
             total_distillation_loss += distillation_loss.item()
@@ -1178,12 +1299,11 @@ class DiffPruningTrainer:
 
     @torch.no_grad()
     def count_flops(self, batch):
+        arch_vecs_separated = call_module_method(self.hyper_net, 'transform_structure_vector',
+                                                 torch.ones((1, get_module_attribute(self.quantizer, 'vq_embed_dim')),
+                                                            device=self.accelerator.device))
 
-        arch_vecs_separated = self.hyper_net.module.transform_structure_vector(
-            torch.ones((1, self.quantizer.module.vq_embed_dim),
-                       device=self.accelerator.device))
-
-        self.unet.module.set_structure(arch_vecs_separated)
+        call_module_method(self.unet, 'set_structure', arch_vecs_separated)
 
         latents = self.vae.encode(batch["pixel_values"][:1].to(self.weight_dtype)).latent_dist.sample()
         timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (1,),
@@ -1199,12 +1319,12 @@ class DiffPruningTrainer:
             "UNet's Params/MACs calculated by OpCounter:\tparams: {:.3f}M\t MACs: {:.3f}G".format(
                 params / 1e6, flops / 1e9))
 
-        sanity_flops_dict = self.unet.module.calc_flops()
+        sanity_flops_dict = call_module_method(self.unet, 'calc_flops')
         prunable_flops_list = [[e / sanity_flops_dict['prunable_flops'] for e in elem] for elem in
-                               self.unet.module.get_prunable_flops()]
+                               call_module_method(self.unet, 'get_prunable_flops')]
 
-        self.unet.module.prunable_flops_list = prunable_flops_list
-        self.unet.module.resource_info_dict = sanity_flops_dict
+        set_module_attribute(self.unet, 'prunable_flops_list', prunable_flops_list)
+        set_module_attribute(self.unet, 'resource_info_dict', sanity_flops_dict)
 
         sanity_string = "Our MACs calculation:\t"
         for k, v in sanity_flops_dict.items():
@@ -1221,8 +1341,8 @@ class DiffPruningTrainer:
     @torch.no_grad()
     def update_pruning_target(self):
         p = self.config.training.losses.resource_loss.pruning_target
-        p_actual = (1 - (1 - p) * self.unet.module.resource_info_dict['total_flops'] /
-                    self.unet.module.resource_info_dict['cur_prunable_flops']).item()
+        p_actual = (1 - (1 - p) * get_module_attribute(self.unet, 'resource_info_dict')['total_flops'] /
+                    get_module_attribute(self.unet, 'resource_info_dict')['cur_prunable_flops']).item()
         self.resource_loss.p = p_actual
 
         del p, p_actual
@@ -1382,7 +1502,7 @@ class DiffPruningTrainer:
         image_output_dir = os.path.join(self.config.training.logging.logging_dir, "depth_analysis_images")
         os.makedirs(image_output_dir, exist_ok=True)
 
-        n_depth_pruned_blocks = sum([sum(d) for d in self.unet.module.get_structure()['depth']])
+        n_depth_pruned_blocks = sum([sum(d) for d in call_module_method(self.unet, 'get_structure')['depth']])
 
         # index n_depth_pruned_blocks is for no pruning
         images = {i: [] for i in range(n_depth_pruned_blocks + 1)}

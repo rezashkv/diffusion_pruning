@@ -2598,6 +2598,7 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
 
 
 class UNet2DConditionModelMagnitudePruned(UNet2DConditionModel):
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], **kwargs):
         r"""

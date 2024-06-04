@@ -5,6 +5,8 @@
 
 from __future__ import absolute_import
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -53,15 +55,12 @@ class HyperStructure(ModelMixin, ConfigMixin):
             self.mh_fc = torch.nn.ModuleList(linear_list)
             self.initialize_weights()
 
-
-
     def forward(self, x):
         if self.single_arch_param:
             # repeat the same architecture for all samples in the batch
             return self.arch.repeat(x.shape[0], 1)
         else:
             return self._forward(x)
-
 
     def initialize_weights(self):
         for name, param in self.named_parameters():
