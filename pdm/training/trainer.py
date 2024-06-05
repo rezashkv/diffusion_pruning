@@ -420,7 +420,8 @@ class Trainer(ABC):
 
             if path is None:
                 self.accelerator.print(
-                    f"Checkpoint '{self.config.training.logging.resume_from_checkpoint}' does not exist. Starting a new training run."
+                    f"Checkpoint '{self.config.training.logging.resume_from_checkpoint}' "
+                    f"does not exist. Starting a new training run."
                 )
                 self.config.training.logging.resume_from_checkpoint = None
                 initial_global_step = 0
@@ -470,8 +471,8 @@ class Trainer(ABC):
                 os.makedirs(self.config.training.logging.logging_dir, exist_ok=True)
 
                 # dump the args to a yaml file
-                logging.info("Project config")
-                print(OmegaConf.to_yaml(self.config))
+                logger.info("Project config")
+                logger.info(OmegaConf.to_yaml(self.config))
                 OmegaConf.save(self.config, os.path.join(self.config.training.logging.logging_dir, "config.yaml"))
 
             if self.config.training.hf_hub.push_to_hub:
@@ -822,7 +823,7 @@ class Pruner(Trainer):
 
     def init_losses(self):
         resource_loss = ResourceLoss(p=self.config.training.losses.resource_loss.pruning_target,
-                                     loss_type=self.config.training.losses.resource_loss.type)
+                                     loss_type=self.config.training.losses.resource_loss.pruning_type)
 
         contrastive_loss = ContrastiveLoss(
             arch_vector_temperature=self.config.training.losses.contrastive_loss.arch_vector_temperature,
@@ -1411,17 +1412,17 @@ class FineTuner(Trainer):
             vae = AutoencoderKL.from_pretrained(
                 self.config.pretrained_model_name_or_path, subfolder="vae", revision=self.config.revision
             )
-
-        embeddings_gs = torch.load(os.path.join(self.config.pruning_ckpt_dir, "quantizer_embeddings.pt"),
-                                   map_location="cpu")
-        arch_v = embeddings_gs[self.config.expert_id % embeddings_gs.shape[0]].unsqueeze(0)
-        torch.save(arch_v, os.path.join(self.config.training.logging.logging_dir, "arch_vector.pt"))
-
         teacher_unet = UNet2DConditionModel.from_pretrained(
             self.config.pretrained_model_name_or_path,
             subfolder="unet",
             revision=self.config.revision,
         )
+
+        embeddings_gs = torch.load(os.path.join(self.config.pruning_ckpt_dir, "quantizer_embeddings.pt"),
+                                   map_location="cpu")
+        arch_v = embeddings_gs[self.config.expert_id % embeddings_gs.shape[0]].unsqueeze(0)
+
+        torch.save(arch_v, os.path.join(self.config.training.logging.logging_dir, "arch_vector.pt"))
 
         unet = UNet2DConditionModelPruned.from_pretrained(
             self.config.pretrained_model_name_or_path,
@@ -1438,22 +1439,6 @@ class FineTuner(Trainer):
         vae.requires_grad_(False)
         text_encoder.requires_grad_(False)
         teacher_unet.requires_grad_(False)
-
-        if self.config.training.enable_xformers_memory_efficient_attention:
-            if is_xformers_available():
-                import xformers
-
-                xformers_version = version.parse(xformers.__version__)
-                if xformers_version == version.parse("0.0.16"):
-                    logger.warn(
-                        "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
-                    )
-                unet.enable_xformers_memory_efficient_attention()
-            else:
-                raise ValueError("xformers is not available. Make sure it is installed correctly")
-
-        if self.config.training.gradient_checkpointing:
-            unet.enable_gradient_checkpointing()
 
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder
@@ -1731,11 +1716,12 @@ class FineTuner(Trainer):
         loss *= self.config.training.losses.diffusion_loss.weight
 
         block_loss = torch.tensor(0.0, device=self.accelerator.device)
-        for key in self.block_act_student.keys():
-            block_loss += F.mse_loss(self.block_act_student[key], self.block_act_teacher[key].detach(),
-                                     reduction="mean")
-        block_loss /= len(self.block_act_student)
-        loss += self.config.training.losses.block_loss.weight * block_loss
+        if self.config.training.losses.block_loss.weight > 0:
+            for key in self.block_act_student.keys():
+                block_loss += F.mse_loss(self.block_act_student[key], self.block_act_teacher[key].detach(),
+                                         reduction="mean")
+            block_loss /= len(self.block_act_student)
+            loss += self.config.training.losses.block_loss.weight * block_loss
 
         distillation_loss = F.mse_loss(model_pred.float(), full_model_pred.float(), reduction="mean")
         loss += self.config.training.losses.distillation_loss.weight * distillation_loss
@@ -1827,3 +1813,174 @@ class FineTuner(Trainer):
         )
 
         return images
+
+
+class SingleArchFinetuner(FineTuner):
+
+    def init_models(self):
+        logger.info("Loading models...")
+
+        # Load scheduler, tokenizer and models.
+        noise_scheduler = DDIMScheduler.from_pretrained(self.config.pretrained_model_name_or_path,
+                                                        subfolder="scheduler")
+        tokenizer = CLIPTokenizer.from_pretrained(
+            self.config.pretrained_model_name_or_path, subfolder="tokenizer", revision=self.config.revision
+        )
+
+        hyper_net = HyperStructure.from_pretrained(self.config.pruning_ckpt_dir, subfolder="hypernet")
+        quantizer = StructureVectorQuantizer.from_pretrained(self.config.pruning_ckpt_dir, subfolder="quantizer")
+
+        mpnet_tokenizer = AutoTokenizer.from_pretrained(self.config.prompt_encoder_model_name_or_path)
+        mpnet_model = AutoModel.from_pretrained(self.config.prompt_encoder_model_name_or_path)
+
+        with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
+            text_encoder = CLIPTextModel.from_pretrained(
+                self.config.pretrained_model_name_or_path, subfolder="text_encoder", revision=self.config.revision
+            )
+            vae = AutoencoderKL.from_pretrained(
+                self.config.pretrained_model_name_or_path, subfolder="vae", revision=self.config.revision
+            )
+        teacher_unet = UNet2DConditionModel.from_pretrained(
+            self.config.pretrained_model_name_or_path,
+            subfolder="unet",
+            revision=self.config.revision,
+        )
+
+        sample_inputs = {'sample': torch.randn(1, teacher_unet.config.in_channels, teacher_unet.config.sample_size,
+                                               teacher_unet.config.sample_size),
+                         'timestep': torch.ones((1,)).long(),
+                         'encoder_hidden_states': text_encoder(torch.tensor([[100]]))[0],
+                         }
+        teacher_flops, teacher_params = count_ops_and_params(teacher_unet, sample_inputs)
+
+        arch_v = hyper_net.arch
+        arch_v = quantizer.gumbel_sigmoid_trick(arch_v).to("cpu")
+
+        unet = UNet2DConditionModelPruned.from_pretrained(
+            self.config.pretrained_model_name_or_path,
+            subfolder="unet",
+            revision=self.config.non_ema_revision,
+            down_block_types=tuple(self.config.model.unet.unet_down_blocks),
+            mid_block_type=self.config.model.unet.unet_mid_block,
+            up_block_types=tuple(self.config.model.unet.unet_up_blocks),
+            gated_ff=self.config.model.unet.gated_ff,
+            ff_gate_width=self.config.model.unet.ff_gate_width,
+            arch_vector=arch_v
+        )
+
+        unet_flops, unet_params = count_ops_and_params(unet, sample_inputs)
+
+        print(f"Teacher FLOPs: {teacher_flops / 1e9}G, Teacher Params: {teacher_params / 1e6}M")
+        print(f"Pruned Single Arch UNet FLOPs: {unet_flops / 1e9}G,"
+              f" Magnitude Pruned UNet Params: {unet_params / 1e6}M")
+        print(f"Pruning Raio: {unet_flops / teacher_flops:.2f}")
+
+        vae.requires_grad_(False)
+        text_encoder.requires_grad_(False)
+        teacher_unet.requires_grad_(False)
+
+        self.tokenizer = tokenizer
+        self.text_encoder = text_encoder
+        self.vae = vae
+        self.noise_scheduler = noise_scheduler
+        self.mpnet_tokenizer = mpnet_tokenizer
+        self.mpnet_model = mpnet_model
+        self.teacher_model = teacher_unet
+        self.unet = unet
+        self.hyper_net = hyper_net
+        self.quantizer = quantizer
+
+    def init_datasets(self):
+        logger.info("Loading datasets...")
+        dataset = get_dataset(self.config.data)
+        return dataset
+
+
+class BaselineFineTuner(FineTuner):
+
+    def __init__(self, config: DictConfig, pruning_type="magnitude"):
+        assert pruning_type in ["magnitude", "random"]
+        self.pruning_type = pruning_type
+        super().__init__(config)
+
+    def init_models(self):
+        logger.info("Loading models...")
+
+        # Load scheduler, tokenizer and models.
+        noise_scheduler = DDIMScheduler.from_pretrained(self.config.pretrained_model_name_or_path,
+                                                        subfolder="scheduler")
+        tokenizer = CLIPTokenizer.from_pretrained(
+            self.config.pretrained_model_name_or_path, subfolder="tokenizer", revision=self.config.revision
+        )
+
+        mpnet_tokenizer = AutoTokenizer.from_pretrained(self.config.prompt_encoder_model_name_or_path)
+        mpnet_model = AutoModel.from_pretrained(self.config.prompt_encoder_model_name_or_path)
+
+        with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
+            text_encoder = CLIPTextModel.from_pretrained(
+                self.config.pretrained_model_name_or_path, subfolder="text_encoder", revision=self.config.revision
+            )
+            vae = AutoencoderKL.from_pretrained(
+                self.config.pretrained_model_name_or_path, subfolder="vae", revision=self.config.revision
+            )
+
+        teacher_unet = UNet2DConditionModel.from_pretrained(
+            self.config.pretrained_model_name_or_path,
+            subfolder="unet",
+            revision=self.config.revision,
+        )
+
+        sample_inputs = {'sample': torch.randn(1, teacher_unet.config.in_channels, teacher_unet.config.sample_size,
+                                               teacher_unet.config.sample_size),
+                         'timestep': torch.ones((1,)).long(),
+                         'encoder_hidden_states': text_encoder(torch.tensor([[100]]))[0],
+                         }
+
+        teacher_flops, teacher_params = count_ops_and_params(teacher_unet, sample_inputs)
+
+        if self.pruning_type == "magnitude":
+            unet = UNet2DConditionModelMagnitudePruned.from_pretrained(
+                self.config.pretrained_model_name_or_path,
+                subfolder="unet",
+                revision=self.config.non_ema_revision,
+                target_pruning_rate=self.config.training.pruning_target,
+                pruning_method=self.config.training.pruning_method,
+                sample_inputs=sample_inputs
+            )
+        else:
+            unet = UNet2DConditionModelPruned.from_pretrained(
+                self.config.pretrained_model_name_or_path,
+                subfolder="unet",
+                revision=self.config.non_ema_revision,
+                down_block_types=tuple(self.config.model.unet.unet_down_blocks),
+                mid_block_type=self.config.model.unet.unet_mid_block,
+                up_block_types=tuple(self.config.model.unet.unet_up_blocks),
+                gated_ff=self.config.model.unet.gated_ff,
+                ff_gate_width=self.config.model.unet.ff_gate_width,
+                random_pruning_ratio=self.config.training.random_pruning_ratio
+            )
+
+        unet_flops, unet_params = count_ops_and_params(unet, sample_inputs)
+
+        logging.info(f"Teacher FLOPs: {teacher_flops / 1e9}G, Teacher Params: {teacher_params / 1e6}M")
+        logger.info(
+            f"Magnitude Pruned UNet FLOPs: {unet_flops / 1e9}G, Magnitude Pruned UNet Params: {unet_params / 1e6}M")
+        logger.info(f"Pruning Raio: {unet_flops / teacher_flops:.2f}")
+
+        vae.requires_grad_(False)
+        text_encoder.requires_grad_(False)
+        teacher_unet.requires_grad_(False)
+
+        self.tokenizer = tokenizer
+        self.text_encoder = text_encoder
+        self.vae = vae
+        self.noise_scheduler = noise_scheduler
+        self.teacher_model = teacher_unet
+        self.unet = unet
+        self.mpnet_tokenizer = mpnet_tokenizer
+        self.mpnet_model = mpnet_model
+
+    def init_datasets(self):
+        logger.info("Loading datasets...")
+        dataset = get_dataset(self.config.data)
+        return dataset

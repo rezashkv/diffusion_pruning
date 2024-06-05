@@ -22,7 +22,7 @@ def main():
     logging.info(f"FID: {fid_value}")
 
     os.makedirs(args.result_dir, exist_ok=True)
-    #append to file. If file does not exist, create it
+
     with open(f"{args.result_dir}/fid.txt", "a") as f:
         f.write(f"{args.gen_dir} {fid_value}\n")
 
