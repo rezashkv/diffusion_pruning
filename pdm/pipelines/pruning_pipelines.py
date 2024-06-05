@@ -11,7 +11,7 @@ from diffusers.utils import replace_example_docstring
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPImageProcessor
 import diffusers
 
-from pdm.models.diffusion.unet_2d_conditional import UNet2DConditionModelGated
+from pdm.models.unet.unet_2d_conditional import UNet2DConditionModelGated
 
 from diffusers import StableDiffusionPipeline, DiffusionPipeline
 from diffusers.models.modeling_utils import _LOW_CPU_MEM_USAGE_DEFAULT
@@ -24,7 +24,7 @@ EXAMPLE_DOC_STRING = """
         >>> import torch
         >>> from diffusers import StableDiffusionPipeline
 
-        >>> pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16)
+        >>> pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-unet-v1-5", torch_dtype=torch.float16)
         >>> pipe = pipe.to("cuda")
 
         >>> prompt = "a photo of an astronaut riding a horse on mars"
@@ -73,7 +73,7 @@ def load_sub_model_gated(
         class_obj = UNet2DConditionModelGated
 
     load_method_name = None
-    # retrive load method name
+    # retrieve load method name
     for class_name, class_candidate in class_candidates.items():
         if class_candidate is not None and issubclass(class_obj, class_candidate):
             load_method_name = importable_classes[class_name][1]
@@ -116,9 +116,9 @@ def load_sub_model_gated(
             and transformers_version >= version.parse("4.20.0")
     )
 
-    # When loading a transformers model, if the device_map is None, the weights will be initialized as opposed to diffusers.
-    # To make default loading faster we set the `low_cpu_mem_usage=low_cpu_mem_usage` flag which is `True` by default.
-    # This makes sure that the weights won't be initialized which significantly speeds up loading.
+    # When loading a transformers model, if the device_map is None, the weights will be initialized as opposed to
+    # diffusers. To make default loading faster we set the `low_cpu_mem_usage=low_cpu_mem_usage` flag which is
+    # `True` by default. This makes sure that the weights won't be initialized which significantly speeds up loading.
     if is_diffusers_model or is_transformers_model:
         loading_kwargs["device_map"] = device_map
         loading_kwargs["max_memory"] = max_memory
@@ -180,14 +180,14 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], **kwargs):
         r"""
-        Instantiate a PyTorch diffusion pipeline from pretrained pipeline weights.
+        Instantiate a PyTorch unet pipeline from pretrained pipeline weights.
 
         The pipeline is set in evaluation mode (`model.eval()`) by default.
 
         If you get the error message below, you need to finetune the weights for your downstream task:
 
         ```
-        Some weights of UNet2DConditionModel were not initialized from the model checkpoint at runwayml/stable-diffusion-v1-5 and are newly initialized because the shapes did not match:
+        Some weights of UNet2DConditionModel were not initialized from the model checkpoint at runwayml/stable-unet-v1-5 and are newly initialized because the shapes did not match:
         - conv_in.weight: found shape torch.Size([320, 4, 3, 3]) in the checkpoint and torch.Size([320, 9, 3, 3]) in the model instantiated
         You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
         ```
@@ -316,7 +316,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
         >>> # Download pipeline that requires an authorization token
         >>> # For more information on access tokens, please refer to this section
         >>> # of the documentation](https://huggingface.co/docs/hub/security-tokens)
-        >>> pipeline = DiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5")
+        >>> pipeline = DiffusionPipeline.from_pretrained("runwayml/stable-unet-v1-5")
 
         >>> # Use a different scheduler
         >>> from diffusers import LMSDiscreteScheduler
@@ -748,7 +748,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
         else:
             structure_vector = self.hyper_net(hyper_net_input)
 
-        structure_vector_quantized, _, (_, _, min_encoding_indices) = self.quantizer(structure_vector)
+        structure_vector_quantized, (_, _, min_encoding_indices) = self.quantizer(structure_vector)
 
         structure_vector = self.quantizer.gumbel_sigmoid_trick(structure_vector)
         if pretrain:
@@ -852,7 +852,6 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
         else:
             return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
 
-
     @torch.no_grad()
     def generate_samples(
             self,
@@ -913,7 +912,6 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
             negative_prompt_embeds=negative_prompt_embeds,
             lora_scale=text_encoder_lora_scale,
         )
-
 
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch
@@ -1000,7 +998,6 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
         else:
             return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
 
-
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def sample_progressive(
@@ -1039,7 +1036,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
                    num_inference_steps (`int`, *optional*, defaults to 50):
                        The number of denoising steps. More denoising steps usually lead to a higher quality image at the
                        expense of slower inference.
-                   guidance_scale (`float`, *optional*, defaults to 7.5):
+                   (`float`, *optional*, defaults to 7.5):
                        A higher guidance scale value encourages the model to generate images closely linked to the text
                        `prompt` at the expense of lower image quality. Guidance scale is enabled when `guidance_scale > 1`.
                    negative_prompt (`str` or `List[str]`, *optional*):
@@ -1051,7 +1048,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
                        Corresponds to parameter eta (η) from the [DDIM](https://arxiv.org/abs/2010.02502) paper. Only applies
                        to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
                    generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
-                       A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
+                       A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make guidance_scale
                        generation deterministic.
                    latents (`torch.FloatTensor`, *optional*):
                        Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image
@@ -1134,7 +1131,7 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
             structure_vector = self.hyper_net(prompt_embeds.mean(dim=1))
         else:
             structure_vector = self.hyper_net(hyper_net_input)
-        structure_vector_quantized, _, _ = self.quantizer(structure_vector)
+        structure_vector_quantized, _ = self.quantizer(structure_vector)
         arch_vectors_separated = self.hyper_net.transform_structure_vector(structure_vector_quantized)
 
         self.unet.set_structure(arch_vectors_separated)
@@ -1424,7 +1421,8 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
                         callback(i, t, latents)
 
         flops_dict = self.unet.calc_flops()
-        resource_ratios = flops_dict['cur_prunable_flops'] / (self.unet.resource_info_dict['cur_prunable_flops'].squeeze())
+        resource_ratios = flops_dict['cur_prunable_flops'] / (
+            self.unet.resource_info_dict['cur_prunable_flops'].squeeze())
 
         if not output_type == "latent":
             latents = latents.to(dtype=self.vae.dtype, device=self.vae.device)

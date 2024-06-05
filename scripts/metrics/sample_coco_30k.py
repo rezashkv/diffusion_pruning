@@ -15,6 +15,7 @@ def parse_args():
                         help="Number of samples to take from the COCO 2014 validation set.")
     return parser.parse_args()
 
+
 def main(args):
     annotations_path = os.path.join(args.data_dir, "annotations", "captions_val2014.json")
     images_dir = os.path.join(args.data_dir, "images", "val2014")
@@ -52,6 +53,7 @@ def main(args):
     print(f"Saved {args.num_samples} samples to {output_dir}.")
     print(f"Saved annotations to {output_annotations_path}.")
     print("Done.")
+
 
 if __name__ == "__main__":
     args = parse_args()

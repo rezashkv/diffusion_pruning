@@ -1,5 +1,4 @@
 import argparse
-import os
 from pdm.utils.clip_utils import clip_features
 import logging
 

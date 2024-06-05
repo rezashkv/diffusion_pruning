@@ -1,6 +1,7 @@
 import argparse
 import os
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Dynamic Pruning of StableDiffusion-2.1")
     parser.add_argument(
@@ -17,6 +18,11 @@ def parse_args():
         required=False,
         help="Path to pretrained clip model or model identifier from huggingface.co/models.",
     )
+    parser.add_argument("--prompt_encoder_model_name_or_path",
+                        type=str,
+                        default="sentence-transformers/all-mpnet-base-v2",
+                        required=False,
+                        help="Path to pretrained prompt encoder model or model identifier from huggingface.co/models.")
     parser.add_argument(
         "--base_config_path",
         type=str,
@@ -42,12 +48,6 @@ def parse_args():
         help="Path to the saved finetuning checkpoint dir. used for image generation.",
     )
     parser.add_argument(
-        "--name",
-        type=str,
-        default="",
-        help="Experiment name. Will be added to the name of the logging directory for easier tracking of experiments.",
-    )
-    parser.add_argument(
         "--use_ema",
         action="store_true",
         help="Whether to use EMA model.",
@@ -68,8 +68,8 @@ def parse_args():
     )
     parser.add_argument(
         "--seed",
-        type=int, 
-        default=43, 
+        type=int,
+        default=43,
         help="A seed for reproducible training."
     )
     parser.add_argument(
@@ -93,22 +93,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--wandb_run_name", 
-        type=str, 
-        default=None, 
+        "--expert_id",
+        type=int,
+        default=None,
+        help="Index of the expert to finetune",
+    )
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
         help="The `run_name` argument passed to Accelerator.init_trackers"
-    )
-    parser.add_argument(
-        "--n_blocks",
-        type=int,
-        default=1,
-        help="Number of consecutive blocks to prune for depth analysis.",
-    )
-    parser.add_argument(
-        "--embedding_ind",
-        type=int,
-        default=0,
-        help="Index of the embedding layer to prune for depth analysis.",
     )
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
@@ -118,15 +112,10 @@ def parse_args():
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="For distributed training: local_rank")
 
-
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
-
-    # Sanity checks
-    # if args.dataset_name is None and args.train_data_dir is None:
-    #     raise ValueError("Need either a dataset name or a training folder.")
 
     # default to using the same revision for the non-ema model if not specified
     if args.non_ema_revision is None:

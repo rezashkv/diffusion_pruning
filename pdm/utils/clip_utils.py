@@ -1,4 +1,4 @@
-# Credit: https://github.com/Taited/clip-score/blob/master/src/clip_score/clip_score.py
+# Credits: https://github.com/Taited/clip-score/blob/master/src/clip_score/clip_score.py
 """Calculates the CLIP Scores
 
 The CLIP model is a contrasitively learned language-image model. There is

@@ -12,9 +12,9 @@ def save_coco_captions(annotations_file):
     os.makedirs(save_dir, exist_ok=True)
     for capt in captions_file['annotations']:
         if '2014' in annotations_file:
-            image_id = f"COCO_{split_name}_%012d.jpg" % capt['image_id']
+            image_id = f"COCO_{split_name}_%012d" % capt['image_id']
         else:
-            image_id = "%012d.jpg" % capt['image_id']
+            image_id = "%012d" % capt['image_id']
 
         caption = capt['caption']
         with open(os.path.join(save_dir, image_id + '.txt'), 'w') as f:

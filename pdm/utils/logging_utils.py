@@ -1,3 +1,5 @@
+import logging
+import os
 from PIL import Image, ImageDraw, ImageFont
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -33,9 +35,27 @@ def create_image_grid_from_indices(indices, grid_size=(5, 5), image_size=(256, 2
     # Save or display the resulting image
     return background
 
+
 def create_heatmap(data, n_rows, n_cols):
     plt.figure()
     data = data.reshape(n_rows, n_cols)
     fig = sns.heatmap(data, cmap='Blues', linewidth=0.5, xticklabels=False, yticklabels=False).get_figure()
     return fig
 
+
+def init_logging(config):
+    config.training.logging.logging_dir = os.path.join(config.training.logging.logging_dir,
+                                                       os.getcwd().split('/')[-2],
+                                                       config.base_config_path.split('/')[-2],
+                                                       config.base_config_path.split('/')[-1].split('.')[0],
+                                                       config.wandb_run_name
+                                                       )
+
+    os.makedirs(config.training.logging.logging_dir, exist_ok=True)
+
+    # Make one log on every process with the configuration for debugging.
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )

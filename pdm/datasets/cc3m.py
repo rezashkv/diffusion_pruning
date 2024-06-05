@@ -9,13 +9,13 @@ from PIL import ImageFile
 from datasets import Dataset
 from webdataset import WebDataset
 import webdataset as wds
-from .dist_utils import nodesplitter
+from pdm.utils.dist_utils import nodesplitter
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 def load_cc3m_dataset(data_dir, split="train", split_file="Train_GCC-training.tsv",
-                      split_dir="training", max_samples=1000, bad_images_path=None):
+                      split_dir="training", bad_images_path=None):
     captions = pd.read_csv(os.path.join(data_dir, split_file),
                            sep="\t", header=None, names=["caption", "link"],
                            dtype={"caption": str, "link": str})
@@ -29,9 +29,6 @@ def load_cc3m_dataset(data_dir, split="train", split_file="Train_GCC-training.ts
         images = os.listdir(os.path.join(data_dir, split_dir))
         with open(names_file, 'wb') as file:
             pickle.dump(images, file)
-
-    if max_samples is not None and max_samples < 1000:
-        images = images[:max_samples * 5]
 
     images = [os.path.join(data_dir, split_dir, image) for image in images]
     if bad_images_path is None:

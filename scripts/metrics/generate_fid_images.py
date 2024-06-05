@@ -74,7 +74,7 @@ def main():
     dataset_config_name = getattr(config.data, "dataset_config_name", None)
     data_dir = getattr(config.data, "data_dir", None)
 
-    assert config.embedding_ind is not None, "embedding_ind must be provided"
+    assert config.expert_id is not None, "expert index must be provided"
 
     def collate_fn(examples):
         # get a list of images and captions from examples which is a list of dictionaries
@@ -104,8 +104,8 @@ def main():
             assert os.path.exists(fid_val_indices_path), \
                 f"{dataset_name}_validation_mapped_indices.pkl must be present in two upper directory of the checkpoint directory {config.finetuning_ckpt_dir}"
             val_indices = pickle.load(open(fid_val_indices_path, "rb"))
-            length = len([x for x in val_indices if val_indices[x] == config.embedding_ind])
-            dataset = dataset.select(lambda x: val_indices[x["__key__"]] == config.embedding_ind)
+            length = len([x for x in val_indices if val_indices[x] == config.expert_id])
+            dataset = dataset.select(lambda x: val_indices[x["__key__"]] == config.expert_id)
             dataset = dataset.batched(config.data.dataloader.image_generation_batch_size * accelerator.num_processes,
                                       collation_fn=collate_fn)
 
@@ -134,7 +134,7 @@ def main():
 
             def filter_dataset(dataset, validation_indices):
                 dataset["validation"] = dataset["validation"].select(
-                    torch.where(validation_indices == config.embedding_ind)[0])
+                    torch.where(validation_indices == config.expert_id)[0])
                 return dataset
 
             fid_val_indices_path = os.path.abspath(

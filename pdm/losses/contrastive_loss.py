@@ -2,7 +2,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ClipLoss(nn.Module):
+class ContrastiveLoss(nn.Module):
     def __init__(self, arch_vector_temperature=1.0, prompt_embedding_temperature=1.0):
         super().__init__()
         self.arch_vector_temperature = arch_vector_temperature

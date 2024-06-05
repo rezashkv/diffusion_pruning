@@ -15,7 +15,7 @@ from diffusers.models.attention_processor import SpatialNorm
 from diffusers.models.normalization import AdaGroupNorm
 # from diffusers.models.activations import GEGLU
 from diffusers.models.lora import (LoRACompatibleConv, LoRACompatibleLinear)
-from pdm.models.diffusion.blocks import GatedAttention
+from pdm.models.unet.blocks import GatedAttention
 from diffusers.models.attention_processor import Attention
 import sys
 from functools import partial

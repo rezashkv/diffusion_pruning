@@ -1,43 +1,26 @@
-#!/usr/bin/env python
-# coding=utf-8
-# Copyright 2023 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-
 import logging
 import os
 
-from accelerate.utils import set_seed
 from omegaconf import OmegaConf
 
-import accelerate
 import torch
 import torch.utils.checkpoint
-from accelerate.logging import get_logger
-from accelerate.state import AcceleratorState
 
-from transformers import CLIPTextModel, CLIPTokenizer, AutoModel
+from accelerate.utils import set_seed
+from accelerate.logging import get_logger
+
+from diffusers import UNet2DConditionModel
+from diffusers.utils import check_min_version
+
+from transformers import CLIPTextModel,AutoModel
 from transformers.utils import ContextManagers
 
-from diffusers import DDIMScheduler, UNet2DConditionModel
-from diffusers.utils import check_min_version, deprecate
-
-from pdm.models.diffusion import UNet2DConditionModelGated
+from pdm.models.unet import UNet2DConditionModelGated
+from pdm.models import HyperStructure, StructureVectorQuantizer
 from pdm.utils.arg_utils import parse_args
-from pdm.models import HyperStructure
-
-import torch._dynamo
-
 from pdm.utils.op_counter_orig import count_ops_and_params
+from pdm.utils.dist_utils import deepspeed_zero_init_disabled_context_manager
+
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.22.0.dev0")
@@ -48,21 +31,12 @@ logger = get_logger(__name__)
 def main():
     args = parse_args()
     config = OmegaConf.load(args.base_config_path)
-    # add args to config
     config.update(vars(args))
+
+    assert config.pruning_ckpt_dir is not None, "Please provide a path to the pruning checkpoint directory."
 
     if config.seed is not None:
         set_seed(config.seed)
-
-    if config.non_ema_revision is not None:
-        deprecate(
-            "non_ema_revision!=None",
-            "0.15.0",
-            message=(
-                "Downloading 'non_ema' weights from revision branches of the Hub is deprecated. Please make sure to"
-                " use `--variant=non_ema` instead."
-            ),
-        )
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -72,23 +46,6 @@ def main():
     )
 
     # #################################################### Models ####################################################
-
-    # Load scheduler, tokenizer and models.
-    noise_scheduler = DDIMScheduler.from_pretrained(config.pretrained_model_name_or_path, subfolder="scheduler")
-
-    tokenizer = CLIPTokenizer.from_pretrained(
-        config.pretrained_model_name_or_path, subfolder="tokenizer", revision=config.revision
-    )
-
-    def deepspeed_zero_init_disabled_context_manager():
-        """
-        returns either a context list that includes one that will disable zero.Init or an empty context list
-        """
-        deepspeed_plugin = AcceleratorState().deepspeed_plugin if accelerate.state.is_initialized() else None
-        if deepspeed_plugin is None:
-            return []
-
-        return [deepspeed_plugin.zero3_init_context_manager(enable=False)]
 
     # Currently Accelerate doesn't know how to handle multiple models under Deepspeed ZeRO stage 3.
     # For this to work properly all models must be run through `accelerate.prepare`. But accelerate
@@ -104,7 +61,6 @@ def main():
             config.pretrained_model_name_or_path, subfolder="text_encoder", revision=config.revision
         )
 
-    embeddings_gs = torch.load(os.path.join(config.pruning_ckpt_dir, "quantizer_embeddings.pt"), map_location="cpu")
     pretrained_config = UNet2DConditionModel.load_config(config.pretrained_model_name_or_path, subfolder="unet")
 
     sample_inputs = {'sample': torch.randn(1, pretrained_config["in_channels"], pretrained_config["sample_size"],
@@ -132,6 +88,12 @@ def main():
                                wn_flag=config.model.hypernet.weight_norm,
                                linear_bias=config.model.hypernet.linear_bias)
 
+    if config.pruning_type == "multi-expert":
+        embeddings_gs = torch.load(os.path.join(config.pruning_ckpt_dir, "quantizer_embeddings.pt"), map_location="cpu")
+    else:
+        quantizer = StructureVectorQuantizer.from_pretrained(config.pruning_ckpt_dir, subfolder="quantizer")
+        embeddings_gs = quantizer.gumbel_sigmoid_trick(hyper_net.arch)
+
     arch_vecs_separated = hyper_net.transform_structure_vector(
         torch.ones((1, embeddings_gs.shape[1]), device=embeddings_gs.device))
 
@@ -140,7 +102,7 @@ def main():
     flops, params = count_ops_and_params(unet, sample_inputs)
 
     logging.info(
-        "UNet's Params/MACs calculated by OpCounter:\tparams: {:.3f}M\t MACs: {:.3f}G".format(
+        "Full UNet's Params/MACs calculated by OpCounter:\tparams: {:.3f}M\t MACs: {:.3f}G".format(
             params / 1e6, flops / 1e9))
 
     sanity_flops_dict = unet.calc_flops()
@@ -160,9 +122,9 @@ def main():
 
     arch_vectors_separated = hyper_net.transform_structure_vector(embeddings_gs)
     unet.set_structure(arch_vectors_separated)
-    flops_dict = unet.calc_flops()
-    resource_ratios = flops_dict['cur_prunable_flops'] / (unet.resource_info_dict['cur_prunable_flops'].squeeze())
 
+    flops_dict = unet.calc_flops()
+    resource_ratios = flops_dict['cur_total_flops'] / (unet.resource_info_dict['cur_total_flops'].squeeze())
     logging.info(f"Resource Ratios: {resource_ratios}")
     # save the resource ratios to the checkpoint directory
     torch.save(resource_ratios, os.path.join(config.pruning_ckpt_dir, "resource_ratios.pt"))
