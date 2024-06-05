@@ -93,6 +93,12 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--expert_id",
+        type=int,
+        default=None,
+        help="Index of the expert to finetune",
+    )
+    parser.add_argument(
         "--wandb_run_name",
         type=str,
         default=None,

@@ -43,24 +43,17 @@ class HyperStructure(ModelMixin, ConfigMixin):
             self.arch = nn.Parameter(torch.randn(1, sum(self.width_list) + sum(self.depth_list)))
             self.arch_gs = torch.zeros(1, sum(self.width_list) + sum(self.depth_list))
         else:
-            width_linear_list = [nn.Linear(self.input_dim, self.width_list[i], bias=linear_bias) for i in
+            width_linear_list = [nn.Linear(self.input_dim, self.width_list[i], bias=self.linear_bias) for i in
                                  range(len(self.width_list))]
-            depth_linear_layer = nn.Linear(self.input_dim, sum(self.depth_list), bias=linear_bias)
+            depth_linear_layer = nn.Linear(self.input_dim, sum(self.depth_list), bias=self.linear_bias)
 
             linear_list = width_linear_list + [depth_linear_layer]
 
-            if wn_flag:
+            if self.wn_flag:
                 linear_list = [weight_norm(linear) for linear in linear_list]
 
             self.mh_fc = torch.nn.ModuleList(linear_list)
             self.initialize_weights()
-
-    def forward(self, x):
-        if self.single_arch_param:
-            # repeat the same architecture for all samples in the batch
-            return self.arch.repeat(x.shape[0], 1)
-        else:
-            return self._forward(x)
 
     def initialize_weights(self):
         for name, param in self.named_parameters():
@@ -68,6 +61,13 @@ class HyperStructure(ModelMixin, ConfigMixin):
                 nn.init.orthogonal_(param)
             elif "bias" in name:
                 nn.init.zeros_(param)
+
+    def forward(self, x):
+        if self.single_arch_param:
+            # repeat the same architecture for all samples in the batch
+            return self.arch.repeat(x.shape[0], 1)
+        else:
+            return self._forward(x)
 
     def _forward(self, x):
         # x: B * L * D

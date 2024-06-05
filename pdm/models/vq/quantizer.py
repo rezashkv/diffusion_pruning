@@ -12,9 +12,6 @@ from diffusers import ModelMixin
 import torch.distributed as dist
 
 
-# DEPTH_ORDER = [-1, -2, -3, -4, -5, 0, 1, 2, -6, -7, 3, 4]
-
-
 class StructureVectorQuantizer(ModelMixin, ConfigMixin):
     """
     Improved version over VectorQuantizer, can be used as a drop-in replacement. Mostly avoids costly matrix
@@ -105,8 +102,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         self.temperature = temperature
         self.base = base
 
-        # Used for preventing collapsing the blocks due to zero width. Prevents the cases that width gets zero but
-        # we don't actually want to remove the whole block.
+        # Avoid cases that width gets zero but we don't actually want to remove the whole block.
         self.non_zero_width = non_zero_width
 
         self.optimal_transport = optimal_transport
@@ -137,8 +133,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         back = torch.gather(used[None, :][inds.shape[0] * [0], :], 1, inds)
         return back.reshape(ishape)
 
-    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Tuple]:
-        # reshape z -> (batch, dim) and flatten
+    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, Tuple]:
         z = z.contiguous()
         z_flattened = z.view(-1, self.vq_embed_dim)
 
@@ -156,19 +151,9 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         z_q = embedding_gs[min_encoding_indices].view(z.shape)
 
         z_q_out = z_q.contiguous()
-        # z_q_out = self.gumbel_sigmoid_trick(z_q)
 
         perplexity = None
         min_encodings = None
-
-        # compute loss for embedding
-        # loss = self.beta * torch.mean((z_q.detach() - z) ** 2) + torch.mean((z_q - z.detach()) ** 2)
-        loss = torch.tensor(0.0, device=z.device)
-
-        # preserve gradients
-        # z_q: torch.Tensor = z + (z_q - z).detach()
-
-        # reshape back to match original input shape
 
         if self.remap is not None:
             min_encoding_indices = min_encoding_indices.reshape(z.shape[0], -1)  # add batch axis
@@ -181,7 +166,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         if not self.training:
             z_q_out = hard_concrete(z_q)
 
-        return z_q_out, loss, (perplexity, min_encodings, min_encoding_indices)
+        return z_q_out, (perplexity, min_encodings, min_encoding_indices)
 
     def get_codebook_entry(self, indices: torch.LongTensor, shape: Tuple[int, ...] = None) -> torch.Tensor:
         # shape specifying (batch, dim)
@@ -259,7 +244,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
                         inputs[:, self.depth_indices[i]:(self.depth_indices[i] + 1)])
 
         outputs = inputs_clone * (torch.sqrt(self.template).detach())
-        if self.config.resource_aware_normalization:
+        if self.resource_effect_normalization:
             outputs = outputs * self.prunable_flops_template.detach()
 
         return outputs

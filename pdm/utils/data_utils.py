@@ -15,20 +15,17 @@ def get_dataset(config):
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    dataset_name = getattr(config.data, "dataset_name", None)
-    dataset_config_name = getattr(config.data, "dataset_config_name", None)
-    data_files = getattr(config.data, "data_files", None)
-    data_dir = getattr(config.data, "data_dir", None)
+    dataset_name = getattr(config, "dataset_name", None)
+    dataset_config_name = getattr(config, "dataset_config_name", None)
+    data_dir = getattr(config, "data_dir", None)
 
-    train_data_dir = getattr(config.data, "train_data_dir", None)
-    train_data_file = getattr(config.data, "train_data_file", None)
-    train_bad_images_path = getattr(config.data, "train_bad_images_path", None)
-    max_train_samples = getattr(config.data, "max_train_samples", None)
+    train_data_dir = getattr(config, "train_data_dir", None)
+    train_data_file = getattr(config, "train_data_file", None)
+    train_bad_images_path = getattr(config, "train_bad_images_path", None)
 
-    validation_data_dir = getattr(config.data, "validation_data_dir", None)
-    validation_data_file = getattr(config.data, "validation_data_file", None)
-    validation_bad_images_path = getattr(config.data, "validation_bad_images_path", None)
-    max_validation_samples = getattr(config.data, "max_validation_samples", None)
+    validation_data_dir = getattr(config, "validation_data_dir", None)
+    validation_data_file = getattr(config, "validation_data_file", None)
+    validation_bad_images_path = getattr(config, "validation_bad_images_path", None)
 
     if dataset_name is not None:
         # Downloading and loading a dataset from the hub.
@@ -45,18 +42,16 @@ def get_dataset(config):
                                                   split="train",
                                                   split_file=train_data_file,
                                                   split_dir=train_data_dir,
-                                                  max_samples=max_train_samples,
                                                   bad_images_path=train_bad_images_path)}
             if validation_data_dir is not None:
                 dataset["validation"] = load_cc3m_dataset(data_dir,
                                                           split="validation",
                                                           split_file=validation_data_file,
                                                           split_dir=validation_data_dir,
-                                                          max_samples=max_validation_samples,
                                                           bad_images_path=validation_bad_images_path)
 
         elif "coco" in data_dir:
-            year = config.data.year
+            year = config.year
             dataset = {"train": load_coco_dataset(os.path.join(data_dir, "images", f"train{year}"),
                                                   os.path.join(data_dir, "annotations", f"captions_train{year}.json")),
                        "validation": load_coco_dataset(os.path.join(data_dir, "images", f"val{year}"),
@@ -65,8 +60,8 @@ def get_dataset(config):
 
         else:
             data_files = {}
-            if config.data.data_dir is not None:
-                data_files["train"] = os.path.join(config.data.data_dir, "**")
+            if config.data_dir is not None:
+                data_files["train"] = os.path.join(config.data_dir, "**")
             dataset = load_dataset(
                 "imagefolder",
                 data_files=data_files,
@@ -163,6 +158,7 @@ def get_mpnet_embeddings(capts, mpnet_model, mpnet_tokenizer, is_train=True):
 
     encoded_input = mpnet_tokenizer(captions, padding=True, truncation=True, return_tensors="pt")
     with torch.no_grad():
+        encoded_input = encoded_input.to(mpnet_model.device)
         model_output = mpnet_model(**encoded_input)
     sentence_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
     return sentence_embeddings
@@ -198,8 +194,39 @@ def collate_fn(samples):
     return {"pixel_values": pixel_values, "input_ids": input_ids, "mpnet_embeddings": mpnet_embeddings}
 
 
-def prompts_collate_fn(samples):
+def prompts_collator(samples):
     prompts = [sample["prompts"] for sample in samples]
     prompt_embdeddings = torch.stack([sample["mpnet_embeddings"] for sample in samples])
     prompt_embdeddings = prompt_embdeddings.to(memory_format=torch.contiguous_format).float()
     return {"prompts": prompts, "mpnet_embeddings": prompt_embdeddings}
+
+
+def filter_dataset(dataset, hyper_net, quantizer, mpnet_model, mpnet_tokenizer, caption_column="caption"):
+    train_captions = dataset["train"][caption_column]
+    validation_captions = dataset["validation"][caption_column]
+    train_filtering_dataloader = torch.utils.data.DataLoader(train_captions, batch_size=2048, shuffle=False)
+    validation_filtering_dataloader = torch.utils.data.DataLoader(validation_captions, batch_size=2048,
+                                                                  shuffle=False)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    hyper_net.to(device)
+    quantizer.to(device)
+    mpnet_model.to(device)
+    hyper_net.eval()
+    quantizer.eval()
+    train_indices = []
+    validation_indices = []
+    with torch.no_grad():
+        for batch in train_filtering_dataloader:
+            batch = get_mpnet_embeddings(batch, mpnet_model, mpnet_tokenizer, is_train=True)
+            arch_v = hyper_net(batch)
+            indices = quantizer.get_cosine_sim_min_encoding_indices(arch_v)
+            train_indices.append(indices)
+        for batch in validation_filtering_dataloader:
+            batch = get_mpnet_embeddings(batch, mpnet_model, mpnet_tokenizer, is_train=False)
+            arch_v = hyper_net(batch)
+            indices = quantizer.get_cosine_sim_min_encoding_indices(arch_v)
+            validation_indices.append(indices)
+    train_indices = torch.cat(train_indices, dim=0)
+    validation_indices = torch.cat(validation_indices, dim=0)
+
+    return train_indices, validation_indices
