@@ -92,7 +92,8 @@ def get_down_block(
     # If attn head dim is not defined, we default it to the number of heads
     if attention_head_dim is None:
         logger.warning(
-            f"It is recommended to provide `attention_head_dim` when calling `get_down_block`. Defaulting `attention_head_dim` to {num_attention_heads}."
+            f"It is recommended to provide `attention_head_dim` when calling `get_down_block`."
+            f" Defaulting `attention_head_dim` to {num_attention_heads}."
         )
         attention_head_dim = num_attention_heads
 
@@ -638,7 +639,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
     A conditional 2D UNet model that takes a noisy sample, conditional state, and a timestep and returns a sample
     shaped output.
 
-    This model inherits from [`ModelMixin`]. Check the superclass documentation for it's generic methods implemented
+    This model inherits from [`ModelMixin`]. Check the superclass documentation for its generic methods implemented
     for all models (such as downloading or saving).
 
     Parameters:
@@ -654,7 +655,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
             The tuple of downsample blocks to use.
         mid_block_type (`str`, *optional*, defaults to `"UNetMidBlock2DCrossAttn"`):
             Block type for middle of UNet, it can be either `UNetMidBlock2DCrossAttn` or
-            `UNetMidBlock2DSimpleCrossAttn`. If `None`, the mid block layer is skipped.
+            `UNetMidBlock2DSimpleCrossAttn`. If `None`, the mid-block layer is skipped.
         up_block_types (`Tuple[str]`, *optional*, defaults to `("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D")`):
             The tuple of upsample blocks to use.
         only_cross_attention(`bool` or `Tuple[bool]`, *optional*, default to `False`):
@@ -664,7 +665,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
             The tuple of output channels for each block.
         layers_per_block (`int`, *optional*, defaults to 2): The number of layers per block.
         downsample_padding (`int`, *optional*, defaults to 1): The padding to use for the downsampling convolution.
-        mid_block_scale_factor (`float`, *optional*, defaults to 1.0): The scale factor to use for the mid block.
+        mid_block_scale_factor (`float`, *optional*, defaults to 1.0): The scale factor to use for the mid-block.
         dropout (`float`, *optional*, defaults to 0.0): The dropout probability to use.
         act_fn (`str`, *optional*, defaults to `"silu"`): The activation function to use.
         norm_num_groups (`int`, *optional*, defaults to 32): The number of groups to use for the normalization.
@@ -716,7 +717,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         class_embeddings_concat (`bool`, *optional*, defaults to `False`): Whether to concatenate the time
             embeddings with the class embeddings.
         mid_block_only_cross_attention (`bool`, *optional*, defaults to `None`):
-            Whether to use cross attention with the mid block when using the `UNetMidBlock2DSimpleCrossAttn`. If
+            Whether to use cross attention with the mid-block when using the `UNetMidBlock2DSimpleCrossAttn`. If
             `only_cross_attention` is given as a single boolean and `mid_block_only_cross_attention` is `None`, the
             `only_cross_attention` value is used as the value for `mid_block_only_cross_attention`. Default to `False`
             otherwise.
@@ -1454,7 +1455,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
             cross_attention_kwargs (`dict`, *optional*):
                 A kwargs dictionary that if specified is passed along to the [`AttnProcessor`].
             added_cond_kwargs: (`dict`, *optional*):
-                A kwargs dictionary containin additional embeddings that if specified are added to the embeddings that
+                A kwargs dictionary containing additional embeddings that if specified are added to the embeddings that
                 are passed along to the UNet blocks.
 
         Returns:
@@ -2124,7 +2125,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
         return model
 
     def freeze(self):
-        # set all parameters to not require gradients except for the virtual hypernets
+        # Freeze all parameters except the gate_f parameters
         for name, param in self.named_parameters():
             if "gate_f" not in name:
                 param.requires_grad = False

@@ -4,49 +4,49 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from diffusers.configuration_utils import register_to_config
 from diffusers.models import DualTransformer2DModel, Transformer2DModel
 from diffusers.models.activations import GEGLU
 from diffusers.models.resnet import ResnetBlock2D, Upsample2D, Downsample2D
 from diffusers.models.transformer_2d import Transformer2DModelOutput
-from diffusers.configuration_utils import register_to_config
 from diffusers.models.attention import BasicTransformerBlock, FeedForward
 from diffusers.models.unet_2d_blocks import (CrossAttnDownBlock2D, CrossAttnUpBlock2D, DownBlock2D, UpBlock2D,
                                              UNetMidBlock2DCrossAttn)
-from diffusers.utils import logging, USE_PEFT_BACKEND
 from diffusers.models.attention_processor import AttnProcessor2_0, Attention
+from diffusers.utils import logging, USE_PEFT_BACKEND
 
+from pdm.models.unet.gates import DepthGate, WidthGate, LinearWidthGate
 from pdm.utils.estimation_utils import hard_concrete
-from pdm.models.hypernet.gates import DepthGate, WidthGate
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 class GEGLUGated(GEGLU):
     r"""
-    A [variant](https://arxiv.org/abs/2002.05202) of the gated linear unit activation function.
+    A pruning-gated [variant](https://arxiv.org/abs/2002.05202) of the gated linear unit activation function.
 
     Parameters:
         dim_in (`int`): The number of channels in the input.
         dim_out (`int`): The number of channels in the output.
+        gate_width (`int`, *optional*, defaults to 32): The width of the pruning gate.
     """
 
     def __init__(self, dim_in: int, dim_out: int, gate_width: int = 32):
         super().__init__(dim_in, dim_out)
         self.dim_out = dim_out
-        self.gate = WidthGate(gate_width)
+        self.gate = LinearWidthGate(gate_width)
         self.total_flops, self.prunable_flops = 0., 0.
         self.pruned = False
 
     def forward(self, hidden_states, scale: float = 1.0):
         args = () if USE_PEFT_BACKEND else (scale,)
         hidden_states, gate = self.proj(hidden_states, *args).chunk(2, dim=-1)
-
+        # if gate is pruned, no need to apply the pruning gate
         if not self.pruned:
-            mask = self.gate.gate_f.repeat_interleave(self.dim_out // self.gate.gate_f.shape[1], dim=1).unsqueeze(1)
-            if mask.shape[0] != hidden_states.shape[0]:
-                mask = mask.repeat(hidden_states.shape[0] // mask.shape[0], 1, 1)
-            hidden_states = mask.expand_as(hidden_states) * hidden_states
-            gate = mask.expand_as(gate) * gate
+            # ########## Apply Width Gate ##########
+            hidden_states = self.gate(hidden_states)
+            gate = self.gate(gate)
+
         return hidden_states * self.gelu(gate)
 
     @torch.no_grad()
@@ -78,6 +78,7 @@ class FeedForwardWidthGated(FeedForward):
          dropout (`float`, *optional*, defaults to 0.0): The dropout probability to use.
          activation_fn (`str`, *optional*, defaults to `"geglu"`): Activation function to be used in feed-forward.
          final_dropout (`bool` *optional*, defaults to False): Apply a final dropout.
+         gate_width (`int`, *optional*, defaults to 32): The width of the pruning gate.
      """
 
     def __init__(
@@ -175,7 +176,6 @@ class GatedAttention(Attention):
                     linear.bias.data = new_linear_bias
             return linear
 
-
         assert self.gate.gate_f.shape[0] == 1, "Pruning is only supported for single batch size"
         gate_h = hard_concrete(self.gate.gate_f)[0]
         self.to_q = prune_linear(self.to_q, gate_h)
@@ -247,18 +247,11 @@ class HeadGatedAttnProcessor2(AttnProcessor2_0):
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
         if not attn.pruned:
-            # ########## Apply Width Gate
+            # ########## Apply Width Gate ##########
             assert key.shape[1] == attn.gate.gate_f.shape[1]
-            mask = attn.gate.gate_f.unsqueeze(-1).unsqueeze(-1)
-
-            if mask.shape[0] != key.shape[0]:
-                mask = mask.repeat(key.shape[0] // mask.shape[0], 1, 1, 1)
-            query = query * mask
-            key = key * mask
-            value = value * mask
-            # query = attn.gate(query)
-            # key = attn.gate(key)
-            # value = attn.gate(value)
+            query = attn.gate(query)
+            key = attn.gate(key)
+            value = attn.gate(value)
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         hidden_states = F.scaled_dot_product_attention(
@@ -307,7 +300,8 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
         hidden_states = self.nonlinearity(hidden_states)
 
         if self.upsample is not None:
-            # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
+            # upsample_nearest_nhwc fails with large batch sizes.
+            # see https://github.com/huggingface/diffusers/issues/984
             if hidden_states.shape[0] >= 64:
                 input_tensor = input_tensor.contiguous()
                 hidden_states = hidden_states.contiguous()
@@ -348,17 +342,9 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
             hidden_states = hidden_states + temb
 
         if not self.pruned:
+            # ########## Apply Width Gate ##########
             assert self.norm2.num_groups == self.gate.gate_f.shape[1]
-            num_repeat = int(hidden_states.shape[1] / self.norm2.num_groups)
-            mask = torch.repeat_interleave(self.gate.gate_f, repeats=num_repeat, dim=1).unsqueeze(-1).unsqueeze(
-                -1)
-            # when doing inference with cfg the mask and hidden_states do not have the same size at dim 0. repeat the mask
-            # to match the size of hidden_states
-            if mask.shape[0] != hidden_states.shape[0]:
-                mask = mask.repeat(hidden_states.shape[0] // mask.shape[0], 1, 1, 1)
-
-            hidden_states = hidden_states * mask
-            # hidden_states = self.gate(hidden_states)
+            hidden_states = self.gate(hidden_states)
 
         if self.time_embedding_norm == "ada_group" or self.time_embedding_norm == "spatial":
             hidden_states = self.norm2(hidden_states, temb)
@@ -384,7 +370,7 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
         return output_tensor
 
     def get_gate_structure(self):
-        if self.structure["width"] == []:
+        if not self.structure["width"]:
             self.structure = {"width": [self.gate.width], "depth": [0]}
         return self.structure
 
@@ -450,7 +436,8 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
 
         if self.time_emb_proj is not None:
             linear_cls = self.time_emb_proj.__class__
-            time_emb_proj = linear_cls(self.time_emb_proj.in_features, conv1.out_channels, bias=self.time_emb_proj.bias is not None)
+            time_emb_proj = linear_cls(self.time_emb_proj.in_features, conv1.out_channels,
+                                       bias=self.time_emb_proj.bias is not None)
             time_emb_proj.weight.data = self.time_emb_proj.weight.data[gate_hard.bool(), :]
             if self.time_emb_proj.bias is not None:
                 time_emb_proj.bias.data = self.time_emb_proj.bias.data[gate_hard.bool()]
@@ -464,7 +451,7 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
 
         conv2_cls = self.conv2.__class__
         conv2 = conv2_cls(norm2.num_channels, self.conv2.out_channels, kernel_size=self.conv2.kernel_size,
-                            stride=self.conv2.stride, padding=self.conv2.padding)
+                          stride=self.conv2.stride, padding=self.conv2.padding)
         conv2.weight.data = self.conv2.weight.data[:, gate_hard.bool(), :, :]
         if self.conv2.bias is not None:
             conv2.bias.data = self.conv2.bias.data
@@ -491,8 +478,10 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         assert (self.upsample is None) and (
                 self.downsample is None)  # Depth gate cannot be in the up/down sample blocks.
         if self.is_input_concatenated:  # We are in the upsample blocks, input is concatenated.
-            # input_hidden_states = input_tensor.chunk(2, dim=1)[0]  # [0] because the forward pass is hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1) 
-            # in here: https://github.com/huggingface/diffusers/blob/acd926f4f208e4cf12be69315787c450da48913b/src/diffusers/models/unet_2d_blocks.py#L2324
+            # input_hidden_states = input_tensor.chunk(2, dim=1)[0]
+            # [0] because the forward pass is hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+            # in here:
+            # https://github.com/huggingface/diffusers/blob/acd926f4f208e4cf12be69315787c450da48913b/src/diffusers/models/unet_2d_blocks.py#L2324
             assert input_tensor.ndim == 4
             assert self.skip_connection_dim is not None
             n_channels_concat = input_tensor.shape[1]
@@ -513,7 +502,8 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         hidden_states = self.nonlinearity(hidden_states)
 
         if self.upsample is not None:
-            # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
+            # upsample_nearest_nhwc fails with large batch sizes.
+            # see https://github.com/huggingface/diffusers/issues/984
             if hidden_states.shape[0] >= 64:
                 input_tensor = input_tensor.contiguous()
                 hidden_states = hidden_states.contiguous()
@@ -554,17 +544,9 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
             hidden_states = hidden_states + temb
 
         if not self.pruned:
-            # DO it here or after norm2?
+            # ########## Apply Width Gate ##########
             assert self.norm2.num_groups == self.gate.gate_f.shape[1]
-            num_repeat = int(hidden_states.shape[1] / self.norm2.num_groups)
-            mask = torch.repeat_interleave(self.gate.gate_f, repeats=num_repeat, dim=1).unsqueeze(-1).unsqueeze(
-                -1)
-
-            if mask.shape[0] != hidden_states.shape[0]:
-                mask = mask.repeat(hidden_states.shape[0] // mask.shape[0], 1, 1, 1)
-
-            hidden_states = hidden_states * mask
-            # hidden_states = self.gate(hidden_states)
+            hidden_states = self.gate(hidden_states)
 
         if self.time_embedding_norm == "ada_group" or self.time_embedding_norm == "spatial":
             hidden_states = self.norm2(hidden_states, temb)
@@ -588,18 +570,16 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
 
         if not self.pruned:
+            # ########## Apply Depth Gate ##########
             assert output_tensor.shape == input_hidden_states.shape
-            mask = self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-            if mask.shape[0] != output_tensor.shape[0]:
-                mask = mask.repeat(output_tensor.shape[0] // mask.shape[0], 1, 1, 1)
-            output = ((1 - mask) * input_hidden_states +
-                      mask * output_tensor)
+            output = self.depth_gate((input_hidden_states, output_tensor))
+
             return output
         else:
             return output_tensor
 
     def get_gate_structure(self):
-        if self.structure["width"] == []:
+        if not self.structure["width"]:
             self.structure = {"depth": [self.depth_gate.width], "width": [self.gate.width]}
         return self.structure
 
@@ -651,7 +631,8 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
 
     @torch.no_grad()
     def prune(self):
-        assert self.depth_gate.gate_f.shape[0] == self.gate.gate_f.shape[0] == 1, "Pruning is only supported for single batch size"
+        assert self.depth_gate.gate_f.shape[0] == self.gate.gate_f.shape[
+            0] == 1, "Pruning is only supported for single batch size"
         hard_depth_gate = hard_concrete(self.depth_gate.gate_f)[0]
         if hard_depth_gate == 0:
             self.dropped = True
@@ -684,7 +665,8 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
 
             if self.time_emb_proj is not None:
                 linear_cls = self.time_emb_proj.__class__
-                time_emb_proj = linear_cls(self.time_emb_proj.in_features, conv1.out_channels, bias=self.time_emb_proj.bias is not None)
+                time_emb_proj = linear_cls(self.time_emb_proj.in_features, conv1.out_channels,
+                                           bias=self.time_emb_proj.bias is not None)
                 time_emb_proj.weight.data = self.time_emb_proj.weight.data[gate_hard.bool(), :]
                 if self.time_emb_proj.bias is not None:
                     time_emb_proj.bias.data = self.time_emb_proj.bias.data[gate_hard.bool()]
@@ -836,7 +818,9 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
             # "feed_forward_chunk_size" can be used to save memory
             if norm_hidden_states.shape[self._chunk_dim] % self._chunk_size != 0:
                 raise ValueError(
-                    f"`hidden_states` dimension to be chunked: {norm_hidden_states.shape[self._chunk_dim]} has to be divisible by chunk size: {self._chunk_size}. Make sure to set an appropriate `chunk_size` when calling `unet.enable_forward_chunking`."
+                    f"`hidden_states` dimension to be chunked: {norm_hidden_states.shape[self._chunk_dim]}"
+                    f" has to be divisible by chunk size: {self._chunk_size}. "
+                    f"Make sure to set an appropriate `chunk_size` when calling `unet.enable_forward_chunking`."
                 )
 
             num_chunks = norm_hidden_states.shape[self._chunk_dim] // self._chunk_size
@@ -1138,7 +1122,8 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
         The [`Transformer2DModel`] forward method.
 
         Args:
-            hidden_states (`torch.LongTensor` of shape `(batch size, num latent pixels)` if discrete, `torch.FloatTensor` of shape `(batch size, channel, height, width)` if continuous):
+            hidden_states (`torch.LongTensor` of shape `(batch size, num latent pixels)`
+            if discrete, `torch.FloatTensor` of shape `(batch size, channel, height, width)` if continuous):
                 Input `hidden_states`.
             encoder_hidden_states ( `torch.FloatTensor` of shape `(batch size, sequence len, embed dims)`, *optional*):
                 Conditional embeddings for cross attention layer. If not given, cross-attention defaults to
@@ -1165,7 +1150,7 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
                 If `ndim == 2`: will be interpreted as a mask, then converted into a bias consistent with the format
                 above. This bias will be added to the cross-attention scores.
             return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~models.unet_2d_condition.UNet2DConditionOutput`] instead of a plain
+                Whether to return a [`~models.unet_2d_condition.UNet2DConditionOutput`] instead of a plain
                 tuple.
 
         Returns:
@@ -1320,19 +1305,17 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
             if self.adaln_single is None:
                 height = width = int(hidden_states.shape[1] ** 0.5)
             hidden_states = hidden_states.reshape(
-                shape=(-1, height, width, self.patch_size, self.patch_size, self.out_channels)
+                (-1, height, width, self.patch_size, self.patch_size, self.out_channels)
             )
             hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
             output = hidden_states.reshape(
-                shape=(-1, self.out_channels, height * self.patch_size, width * self.patch_size)
+                (-1, self.out_channels, height * self.patch_size, width * self.patch_size)
             )
 
         if not self.pruned:
+            # ########## Apply Depth Gate ##########
             assert output.shape == input_hidden_states.shape
-            mask = self.depth_gate.gate_f.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-            if mask.shape[0] != output.shape[0]:
-                mask = mask.repeat(output.shape[0] // mask.shape[0], 1, 1, 1)
-            output_tensor = (1 - mask) * input_hidden_states + mask * output
+            output_tensor = self.depth_gate((input_hidden_states, output))
 
         else:
             output_tensor = output
@@ -1393,8 +1376,8 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
         if self.prunable_flops == 0:
             self.prunable_flops = out_dict["prunable_flops"]
 
-        out_dict["cur_prunable_flops"] = (out_dict[
-                                              "cur_prunable_flops"] + self.total_flops - self.prunable_flops) * depth_ratio
+        out_dict["cur_prunable_flops"] = ((out_dict["cur_prunable_flops"] + self.total_flops - self.prunable_flops)
+                                          * depth_ratio)
         out_dict["cur_total_flops"] = out_dict["cur_total_flops"] * (depth_ratio.detach())
 
         return out_dict
@@ -1530,7 +1513,7 @@ class DualTransformer2DModelWidthDepthGated(DualTransformer2DModel):
                 `self.processor` in
                 [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
             return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`models.unet_2d_condition.UNet2DConditionOutput`] instead of a plain tuple.
+                Whether to return a [`models.unet_2d_condition.UNet2DConditionOutput`] instead of a plain tuple.
 
         Returns:
             [`~models.transformer_2d.Transformer2DModelOutput`] or `tuple`:
@@ -1817,13 +1800,10 @@ class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
         width_vectors, depth_vectors = arch_vectors['width'], arch_vectors['depth']
 
         for b in self.resnets:
-
-            assert hasattr(b, "get_gate_structure")
             b_structure = b.get_gate_structure()
-            assert len(b_structure) == 2
             block_vectors = {'width': [], 'depth': []}
             for i in range(len(b_structure['width'])):
-                b_structure['width'][i] == width_vectors[0].shape[1]
+                assert b_structure['width'][i] == width_vectors[0].shape[1]
                 block_vectors['width'].append(width_vectors.pop(0))
             for i in range(len(b_structure['depth'])):
                 if b_structure['depth'][i] == 1:
@@ -2138,17 +2118,15 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
         return self.structure
 
     def set_gate_structure(self, arch_vectors):
-        # We first read the resnets and then attentions in the "get_gate_structure" method. Thus, we do a similar approach here.
+        # We first read the resnets and then attentions in the "get_gate_structure" method.
+        # Thus, we do a similar approach here.
         width_vectors, depth_vectors = arch_vectors['width'], arch_vectors['depth']
 
         for b in self.resnets:
-
-            assert hasattr(b, "get_gate_structure")
             b_structure = b.get_gate_structure()
-            assert len(b_structure) == 2
             block_vectors = {'width': [], 'depth': []}
             for i in range(len(b_structure['width'])):
-                b_structure['width'][i] == width_vectors[0].shape[1]
+                assert b_structure['width'][i] == width_vectors[0].shape[1]
                 block_vectors['width'].append(width_vectors.pop(0))
             for i in range(len(b_structure['depth'])):
                 if b_structure['depth'][i] == 1:
@@ -2334,12 +2312,10 @@ class DownBlock2DWidthHalfDepthGated(DownBlock2D):
 
         width_vectors, depth_vectors = arch_vectors['width'], arch_vectors['depth']
         for b in self.resnets:
-            assert hasattr(b, "get_gate_structure")
             b_structure = b.get_gate_structure()
-            assert len(b_structure) == 2
             block_vectors = {'width': [], 'depth': []}
             for i in range(len(b_structure['width'])):
-                b_structure['width'][i] == width_vectors[0].shape[1]
+                assert b_structure['width'][i] == width_vectors[0].shape[1]
                 block_vectors['width'].append(width_vectors.pop(0))
             for i in range(len(b_structure['depth'])):
                 if b_structure['depth'][i] == 1:
@@ -2464,12 +2440,10 @@ class UpBlock2DWidthHalfDepthGated(UpBlock2D):
 
         width_vectors, depth_vectors = arch_vectors['width'], arch_vectors['depth']
         for b in self.resnets:
-            assert hasattr(b, "get_gate_structure")
             b_structure = b.get_gate_structure()
-            assert len(b_structure) == 2
             block_vectors = {'width': [], 'depth': []}
             for i in range(len(b_structure['width'])):
-                b_structure['width'][i] == width_vectors[0].shape[1]
+                assert b_structure['width'][i] == width_vectors[0].shape[1]
                 block_vectors['width'].append(width_vectors.pop(0))
             for i in range(len(b_structure['depth'])):
                 if b_structure['depth'][i] == 1:
@@ -2530,7 +2504,6 @@ class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
             upcast_attention: bool = False,
             attention_type: str = "default",
             gated_ff: bool = False,
-            width_gating: bool = True,
             ff_gate_width: int = 32
     ):
         super().__init__(in_channels=in_channels, temb_channels=temb_channels, dropout=dropout, num_layers=num_layers,
@@ -2633,13 +2606,10 @@ class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
         width_vectors, depth_vectors = arch_vectors['width'], arch_vectors['depth']
 
         for b in self.resnets:
-
-            assert hasattr(b, "get_gate_structure")
             b_structure = b.get_gate_structure()
-            assert len(b_structure) == 2
             block_vectors = {'width': [], 'depth': []}
             for i in range(len(b_structure['width'])):
-                b_structure['width'][i] == width_vectors[0].shape[1]
+                assert b_structure['width'][i] == width_vectors[0].shape[1]
                 block_vectors['width'].append(width_vectors.pop(0))
             for i in range(len(b_structure['depth'])):
                 if b_structure['depth'][i] == 1:

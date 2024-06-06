@@ -322,7 +322,7 @@ def attention_counter_hook(attention_module, input, output):
 
     # NormCross
     if attention_module.norm_cross:
-       total_flops += attention_module.norm_cross.__flops__
+        total_flops += attention_module.norm_cross.__flops__
 
     # to_q
     total_flops += attention_module.to_q.__flops__
@@ -332,7 +332,6 @@ def attention_counter_hook(attention_module, input, output):
 
     # to_v
     total_flops += attention_module.to_v.__flops__
-
 
     attn_flops = 0
     batch_size, seq_len, dim = output.shape

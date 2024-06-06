@@ -823,7 +823,7 @@ class Pruner(Trainer):
 
     def init_losses(self):
         resource_loss = ResourceLoss(p=self.config.training.losses.resource_loss.pruning_target,
-                                     loss_type=self.config.training.losses.resource_loss.pruning_type)
+                                     loss_type=self.config.training.losses.resource_loss.type)
 
         contrastive_loss = ContrastiveLoss(
             arch_vector_temperature=self.config.training.losses.contrastive_loss.arch_vector_temperature,
