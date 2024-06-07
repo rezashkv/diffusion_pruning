@@ -35,7 +35,7 @@ class GEGLUGated(GEGLU):
         super().__init__(dim_in, dim_out)
         self.dim_out = dim_out
         self.gate = LinearWidthGate(gate_width)
-        self.total_flops, self.prunable_flops = 0., 0.
+        self.total_macs, self.prunable_macs = 0., 0.
         self.pruned = False
 
     def forward(self, hidden_states, scale: float = 1.0):
@@ -98,24 +98,25 @@ class FeedForwardWidthGated(FeedForward):
         act_fn = GEGLUGated(dim, inner_dim, gate_width=gate_width)
         self.net[0] = act_fn
         self.structure = {'width': [], 'depth': []}
-        self.prunable_flops, self.total_flops = 0., 0.
+        self.prunable_macs, self.total_macs = 0., 0.
 
-    def calc_flops(self):
-        if self.total_flops == 0.:
+    def calc_macs(self):
+        if self.total_macs == 0. or self.prunable_macs == 0.:
+            self.total_macs, self.prunable_macs = 0., 0.
             # GEGLU
-            self.total_flops += self.net[0].proj.__flops__
-            self.prunable_flops += self.net[0].proj.__flops__
+            self.total_macs += self.net[0].proj.__macs__
+            self.prunable_macs += self.net[0].proj.__macs__
 
             # Linear
-            self.total_flops += self.net[2].__flops__
-            self.prunable_flops += self.net[2].__flops__
+            self.total_macs += self.net[2].__macs__
+            self.prunable_macs += self.net[2].__macs__
 
         hard_width_gate = hard_concrete(self.net[0].gate.gate_f)
         ratio = hard_width_gate.sum(dim=1, keepdim=True) / hard_width_gate.shape[1]
-        return {"prunable_flops": self.prunable_flops,
-                "total_flops": self.total_flops,
-                "cur_prunable_flops": ratio * self.prunable_flops,
-                "cur_total_flops": ratio.detach() * self.prunable_flops + (self.total_flops - self.prunable_flops)}
+        return {"prunable_macs": self.prunable_macs,
+                "total_macs": self.total_macs,
+                "cur_prunable_macs": ratio * self.prunable_macs,
+                "cur_total_macs": ratio.detach() * self.prunable_macs + (self.total_macs - self.prunable_macs)}
 
     @torch.no_grad()
     def prune(self):
@@ -137,17 +138,17 @@ class GatedAttention(Attention):
         super().__init__(*args, **kwargs)
         self.gate = WidthGate(self.heads)
         self.set_processor(HeadGatedAttnProcessor2())
-        self.prunable_flops, self.total_flops = 0., 0.
+        self.prunable_macs, self.total_macs = 0., 0.
         self.pruned = False
 
-    def calc_flops(self):
-        assert ((self.total_flops != 0.) and (self.prunable_flops != 0.))
+    def calc_macs(self):
+        assert ((self.total_macs != 0.) and (self.prunable_macs != 0.))
         hard_width_gate = hard_concrete(self.gate.gate_f)
         ratio = hard_width_gate.sum(dim=1, keepdim=True) / hard_width_gate.shape[1]
-        return {"prunable_flops": self.prunable_flops,
-                "total_flops": self.total_flops,
-                "cur_prunable_flops": ratio * self.prunable_flops,
-                "cur_total_flops": ratio.detach() * self.prunable_flops + (self.total_flops - self.prunable_flops)}
+        return {"prunable_macs": self.prunable_macs,
+                "total_macs": self.total_macs,
+                "cur_prunable_macs": ratio * self.prunable_macs,
+                "cur_total_macs": ratio.detach() * self.prunable_macs + (self.total_macs - self.prunable_macs)}
 
     @torch.no_grad()
     def prune(self):
@@ -286,7 +287,7 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
         self.gate = WidthGate(self.norm2.num_groups)
         self.is_input_concatenated = is_input_concatenated
         self.structure = {'width': [], 'depth': []}
-        self.prunable_flops, self.total_flops = 0., 0.
+        self.prunable_macs, self.total_macs = 0., 0.
         self.pruned = False
 
     def forward(self, input_tensor, temb, scale: float = 1.0):
@@ -380,41 +381,42 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
         assert arch_vectors['width'][0].shape[1] == self.gate.width
         self.gate.set_structure_value(arch_vectors['width'][0])
 
-    def calc_flops(self):
-        if self.total_flops == 0.:
+    def calc_macs(self):
+        if self.total_macs == 0. or self.prunable_macs == 0.:
+            self.total_macs, self.prunable_macs = 0., 0.
             # First GroupNorm
-            self.total_flops += self.norm1.__flops__
+            self.total_macs += self.norm1.__macs__
 
             # Conv1
-            self.total_flops += self.conv1.__flops__
-            self.prunable_flops += self.conv1.__flops__
+            self.total_macs += self.conv1.__macs__
+            self.prunable_macs += self.conv1.__macs__
 
             # Time Embedding
             if self.time_emb_proj is not None:  # not necessary as it is always not None in the SD model
-                self.total_flops += self.time_emb_proj.__flops__
-                self.prunable_flops += self.time_emb_proj.__flops__
+                self.total_macs += self.time_emb_proj.__macs__
+                self.prunable_macs += self.time_emb_proj.__macs__
 
             # 2nd GroupNorm
-            self.total_flops += self.norm2.__flops__
-            self.prunable_flops += self.norm2.__flops__
+            self.total_macs += self.norm2.__macs__
+            self.prunable_macs += self.norm2.__macs__
 
             # Conv2
-            self.total_flops += self.conv2.__flops__
-            self.prunable_flops += self.conv2.__flops__
+            self.total_macs += self.conv2.__macs__
+            self.prunable_macs += self.conv2.__macs__
 
             # Skip Connection
             if self.conv_shortcut is not None:
-                self.total_flops += self.conv_shortcut.__flops__
+                self.total_macs += self.conv_shortcut.__macs__
 
         hard_width_gate = hard_concrete(self.gate.gate_f)
         ratio = hard_width_gate.sum(dim=1, keepdim=True) / hard_width_gate.shape[1]
-        return {"prunable_flops": self.prunable_flops,
-                "total_flops": self.total_flops,
-                "cur_prunable_flops": ratio * self.prunable_flops,
-                "cur_total_flops": (ratio.detach()) * self.prunable_flops + (self.total_flops - self.prunable_flops)}
+        return {"prunable_macs": self.prunable_macs,
+                "total_macs": self.total_macs,
+                "cur_prunable_macs": ratio * self.prunable_macs,
+                "cur_total_macs": (ratio.detach()) * self.prunable_macs + (self.total_macs - self.prunable_macs)}
 
-    def get_prunable_flops(self):
-        return [self.prunable_flops]
+    def get_prunable_macs(self):
+        return [self.prunable_macs]
 
     @torch.no_grad()
     def prune(self):
@@ -470,7 +472,7 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         self.is_input_concatenated = is_input_concatenated
         self.skip_connection_dim = skip_connection_dim
         self.structure = {'width': [], 'depth': []}
-        self.prunable_flops, self.total_flops = 0., 0.
+        self.prunable_macs, self.total_macs = 0., 0.
         self.dropped = False
         self.pruned = False
 
@@ -590,44 +592,45 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         self.gate.set_structure_value(arch_vectors['width'][0])
         self.depth_gate.set_structure_value(arch_vectors['depth'][0])
 
-    def calc_flops(self):
-        if self.total_flops == 0.:
+    def calc_macs(self):
+        if self.total_macs == 0. or self.prunable_macs == 0.:
+            self.total_macs, self.prunable_macs = 0., 0.
             # First GroupNorm
-            self.total_flops += self.norm1.__flops__
+            self.total_macs += self.norm1.__macs__
 
             # Conv1
-            self.total_flops += self.conv1.__flops__
-            self.prunable_flops += self.conv1.__flops__
+            self.total_macs += self.conv1.__macs__
+            self.prunable_macs += self.conv1.__macs__
 
             # Time Embedding
-            self.total_flops += self.time_emb_proj.__flops__
-            self.prunable_flops += self.time_emb_proj.__flops__
+            self.total_macs += self.time_emb_proj.__macs__
+            self.prunable_macs += self.time_emb_proj.__macs__
 
             # 2nd GroupNorm
-            self.total_flops += self.norm2.__flops__
-            self.prunable_flops += self.norm2.__flops__
+            self.total_macs += self.norm2.__macs__
+            self.prunable_macs += self.norm2.__macs__
 
             # Conv2
-            self.total_flops += self.conv2.__flops__
-            self.prunable_flops += self.conv2.__flops__
+            self.total_macs += self.conv2.__macs__
+            self.prunable_macs += self.conv2.__macs__
 
             # Skip Connection
             if self.conv_shortcut is not None:
-                self.total_flops += self.conv_shortcut.__flops__
+                self.total_macs += self.conv_shortcut.__macs__
 
         hard_width_gate = hard_concrete(self.gate.gate_f)
         ratio = hard_width_gate.sum(dim=1, keepdim=True) / hard_width_gate.shape[1]
         depth_hard_gate = hard_concrete(self.depth_gate.gate_f).unsqueeze(1)
         depth_ratio = depth_hard_gate.sum(dim=1, keepdim=True) / depth_hard_gate.shape[1]
-        return {"prunable_flops": self.prunable_flops,
-                "total_flops": self.total_flops,
-                "cur_prunable_flops": ((ratio * self.prunable_flops) + (
-                        self.total_flops - self.prunable_flops)) * depth_ratio,
-                "cur_total_flops": ((ratio.detach()) * self.prunable_flops + (
-                        self.total_flops - self.prunable_flops)) * (depth_ratio.detach())}
+        return {"prunable_macs": self.prunable_macs,
+                "total_macs": self.total_macs,
+                "cur_prunable_macs": ((ratio * self.prunable_macs) + (
+                        self.total_macs - self.prunable_macs)) * depth_ratio,
+                "cur_total_macs": ((ratio.detach()) * self.prunable_macs + (
+                        self.total_macs - self.prunable_macs)) * (depth_ratio.detach())}
 
-    def get_prunable_flops(self):
-        return [self.prunable_flops]
+    def get_prunable_macs(self):
+        return [self.prunable_macs]
 
     @torch.no_grad()
     def prune(self):
@@ -749,7 +752,7 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
             self.ff = FeedForward(dim, dropout=dropout, activation_fn=activation_fn, final_dropout=final_dropout)
 
         self.structure = {'width': [], 'depth': []}
-        self.prunable_flops, self.total_flops = 0., 0.
+        self.prunable_macs, self.total_macs = 0., 0.
 
     def forward(
             self,
@@ -867,51 +870,51 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
             assert arch_vectors['width'][2].shape[1] == self.ff.net[0].gate.width
             self.ff.net[0].gate.set_structure_value(arch_vectors['width'][2])
 
-    def calc_flops(self):
-        out_dict = {"prunable_flops": 0., "total_flops": 0., "cur_prunable_flops": 0., "cur_total_flops": 0.}
+    def calc_macs(self):
+        out_dict = {"prunable_macs": 0., "total_macs": 0., "cur_prunable_macs": 0., "cur_total_macs": 0.}
 
         # Norm1
-        out_dict["total_flops"] += self.norm1.__flops__
-        out_dict["cur_total_flops"] += self.norm1.__flops__
+        out_dict["total_macs"] += self.norm1.__macs__
+        out_dict["cur_total_macs"] += self.norm1.__macs__
 
         # Attention1
-        attn1_flops = self.attn1.calc_flops()
+        attn1_macs = self.attn1.calc_macs()
         for k in out_dict.keys():
-            out_dict[k] = out_dict[k] + attn1_flops[k]
+            out_dict[k] = out_dict[k] + attn1_macs[k]
 
         # Norm2
-        out_dict["total_flops"] += self.norm2.__flops__
-        out_dict["cur_total_flops"] += self.norm2.__flops__
+        out_dict["total_macs"] += self.norm2.__macs__
+        out_dict["cur_total_macs"] += self.norm2.__macs__
 
         # Attention2
         if self.attn2 is not None:
-            attn2_flops = self.attn2.calc_flops()
+            attn2_macs = self.attn2.calc_macs()
             for k in out_dict.keys():
-                out_dict[k] = out_dict[k] + attn2_flops[k]
+                out_dict[k] = out_dict[k] + attn2_macs[k]
 
         # Norm3
-        out_dict["total_flops"] += self.norm3.__flops__
-        out_dict["cur_total_flops"] += self.norm3.__flops__
+        out_dict["total_macs"] += self.norm3.__macs__
+        out_dict["cur_total_macs"] += self.norm3.__macs__
 
         # FeedForward
         if self.gated_ff:
-            ff_flops = self.ff.calc_flops()
+            ff_macs = self.ff.calc_macs()
             for k in out_dict.keys():
-                out_dict[k] = out_dict[k] + ff_flops[k]
+                out_dict[k] = out_dict[k] + ff_macs[k]
 
-        if self.total_flops == 0.:
-            self.total_flops = out_dict["total_flops"]
+        if self.total_macs == 0.:
+            self.total_macs = out_dict["total_macs"]
 
-        if self.prunable_flops == 0.:
-            self.prunable_flops = out_dict["prunable_flops"]
+        if self.prunable_macs == 0.:
+            self.prunable_macs = out_dict["prunable_macs"]
 
         return out_dict
 
-    def get_prunable_flops(self):
-        flops = [self.attn1.prunable_flops, self.attn2.prunable_flops]
+    def get_prunable_macs(self):
+        macs = [self.attn1.prunable_macs, self.attn2.prunable_macs]
         if self.gated_ff:
-            flops.append(self.ff.prunable_flops)
-        return flops
+            macs.append(self.ff.prunable_macs)
+        return macs
 
 
 class Transformer2DModelWidthGated(Transformer2DModel):
@@ -978,7 +981,7 @@ class Transformer2DModelWidthGated(Transformer2DModel):
             ]
         )
         self.structure = {'width': [], 'depth': []}
-        self.prunable_flops, self.total_flops = 0., 0.
+        self.prunable_macs, self.total_macs = 0., 0.
 
     def get_gate_structure(self):
         if len(self.structure['width']) == 0:
@@ -997,44 +1000,44 @@ class Transformer2DModelWidthGated(Transformer2DModel):
         assert len(arch_vectors['depth']) == 0
         self.transformer_blocks[0].set_gate_structure(arch_vectors)
 
-    def calc_flops(self):
-        out_dict = {"prunable_flops": 0., "total_flops": 0., "cur_prunable_flops": 0., "cur_total_flops": 0.}
+    def calc_macs(self):
+        out_dict = {"prunable_macs": 0., "total_macs": 0., "cur_prunable_macs": 0., "cur_total_macs": 0.}
 
         # Input
         if self.is_input_continuous:
             # Norm
-            out_dict["total_flops"] += self.norm.__flops__
-            out_dict["cur_total_flops"] += self.norm.__flops__
+            out_dict["total_macs"] += self.norm.__macs__
+            out_dict["cur_total_macs"] += self.norm.__macs__
 
             # proj_in (conv or linear)
-            out_dict["total_flops"] += self.proj_in.__flops__
-            out_dict["cur_total_flops"] += self.proj_in.__flops__
+            out_dict["total_macs"] += self.proj_in.__macs__
+            out_dict["cur_total_macs"] += self.proj_in.__macs__
 
         # Transformer blocks
         for tb in self.transformer_blocks:
-            tb_flops = tb.calc_flops()
+            tb_macs = tb.calc_macs()
             for k in out_dict.keys():
-                out_dict[k] = out_dict[k] + tb_flops[k]
+                out_dict[k] = out_dict[k] + tb_macs[k]
 
         # Output
         if self.is_input_continuous:
             # proj_out (conv or linear)
-            out_dict["total_flops"] += self.proj_out.__flops__
-            out_dict["cur_total_flops"] += self.proj_out.__flops__
+            out_dict["total_macs"] += self.proj_out.__macs__
+            out_dict["cur_total_macs"] += self.proj_out.__macs__
 
-        if self.total_flops == 0.:
-            self.total_flops = out_dict["total_flops"]
+        if self.total_macs == 0.:
+            self.total_macs = out_dict["total_macs"]
 
-        if self.prunable_flops == 0:
-            self.prunable_flops = out_dict["prunable_flops"]
+        if self.prunable_macs == 0:
+            self.prunable_macs = out_dict["prunable_macs"]
 
         return out_dict
 
-    def get_prunable_flops(self):
-        flops = []
+    def get_prunable_macs(self):
+        macs = []
         for tb in self.transformer_blocks:
-            flops += tb.get_prunable_flops()
-        return flops
+            macs += tb.get_prunable_macs()
+        return macs
 
 
 class Transformer2DModelWidthDepthGated(Transformer2DModel):
@@ -1103,7 +1106,7 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
 
         self.depth_gate = DepthGate(1)
         self.structure = {'width': [], 'depth': []}
-        self.prunable_flops, self.total_flops = 0., 0.
+        self.prunable_macs, self.total_macs = 0., 0.
         self.dropped, self.pruned = False, False
 
     def forward(
@@ -1340,53 +1343,53 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
         self.depth_gate.set_structure_value(arch_vectors['depth'][0])
         self.transformer_blocks[0].set_gate_structure({'width': arch_vectors['width'], 'depth': []})
 
-    def calc_flops(self):
-        out_dict = {"prunable_flops": 0., "total_flops": 0., "cur_prunable_flops": 0., "cur_total_flops": 0.}
+    def calc_macs(self):
+        out_dict = {"prunable_macs": 0., "total_macs": 0., "cur_prunable_macs": 0., "cur_total_macs": 0.}
 
         # Input
         if self.is_input_continuous:
             # Norm
-            out_dict["total_flops"] += self.norm.__flops__
-            out_dict["cur_total_flops"] += self.norm.__flops__
+            out_dict["total_macs"] += self.norm.__macs__
+            out_dict["cur_total_macs"] += self.norm.__macs__
 
             # proj_in (conv or linear)
-            out_dict["total_flops"] += self.proj_in.__flops__
-            out_dict["cur_total_flops"] += self.proj_in.__flops__
+            out_dict["total_macs"] += self.proj_in.__macs__
+            out_dict["cur_total_macs"] += self.proj_in.__macs__
 
         # Transformer blocks
         for tb in self.transformer_blocks:
-            tb_flops = tb.calc_flops()
+            tb_macs = tb.calc_macs()
             for k in out_dict.keys():
-                out_dict[k] = out_dict[k] + tb_flops[k]
+                out_dict[k] = out_dict[k] + tb_macs[k]
 
         # Output
         if self.is_input_continuous:
             # proj_out (conv or linear)
-            out_dict["total_flops"] += self.proj_out.__flops__
-            out_dict["cur_total_flops"] += self.proj_out.__flops__
+            out_dict["total_macs"] += self.proj_out.__macs__
+            out_dict["cur_total_macs"] += self.proj_out.__macs__
 
         # return out_dict
 
         depth_hard_gate = hard_concrete(self.depth_gate.gate_f).unsqueeze(1)
         depth_ratio = depth_hard_gate.sum(dim=1, keepdim=True) / depth_hard_gate.shape[1]
 
-        if self.total_flops == 0.:
-            self.total_flops = out_dict["total_flops"]
+        if self.total_macs == 0.:
+            self.total_macs = out_dict["total_macs"]
 
-        if self.prunable_flops == 0:
-            self.prunable_flops = out_dict["prunable_flops"]
+        if self.prunable_macs == 0:
+            self.prunable_macs = out_dict["prunable_macs"]
 
-        out_dict["cur_prunable_flops"] = ((out_dict["cur_prunable_flops"] + self.total_flops - self.prunable_flops)
+        out_dict["cur_prunable_macs"] = ((out_dict["cur_prunable_macs"] + self.total_macs - self.prunable_macs)
                                           * depth_ratio)
-        out_dict["cur_total_flops"] = out_dict["cur_total_flops"] * (depth_ratio.detach())
+        out_dict["cur_total_macs"] = out_dict["cur_total_macs"] * (depth_ratio.detach())
 
         return out_dict
 
-    def get_prunable_flops(self):
-        flops = []
+    def get_prunable_macs(self):
+        macs = []
         for tb in self.transformer_blocks:
-            flops += tb.get_prunable_flops()
-        return flops
+            macs += tb.get_prunable_macs()
+        return macs
 
     @torch.no_grad()
     def prune_module(self):
@@ -1773,7 +1776,7 @@ class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
         self.structure = {'width': [], 'depth': []}
-        self.total_flops, self.prunable_flops = 0., 0.
+        self.total_macs, self.prunable_macs = 0., 0.
 
     def get_gate_structure(self):
         if len(self.structure['width']) == 0:
@@ -1824,43 +1827,43 @@ class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
                     block_vectors['depth'].append(depth_vectors.pop(0))
             b.set_gate_structure(block_vectors)
 
-    def calc_flops(self):
-        out_dict = {"prunable_flops": 0., "total_flops": 0., "cur_prunable_flops": 0., "cur_total_flops": 0.}
+    def calc_macs(self):
+        out_dict = {"prunable_macs": 0., "total_macs": 0., "cur_prunable_macs": 0., "cur_total_macs": 0.}
 
         blocks = list(zip(self.resnets, self.attentions))
         for (resnet, attention) in blocks:
-            resnet_flops = resnet.calc_flops()
+            resnet_macs = resnet.calc_macs()
 
             for k in out_dict.keys():
-                out_dict[k] = out_dict[k] + resnet_flops[k]
+                out_dict[k] = out_dict[k] + resnet_macs[k]
 
-            attention_flops = attention.calc_flops()
+            attention_macs = attention.calc_macs()
 
             for k in out_dict.keys():
-                out_dict[k] = out_dict[k] + attention_flops[k]
+                out_dict[k] = out_dict[k] + attention_macs[k]
 
         for b in self.downsamplers:
-            b_flops = 0
+            b_macs = 0
             for m in b.children():
-                b_flops += m.__flops__
-            out_dict["total_flops"] += b_flops
-            out_dict["cur_total_flops"] += b_flops
+                b_macs += m.__macs__
+            out_dict["total_macs"] += b_macs
+            out_dict["cur_total_macs"] += b_macs
 
-        if self.total_flops == 0.:
-            self.total_flops = out_dict["total_flops"]
+        if self.total_macs == 0.:
+            self.total_macs = out_dict["total_macs"]
 
-        if self.prunable_flops == 0:
-            self.prunable_flops = out_dict["prunable_flops"]
+        if self.prunable_macs == 0:
+            self.prunable_macs = out_dict["prunable_macs"]
 
         return out_dict
 
-    def get_prunable_flops(self):
-        flops = []
+    def get_prunable_macs(self):
+        macs = []
         for b in self.resnets:
-            flops.append(b.get_prunable_flops())
+            macs.append(b.get_prunable_macs())
         for b in self.attentions:
-            flops.append(b.get_prunable_flops())
-        return flops
+            macs.append(b.get_prunable_macs())
+        return macs
 
 
 class CrossAttnUpBlock2DWidthDepthGated(CrossAttnUpBlock2D):
@@ -2096,7 +2099,7 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
         self.structure = {'width': [], 'depth': []}
-        self.total_flops, self.prunable_flops = 0., 0.
+        self.total_macs, self.prunable_macs = 0., 0.
 
     def get_gate_structure(self):
         if len(self.structure['width']) == 0:
@@ -2147,44 +2150,44 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
                     block_vectors['depth'].append(depth_vectors.pop(0))
             b.set_gate_structure(block_vectors)
 
-    def calc_flops(self):
-        out_dict = {"prunable_flops": 0., "total_flops": 0., "cur_prunable_flops": 0., "cur_total_flops": 0.}
+    def calc_macs(self):
+        out_dict = {"prunable_macs": 0., "total_macs": 0., "cur_prunable_macs": 0., "cur_total_macs": 0.}
 
         blocks = list(zip(self.resnets, self.attentions))
         for (resnet, attention) in blocks:
-            resnet_flops = resnet.calc_flops()
+            resnet_macs = resnet.calc_macs()
 
             for k in out_dict.keys():
-                out_dict[k] = out_dict[k] + resnet_flops[k]
+                out_dict[k] = out_dict[k] + resnet_macs[k]
 
-            attention_flops = attention.calc_flops()
+            attention_macs = attention.calc_macs()
 
             for k in out_dict.keys():
-                out_dict[k] = out_dict[k] + attention_flops[k]
+                out_dict[k] = out_dict[k] + attention_macs[k]
 
         if self.upsamplers:
             for b in self.upsamplers:
-                b_flops = 0
+                b_macs = 0
                 for m in b.children():
-                    b_flops += m.__flops__
-                out_dict["total_flops"] += b_flops
-                out_dict["cur_total_flops"] += b_flops
+                    b_macs += m.__macs__
+                out_dict["total_macs"] += b_macs
+                out_dict["cur_total_macs"] += b_macs
 
-        if self.total_flops == 0.:
-            self.total_flops = out_dict["total_flops"]
+        if self.total_macs == 0.:
+            self.total_macs = out_dict["total_macs"]
 
-        if self.prunable_flops == 0:
-            self.prunable_flops = out_dict["prunable_flops"]
+        if self.prunable_macs == 0:
+            self.prunable_macs = out_dict["prunable_macs"]
 
         return out_dict
 
-    def get_prunable_flops(self):
-        flops = []
+    def get_prunable_macs(self):
+        macs = []
         for b in self.resnets:
-            flops.append(b.get_prunable_flops())
+            macs.append(b.get_prunable_macs())
         for b in self.attentions:
-            flops.append(b.get_prunable_flops())
-        return flops
+            macs.append(b.get_prunable_macs())
+        return macs
 
 
 class DownBlock2DWidthDepthGated(DownBlock2D):
@@ -2294,7 +2297,7 @@ class DownBlock2DWidthHalfDepthGated(DownBlock2D):
 
         self.resnets = nn.ModuleList(resnets)
         self.structure = {'width': [], 'depth': []}
-        self.total_flops, self.prunable_flops = 0., 0.
+        self.total_macs, self.prunable_macs = 0., 0.
 
     def get_gate_structure(self):
         if len(self.structure['width']) == 0:
@@ -2322,37 +2325,37 @@ class DownBlock2DWidthHalfDepthGated(DownBlock2D):
                     block_vectors['depth'].append(depth_vectors.pop(0))
             b.set_gate_structure(block_vectors)
 
-    def calc_flops(self):
-        out_dict = {"prunable_flops": 0., "total_flops": 0., "cur_prunable_flops": 0., "cur_total_flops": 0.}
+    def calc_macs(self):
+        out_dict = {"prunable_macs": 0., "total_macs": 0., "cur_prunable_macs": 0., "cur_total_macs": 0.}
 
         for resnet in self.resnets:
-            resnet_flops = resnet.calc_flops()
+            resnet_macs = resnet.calc_macs()
 
             for k in out_dict.keys():
-                out_dict[k] = out_dict[k] + resnet_flops[k]
+                out_dict[k] = out_dict[k] + resnet_macs[k]
 
         if self.downsamplers is not None:
             for b in self.downsamplers:
-                b_flops = 0
+                b_macs = 0
                 for m in b.children():
-                    b_flops += m.__flops__
+                    b_macs += m.__macs__
 
-                out_dict["total_flops"] += b_flops
-                out_dict["cur_total_flops"] += b_flops
+                out_dict["total_macs"] += b_macs
+                out_dict["cur_total_macs"] += b_macs
 
-        if self.total_flops == 0.:
-            self.total_flops = out_dict["total_flops"]
+        if self.total_macs == 0.:
+            self.total_macs = out_dict["total_macs"]
 
-        if self.prunable_flops == 0:
-            self.prunable_flops = out_dict["prunable_flops"]
+        if self.prunable_macs == 0:
+            self.prunable_macs = out_dict["prunable_macs"]
 
         return out_dict
 
-    def get_prunable_flops(self):
-        flops = []
+    def get_prunable_macs(self):
+        macs = []
         for b in self.resnets:
-            flops.append(b.get_prunable_flops())
-        return flops
+            macs.append(b.get_prunable_macs())
+        return macs
 
 
 class UpBlock2DWidthHalfDepthGated(UpBlock2D):
@@ -2422,7 +2425,7 @@ class UpBlock2DWidthHalfDepthGated(UpBlock2D):
 
         self.resnets = nn.ModuleList(resnets)
         self.structure = {'width': [], 'depth': []}
-        self.total_flops, self.prunable_flops = 0., 0.
+        self.total_macs, self.prunable_macs = 0., 0.
 
     def get_gate_structure(self):
         if len(self.structure['width']) == 0:
@@ -2450,37 +2453,37 @@ class UpBlock2DWidthHalfDepthGated(UpBlock2D):
                     block_vectors['depth'].append(depth_vectors.pop(0))
             b.set_gate_structure(block_vectors)
 
-    def calc_flops(self):
-        out_dict = {"prunable_flops": 0., "total_flops": 0., "cur_prunable_flops": 0., "cur_total_flops": 0.}
+    def calc_macs(self):
+        out_dict = {"prunable_macs": 0., "total_macs": 0., "cur_prunable_macs": 0., "cur_total_macs": 0.}
 
         for resnet in self.resnets:
-            resnet_flops = resnet.calc_flops()
+            resnet_macs = resnet.calc_macs()
 
             for k in out_dict.keys():
-                out_dict[k] = out_dict[k] + resnet_flops[k]
+                out_dict[k] = out_dict[k] + resnet_macs[k]
 
         if self.upsamplers is not None:
             for b in self.upsamplers:
-                b_flops = 0
+                b_macs = 0
                 for m in b.children():
-                    b_flops += m.__flops__
+                    b_macs += m.__macs__
 
-                out_dict["total_flops"] += b_flops
-                out_dict["cur_total_flops"] += b_flops
+                out_dict["total_macs"] += b_macs
+                out_dict["cur_total_macs"] += b_macs
 
-        if self.total_flops == 0.:
-            self.total_flops = out_dict["total_flops"]
+        if self.total_macs == 0.:
+            self.total_macs = out_dict["total_macs"]
 
-        if self.prunable_flops == 0:
-            self.prunable_flops = out_dict["prunable_flops"]
+        if self.prunable_macs == 0:
+            self.prunable_macs = out_dict["prunable_macs"]
 
         return out_dict
 
-    def get_prunable_flops(self):
-        flops = []
+    def get_prunable_macs(self):
+        macs = []
         for b in self.resnets:
-            flops.append(b.get_prunable_flops())
-        return flops
+            macs.append(b.get_prunable_macs())
+        return macs
 
 
 class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
@@ -2579,7 +2582,7 @@ class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
         self.structure = {'width': [], 'depth': []}
-        self.total_flops, self.prunable_flops = 0., 0.
+        self.total_macs, self.prunable_macs = 0., 0.
 
     def get_gate_structure(self):
         if len(self.structure['width']) == 0:
@@ -2630,31 +2633,31 @@ class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
                     block_vectors['depth'].append(depth_vectors.pop(0))
             b.set_gate_structure(block_vectors)
 
-    def calc_flops(self):
-        out_dict = {"prunable_flops": 0., "total_flops": 0., "cur_prunable_flops": 0., "cur_total_flops": 0.}
+    def calc_macs(self):
+        out_dict = {"prunable_macs": 0., "total_macs": 0., "cur_prunable_macs": 0., "cur_total_macs": 0.}
 
         for resnet in self.resnets:
-            resnet_flops = resnet.calc_flops()
+            resnet_macs = resnet.calc_macs()
             for k in out_dict.keys():
-                out_dict[k] = out_dict[k] + resnet_flops[k]
+                out_dict[k] = out_dict[k] + resnet_macs[k]
 
         for attention in self.attentions:
-            attention_flops = attention.calc_flops()
+            attention_macs = attention.calc_macs()
             for k in out_dict.keys():
-                out_dict[k] = out_dict[k] + attention_flops[k]
+                out_dict[k] = out_dict[k] + attention_macs[k]
 
-        if self.total_flops == 0.:
-            self.total_flops = out_dict["total_flops"]
+        if self.total_macs == 0.:
+            self.total_macs = out_dict["total_macs"]
 
-        if self.prunable_flops == 0:
-            self.prunable_flops = out_dict["prunable_flops"]
+        if self.prunable_macs == 0:
+            self.prunable_macs = out_dict["prunable_macs"]
 
         return out_dict
 
-    def get_prunable_flops(self):
-        flops = []
+    def get_prunable_macs(self):
+        macs = []
         for b in self.resnets:
-            flops.append(b.get_prunable_flops())
+            macs.append(b.get_prunable_macs())
         for b in self.attentions:
-            flops.append(b.get_prunable_flops())
-        return flops
+            macs.append(b.get_prunable_macs())
+        return macs

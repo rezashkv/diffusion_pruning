@@ -12,15 +12,14 @@ from accelerate.logging import get_logger
 from diffusers import UNet2DConditionModel
 from diffusers.utils import check_min_version
 
-from transformers import CLIPTextModel,AutoModel
+from transformers import CLIPTextModel, AutoModel
 from transformers.utils import ContextManagers
 
 from pdm.models.unet import UNet2DConditionModelGated
 from pdm.models import HyperStructure, StructureVectorQuantizer
 from pdm.utils.arg_utils import parse_args
-from pdm.utils.op_counter_orig import count_ops_and_params
+from pdm.utils.op_counter import count_ops_and_params
 from pdm.utils.dist_utils import deepspeed_zero_init_disabled_context_manager
-
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.22.0.dev0")
@@ -80,13 +79,7 @@ def main():
         ff_gate_width=config.model.unet.ff_gate_width
     )
 
-    mpnet_model = AutoModel.from_pretrained('sentence-transformers/all-mpnet-base-v2')
-
-    unet_structure = unet.get_structure()
-    hyper_net = HyperStructure(input_dim=mpnet_model.config.hidden_size,
-                               structure=unet_structure,
-                               wn_flag=config.model.hypernet.weight_norm,
-                               linear_bias=config.model.hypernet.linear_bias)
+    hyper_net = HyperStructure.from_pretrained(config.pruning_ckpt_dir, subfolder="hypernet")
 
     if config.pruning_type == "multi-expert":
         embeddings_gs = torch.load(os.path.join(config.pruning_ckpt_dir, "quantizer_embeddings.pt"), map_location="cpu")
@@ -99,21 +92,21 @@ def main():
 
     unet.set_structure(arch_vecs_separated)
 
-    flops, params = count_ops_and_params(unet, sample_inputs)
+    macs, params = count_ops_and_params(unet, sample_inputs)
 
     logging.info(
         "Full UNet's Params/MACs calculated by OpCounter:\tparams: {:.3f}M\t MACs: {:.3f}G".format(
-            params / 1e6, flops / 1e9))
+            params / 1e6, macs / 1e9))
 
-    sanity_flops_dict = unet.calc_flops()
-    prunable_flops_list = [[e / sanity_flops_dict['prunable_flops'] for e in elem] for elem in
-                           unet.get_prunable_flops()]
+    sanity_macs_dict = unet.calc_macs()
+    prunable_macs_list = [[e / sanity_macs_dict['prunable_macs'] for e in elem] for elem in
+                          unet.get_prunable_macs()]
 
-    unet.prunable_flops_list = prunable_flops_list
-    unet.resource_info_dict = sanity_flops_dict
+    unet.prunable_macs_list = prunable_macs_list
+    unet.resource_info_dict = sanity_macs_dict
 
     sanity_string = "Our MACs calculation:\t"
-    for k, v in sanity_flops_dict.items():
+    for k, v in sanity_macs_dict.items():
         if isinstance(v, torch.Tensor):
             sanity_string += f" {k}: {v.item() / 1e9:.3f}\t"
         else:
@@ -123,8 +116,8 @@ def main():
     arch_vectors_separated = hyper_net.transform_structure_vector(embeddings_gs)
     unet.set_structure(arch_vectors_separated)
 
-    flops_dict = unet.calc_flops()
-    resource_ratios = flops_dict['cur_total_flops'] / (unet.resource_info_dict['cur_total_flops'].squeeze())
+    macs_dict = unet.calc_macs()
+    resource_ratios = macs_dict['cur_total_macs'] / (unet.resource_info_dict['cur_total_macs'].squeeze())
     logging.info(f"Resource Ratios: {resource_ratios}")
     # save the resource ratios to the checkpoint directory
     torch.save(resource_ratios, os.path.join(config.pruning_ckpt_dir, "resource_ratios.pt"))

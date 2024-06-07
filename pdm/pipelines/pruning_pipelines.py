@@ -819,9 +819,9 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
-        flops_dict = self.unet.calc_flops()
-        resource_ratios = flops_dict['cur_prunable_flops'] / (
-            self.unet.resource_info_dict['cur_prunable_flops'].squeeze())
+        macs_dict = self.unet.calc_macs()
+        resource_ratios = macs_dict['cur_prunable_macs'] / (
+            self.unet.resource_info_dict['cur_prunable_macs'].squeeze())
 
         if not output_type == "latent":
             latents = latents.to(dtype=self.vae.dtype, device=self.vae.device)
@@ -1420,9 +1420,9 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
-        flops_dict = self.unet.calc_flops()
-        resource_ratios = flops_dict['cur_prunable_flops'] / (
-            self.unet.resource_info_dict['cur_prunable_flops'].squeeze())
+        macs_dict = self.unet.calc_macs()
+        resource_ratios = macs_dict['cur_prunable_macs'] / (
+            self.unet.resource_info_dict['cur_prunable_macs'].squeeze())
 
         if not output_type == "latent":
             latents = latents.to(dtype=self.vae.dtype, device=self.vae.device)

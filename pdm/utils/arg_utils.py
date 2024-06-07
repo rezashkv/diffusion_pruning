@@ -88,8 +88,8 @@ def parse_args():
         type=str,
         default="text2image-dynamic-pruning",
         help=(
-            "The `project_name` argument passed to Accelerator.init_trackers for"
-            " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
+            "The `project_name` argument passed to Accelerator.init_trackers for more information see "
+            "https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
     parser.add_argument(
@@ -98,6 +98,11 @@ def parse_args():
         default=None,
         help="Index of the expert to finetune",
     )
+    parser.add_argument("--pruning_type",
+                        type=str,
+                        default="multi-expert",
+                        choices=["multi-expert", "single-expert"],
+                        help="Type of pruning to perform. Used in calculate_pruning_ratio.py")
     parser.add_argument(
         "--wandb_run_name",
         type=str,

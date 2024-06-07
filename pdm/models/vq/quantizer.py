@@ -72,7 +72,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
         template = torch.tensor(self.width_list + [d for d in self.depth_list if d != 0])
         template = torch.repeat_interleave(template, template).type(torch.float32)
         self.template = (1.0 / template).requires_grad_(False)
-        self.prunable_flops_template = None
+        self.prunable_macs_template = None
         if resource_aware_normalization is None:
             resource_aware_normalization = True
         self.resource_effect_normalization = resource_aware_normalization
@@ -233,7 +233,7 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
     def width_depth_normalize(self, inputs):
         self.template = self.template.to(inputs.device)
         if self.resource_effect_normalization:
-            self.prunable_flops_template = self.prunable_flops_template.to(inputs.device)
+            self.prunable_macs_template = self.prunable_macs_template.to(inputs.device)
         # Multiply the slice of the arch_vectors defined by the start and end index of the width of the block with the
         # corresponding depth element of the arch_vectors.
         inputs_clone = hard_concrete(inputs.clone())
@@ -245,18 +245,18 @@ class StructureVectorQuantizer(ModelMixin, ConfigMixin):
 
         outputs = inputs_clone * (torch.sqrt(self.template).detach())
         if self.resource_effect_normalization:
-            outputs = outputs * self.prunable_flops_template.detach()
+            outputs = outputs * self.prunable_macs_template.detach()
 
         return outputs
 
-    def set_prunable_flops_template(self, prunable_flops_list):
+    def set_prunable_macs_template(self, prunable_macs_list):
         depth_template = []
         for i, elem in enumerate(self.depth_list):
             if elem == 1:
-                depth_template.append([sum(prunable_flops_list[i])])
-        prunable_flops_list += depth_template
-        prunable_flops_list = [item for sublist in prunable_flops_list for item in sublist]
-        self.prunable_flops_template = torch.repeat_interleave(torch.tensor(prunable_flops_list),
+                depth_template.append([sum(prunable_macs_list[i])])
+        prunable_macs_list += depth_template
+        prunable_macs_list = [item for sublist in prunable_macs_list for item in sublist]
+        self.prunable_macs_template = torch.repeat_interleave(torch.tensor(prunable_macs_list),
                                                                torch.tensor(self.width_list + [1 for _ in range(
                                                                    len(depth_template))]))
 

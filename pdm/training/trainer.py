@@ -50,7 +50,7 @@ from pdm.utils import compute_snr
 from pdm.utils.data_utils import (get_dataset, get_transforms, preprocess_samples, collate_fn,
                                   preprocess_prompts, prompts_collator, filter_dataset)
 from pdm.utils.logging_utils import create_heatmap
-from pdm.utils.op_counter_orig import count_ops_and_params
+from pdm.utils.op_counter import count_ops_and_params
 from pdm.utils.dist_utils import deepspeed_zero_init_disabled_context_manager
 
 logger = get_logger(__name__)
@@ -284,7 +284,7 @@ class Trainer(ABC):
                     load_model = UNet2DConditionModelGated.from_pretrained(input_dir, subfolder="unet")
                     model.register_to_config(**load_model.config)
                     model.load_state_dict(load_model.state_dict())
-                    model.total_flops = load_model.total_flops
+                    model.total_macs = load_model.total_macs
                     del load_model
                 elif isinstance(model, HyperStructure):
                     load_model = HyperStructure.from_pretrained(input_dir, subfolder="hypernet")
@@ -890,16 +890,16 @@ class Pruner(Trainer):
 
                 # Calculating the MACs of each module of the model in the first iteration.
                 if global_step == initial_global_step:
-                    self.count_flops(batch)
+                    self.count_macs(batch)
 
-                # pruning target is for total flops. we calculate loss for prunable flops.
+                # pruning target is for total macs. we calculate loss for prunable macs.
                 if global_step == 0:
                     self.update_pruning_target()
 
                 pretrain = (self.config.training.hypernet_pretraining_steps and
                             global_step < self.config.training.hypernet_pretraining_steps)
                 (loss, diff_loss, distillation_loss, block_loss, contrastive_loss, resource_loss,
-                 arch_vectors_similarity, resource_ratio, flops_dict, arch_vector_quantized,
+                 arch_vectors_similarity, resource_ratio, macs_dict, arch_vector_quantized,
                  quantizer_embedding_pairwise_similarity, batch_resource_ratios) = self.step(batch, pretrain=pretrain)
 
                 avg_loss = loss
@@ -934,7 +934,7 @@ class Pruner(Trainer):
                         "training/quantizer_lr": self.lr_scheduler.get_last_lr()[1],
                         "training/resource_ratio": resource_ratio.detach().item(),
                     }
-                    for k, v in flops_dict.items():
+                    for k, v in macs_dict.items():
                         if isinstance(v, torch.Tensor):
                             log_dict[f"training/{k}"] = v.detach().mean().item()
                         else:
@@ -1205,21 +1205,21 @@ class Pruner(Trainer):
                                                  reduction="mean")
         block_loss /= len(student_block_activations)
 
-        flops_dict = unet_unwrapped.calc_flops()
-        curr_flops = flops_dict['cur_prunable_flops']
+        macs_dict = unet_unwrapped.calc_macs()
+        curr_macs = macs_dict['cur_prunable_macs']
 
-        # The reason is that sanity['prunable_flops'] does not have depth-related pruning
-        # flops like skip connections of resnets in it.
-        resource_ratios = (curr_flops / (
-            unet_unwrapped.resource_info_dict['cur_prunable_flops'].squeeze()))
+        # The reason is that sanity['prunable_macs'] does not have depth-related pruning
+        # macs like skip connections of resnets in it.
+        resource_ratios = (curr_macs / (
+            unet_unwrapped.resource_info_dict['cur_prunable_macs'].squeeze()))
 
         resource_loss = self.resource_loss(resource_ratios.mean())
 
         max_loss = 1. - torch.max(resource_ratios)
         std_loss = -torch.std(resource_ratios)
         with torch.no_grad():
-            batch_resource_ratios = flops_dict['cur_prunable_flops'] / (
-                unet_unwrapped.resource_info_dict['cur_prunable_flops'].squeeze())
+            batch_resource_ratios = macs_dict['cur_prunable_macs'] / (
+                unet_unwrapped.resource_info_dict['cur_prunable_macs'].squeeze())
 
         diff_loss = loss.clone().detach().mean()
         loss += self.config.training.losses.resource_loss.weight * resource_loss
@@ -1232,10 +1232,10 @@ class Pruner(Trainer):
         return (
             loss, diff_loss, distillation_loss, block_loss, contrastive_loss, resource_loss,
             arch_vectors_similarity, resource_ratios.mean(),
-            flops_dict, arch_vector_quantized, quantizer_embeddings_pairwise_similarity, batch_resource_ratios)
+            macs_dict, arch_vector_quantized, quantizer_embeddings_pairwise_similarity, batch_resource_ratios)
 
     @torch.no_grad()
-    def count_flops(self, batch):
+    def count_macs(self, batch):
         hyper_net_unwrapped = self.hyper_net.module if hasattr(self.hyper_net, "module") else self.hyper_net
         quantizer_unwrapped = self.quantizer.module if hasattr(self.quantizer, "module") else self.quantizer
         unet_unwrapped = self.unet.module if hasattr(self.unet, "module") else self.unet
@@ -1250,26 +1250,26 @@ class Pruner(Trainer):
                                   device=self.accelerator.device).long()
         encoder_hidden_states = self.text_encoder(batch["input_ids"][:1])[0]
 
-        flops, params = count_ops_and_params(self.unet,
+        macs, params = count_ops_and_params(self.unet,
                                              {'sample': latents,
                                               'timestep': timesteps,
                                               'encoder_hidden_states': encoder_hidden_states})
 
         logger.info(
             "UNet's Params/MACs calculated by OpCounter:\tparams: {:.3f}M\t MACs: {:.3f}G".format(
-                params / 1e6, flops / 1e9))
+                params / 1e6, macs / 1e9))
 
-        sanity_flops_dict = unet_unwrapped.calc_flops()
-        prunable_flops_list = [[e / sanity_flops_dict['prunable_flops'] for e in elem] for elem in
-                               unet_unwrapped.get_prunable_flops()]
+        sanity_macs_dict = unet_unwrapped.calc_macs()
+        prunable_macs_list = [[e / sanity_macs_dict['prunable_macs'] for e in elem] for elem in
+                               unet_unwrapped.get_prunable_macs()]
 
-        unet_unwrapped.prunable_flops_list = prunable_flops_list
-        unet_unwrapped.resource_info_dict = sanity_flops_dict
+        unet_unwrapped.prunable_macs_list = prunable_macs_list
+        unet_unwrapped.resource_info_dict = sanity_macs_dict
 
-        quantizer_unwrapped.set_prunable_flops_template(prunable_flops_list)
+        quantizer_unwrapped.set_prunable_macs_template(prunable_macs_list)
 
         sanity_string = "Our MACs calculation:\t"
-        for k, v in sanity_flops_dict.items():
+        for k, v in sanity_macs_dict.items():
             if isinstance(v, torch.Tensor):
                 sanity_string += f" {k}: {v.item() / 1e9:.3f}\t"
             else:
@@ -1281,8 +1281,8 @@ class Pruner(Trainer):
         unet_unwrapped = self.unet.module if hasattr(self.unet, "module") else self.unet
         p = self.config.training.losses.resource_loss.pruning_target
 
-        p_actual = (1 - (1 - p) * unet_unwrapped.resource_info_dict['total_flops'] /
-                    unet_unwrapped.resource_info_dict['cur_prunable_flops']).item()
+        p_actual = (1 - (1 - p) * unet_unwrapped.resource_info_dict['total_macs'] /
+                    unet_unwrapped.resource_info_dict['cur_prunable_macs']).item()
 
         self.resource_loss.p = p_actual
 
@@ -1418,6 +1418,14 @@ class FineTuner(Trainer):
             revision=self.config.revision,
         )
 
+        sample_inputs = {'sample': torch.randn(1, teacher_unet.config.in_channels, teacher_unet.config.sample_size,
+                                               teacher_unet.config.sample_size),
+                         'timestep': torch.ones((1,)).long(),
+                         'encoder_hidden_states': text_encoder(torch.tensor([[100]]))[0],
+                         }
+
+        teacher_macs, teacher_params = count_ops_and_params(teacher_unet, sample_inputs)
+
         embeddings_gs = torch.load(os.path.join(self.config.pruning_ckpt_dir, "quantizer_embeddings.pt"),
                                    map_location="cpu")
         arch_v = embeddings_gs[self.config.expert_id % embeddings_gs.shape[0]].unsqueeze(0)
@@ -1435,6 +1443,12 @@ class FineTuner(Trainer):
             ff_gate_width=self.config.model.unet.ff_gate_width,
             arch_vector=arch_v
         )
+
+        unet_macs, unet_params = count_ops_and_params(unet, sample_inputs)
+
+        print(f"Teacher macs: {teacher_macs / 1e9}G, Teacher Params: {teacher_params / 1e6}M")
+        print(f"Pruned UNet macs: {unet_macs / 1e9}G, Pruned UNet Params: {unet_params / 1e6}M")
+        print(f"Pruning Raio: {unet_macs / teacher_macs:.2f}")
 
         vae.requires_grad_(False)
         text_encoder.requires_grad_(False)
@@ -1851,7 +1865,7 @@ class SingleArchFinetuner(FineTuner):
                          'timestep': torch.ones((1,)).long(),
                          'encoder_hidden_states': text_encoder(torch.tensor([[100]]))[0],
                          }
-        teacher_flops, teacher_params = count_ops_and_params(teacher_unet, sample_inputs)
+        teacher_macs, teacher_params = count_ops_and_params(teacher_unet, sample_inputs)
 
         arch_v = hyper_net.arch
         arch_v = quantizer.gumbel_sigmoid_trick(arch_v).to("cpu")
@@ -1868,12 +1882,12 @@ class SingleArchFinetuner(FineTuner):
             arch_vector=arch_v
         )
 
-        unet_flops, unet_params = count_ops_and_params(unet, sample_inputs)
+        unet_macs, unet_params = count_ops_and_params(unet, sample_inputs)
 
-        print(f"Teacher FLOPs: {teacher_flops / 1e9}G, Teacher Params: {teacher_params / 1e6}M")
-        print(f"Pruned Single Arch UNet FLOPs: {unet_flops / 1e9}G,"
-              f" Magnitude Pruned UNet Params: {unet_params / 1e6}M")
-        print(f"Pruning Raio: {unet_flops / teacher_flops:.2f}")
+        print(f"Teacher macs: {teacher_macs / 1e9}G, Teacher Params: {teacher_params / 1e6}M")
+        print(f"Single Arch Pruned UNet macs: {unet_macs / 1e9}G,"
+              f"Single Arch Pruned UNet Params: {unet_params / 1e6}M")
+        print(f"Pruning Raio: {unet_macs / teacher_macs:.2f}")
 
         vae.requires_grad_(False)
         text_encoder.requires_grad_(False)
@@ -1936,7 +1950,7 @@ class BaselineFineTuner(FineTuner):
                          'encoder_hidden_states': text_encoder(torch.tensor([[100]]))[0],
                          }
 
-        teacher_flops, teacher_params = count_ops_and_params(teacher_unet, sample_inputs)
+        teacher_macs, teacher_params = count_ops_and_params(teacher_unet, sample_inputs)
 
         if self.pruning_type == "magnitude":
             unet = UNet2DConditionModelMagnitudePruned.from_pretrained(
@@ -1960,12 +1974,12 @@ class BaselineFineTuner(FineTuner):
                 random_pruning_ratio=self.config.training.random_pruning_ratio
             )
 
-        unet_flops, unet_params = count_ops_and_params(unet, sample_inputs)
+        unet_macs, unet_params = count_ops_and_params(unet, sample_inputs)
 
-        logging.info(f"Teacher FLOPs: {teacher_flops / 1e9}G, Teacher Params: {teacher_params / 1e6}M")
+        logging.info(f"Teacher macs: {teacher_macs / 1e9}G, Teacher Params: {teacher_params / 1e6}M")
         logger.info(
-            f"Magnitude Pruned UNet FLOPs: {unet_flops / 1e9}G, Magnitude Pruned UNet Params: {unet_params / 1e6}M")
-        logger.info(f"Pruning Raio: {unet_flops / teacher_flops:.2f}")
+            f"Baseline Pruned UNet macs: {unet_macs / 1e9}G, Baseline Pruned UNet Params: {unet_params / 1e6}M")
+        logger.info(f"Pruning Raio: {unet_macs / teacher_macs:.2f}")
 
         vae.requires_grad_(False)
         text_encoder.requires_grad_(False)

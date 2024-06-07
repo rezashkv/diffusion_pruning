@@ -1,126 +1,99 @@
-"""
-This opcounter is adapted from https://github.com/sovrasov/flops-counter.pytorch
+'''
+This opcounter is adapted from https://github.com/sovrasov/macs-counter.pytorch
 
 Copyright (C) 2021 Sovrasov V. - All Rights Reserved
  * You may use, distribute and modify this code under the
  * terms of the MIT license.
  * You should have received a copy of the MIT license with
  * this file. If not visit https://opensource.org/licenses/MIT
-"""
+'''
 
 import numpy as np
 import torch
+
 from diffusers.models.attention_processor import SpatialNorm
 from diffusers.models.normalization import AdaGroupNorm
-from diffusers.models.activations import GEGLU
-from diffusers.models.resnet import Upsample2D
+# from diffusers.models.activations import GEGLU
 from diffusers.models.lora import (LoRACompatibleConv, LoRACompatibleLinear)
-from pdm.models.unet.blocks import (ResnetBlock2DWidthGated, ResnetBlock2DWidthDepthGated,
-                                         BasicTransformerBlockWidthGated, Transformer2DModelWidthGated,
-                                         Transformer2DModelWidthDepthGated, GatedAttention, GEGLUGated)
-from pdm.utils.estimation_utils import hard_concrete
-
+from pdm.models.unet.blocks import GatedAttention
+from diffusers.models.attention_processor import Attention
 import sys
-import os
 from functools import partial
 import torch.nn as nn
-import copy
-
-from diffusers.models.attention_processor import Attention
-
-
-# Disable
-def blockPrint():
-    sys.stdout = open(os.devnull, 'w')
-
-
-# Restore
-def enablePrint():
-    sys.stdout = sys.__stdout__
 
 
 @torch.no_grad()
 def count_ops_and_params(model, example_inputs):
     global CUSTOM_MODULES_MAPPING
-    model = copy.deepcopy(model)
-    flops_model = add_flops_counting_methods(model)
-    flops_model.eval()
-    flops_model.start_flops_count(ost=sys.stdout, verbose=False,
+    macs_model = add_macs_counting_methods(model)
+    macs_model.eval()
+    macs_model.start_macs_count(ost=sys.stdout, verbose=False,
                                   ignore_list=[])
     if isinstance(example_inputs, dict):
-        _ = flops_model(**example_inputs)
+        _ = macs_model(**example_inputs)
     elif isinstance(example_inputs, (tuple, list)):
-        _ = flops_model(*example_inputs)
+        _ = macs_model(*example_inputs)
     else:
-        _ = flops_model(example_inputs)
-    flops_count, params_count = flops_model.compute_average_flops_cost()
-    flops_model.stop_flops_count()
+        _ = macs_model(example_inputs)
+    macs_count, params_count = macs_model.compute_average_macs_cost()
+    macs_model.stop_macs_count()
     CUSTOM_MODULES_MAPPING = {}
-    return flops_count, params_count
+    return macs_count, params_count
 
 
-def empty_flops_counter_hook(module, input, output):
-    module.__flops__ += 0
+def empty_macs_counter_hook(module, input, output):
+    module.__macs__ += 0
 
 
-def upsample_flops_counter_hook(module, input, output):
+def upsample_macs_counter_hook(module, input, output):
     output_size = output[0]
     batch_size = output_size.shape[0]
     output_elements_count = batch_size
     for val in output_size.shape[1:]:
         output_elements_count *= val
-    module.__flops__ += int(output_elements_count)
+    module.__macs__ += int(output_elements_count)
 
 
-def relu_flops_counter_hook(module, input, output):
+def relu_macs_counter_hook(module, input, output):
     active_elements_count = output.numel()
-    module.__flops__ += int(active_elements_count)
+    module.__macs__ += int(active_elements_count)
 
 
-def silu_flops_counter_hook(module, input, output):
+def silu_macs_counter_hook(module, input, output):
     active_elements_count = output.numel()
-    module.__flops__ += int(active_elements_count * 2)
+    module.__macs__ += int(active_elements_count * 2)
 
 
-def geglu_flops_counter_hook(module, input, output):
-    input = input[0]
-    output_last_dim = output.shape[-1]
-    bias_flops = output_last_dim if module.proj.bias is not None else 0
-    proj_flops = np.prod(input.shape) * output_last_dim * 2 + bias_flops
-    gelu_flops = output.numel()
-    module.__flops__ += int(proj_flops + gelu_flops * 2)
-
-
-def linear_flops_counter_hook(module, input, output):
+def linear_macs_counter_hook(module, input, output):
     input = input[0]
     # pytorch checks dimensions, so here we don't care much
     output_last_dim = output.shape[-1]
-    bias_flops = output_last_dim if module.bias is not None else 0
-    module.__flops__ += int(np.prod(input.shape) * output_last_dim + bias_flops)
+    bias_macs = output_last_dim if module.bias is not None else 0
+    module.__macs__ += int(np.prod(input.shape) * output_last_dim + bias_macs)
 
 
-def pool_flops_counter_hook(module, input, output):
+def pool_macs_counter_hook(module, input, output):
     input = input[0]
-    module.__flops__ += int(np.prod(input.shape))
+    module.__macs__ += int(np.prod(input.shape))
 
 
-def bn_flops_counter_hook(module, input, output):
+def bn_macs_counter_hook(module, input, output):
     input = input[0]
 
-    batch_flops = np.prod(input.shape)
+    batch_macs = np.prod(input.shape)
     if module.affine:
-        batch_flops *= 2
-    module.__flops__ += int(batch_flops)
+        batch_macs *= 2
+    module.__macs__ += int(batch_macs)
 
 
-def layer_norm_flops_counter_hook(module, input, output):
+def layer_norm_macs_counter_hook(module, input, output):
     input = input[0]
 
-    batch_flops = np.prod(input.shape)
-    module.__flops__ += int(batch_flops)
+    batch_macs = np.prod(input.shape)
+    module.__macs__ += int(batch_macs)
 
 
-def conv_flops_counter_hook(conv_module, input, output):
+def conv_macs_counter_hook(conv_module, input, output):
     # Can have multiple inputs, getting the first one
     input = input[0]
 
@@ -133,55 +106,55 @@ def conv_flops_counter_hook(conv_module, input, output):
     groups = conv_module.groups
 
     filters_per_channel = out_channels // groups
-    conv_per_position_flops = int(np.prod(kernel_dims)) * \
+    conv_per_position_macs = int(np.prod(kernel_dims)) * \
                               in_channels * filters_per_channel
 
     active_elements_count = batch_size * int(np.prod(output_dims))
 
-    overall_conv_flops = conv_per_position_flops * active_elements_count
+    overall_conv_macs = conv_per_position_macs * active_elements_count
 
-    bias_flops = 0
+    bias_macs = 0
 
     if conv_module.bias is not None:
-        bias_flops = out_channels * active_elements_count
+        bias_macs = out_channels * active_elements_count
 
-    overall_flops = overall_conv_flops + bias_flops
+    overall_macs = overall_conv_macs + bias_macs
 
-    conv_module.__flops__ += int(overall_flops)
+    conv_module.__macs__ += int(overall_macs)
 
 
-def rnn_flops(flops, rnn_module, w_ih, w_hh, input_size):
+def rnn_macs(macs, rnn_module, w_ih, w_hh, input_size):
     # matrix matrix mult ih state and internal state
-    flops += w_ih.shape[0] * w_ih.shape[1]
+    macs += w_ih.shape[0] * w_ih.shape[1]
     # matrix matrix mult hh state and internal state
-    flops += w_hh.shape[0] * w_hh.shape[1]
+    macs += w_hh.shape[0] * w_hh.shape[1]
     if isinstance(rnn_module, (nn.RNN, nn.RNNCell)):
         # add both operations
-        flops += rnn_module.hidden_size
+        macs += rnn_module.hidden_size
     elif isinstance(rnn_module, (nn.GRU, nn.GRUCell)):
         # hadamard of r
-        flops += rnn_module.hidden_size
+        macs += rnn_module.hidden_size
         # adding operations from both states
-        flops += rnn_module.hidden_size * 3
+        macs += rnn_module.hidden_size * 3
         # last two hadamard product and add
-        flops += rnn_module.hidden_size * 3
+        macs += rnn_module.hidden_size * 3
     elif isinstance(rnn_module, (nn.LSTM, nn.LSTMCell)):
         # adding operations from both states
-        flops += rnn_module.hidden_size * 4
+        macs += rnn_module.hidden_size * 4
         # two hadamard product and add for C state
-        flops += rnn_module.hidden_size + rnn_module.hidden_size + rnn_module.hidden_size
+        macs += rnn_module.hidden_size + rnn_module.hidden_size + rnn_module.hidden_size
         # final hadamard
-        flops += rnn_module.hidden_size + rnn_module.hidden_size + rnn_module.hidden_size
-    return flops
+        macs += rnn_module.hidden_size + rnn_module.hidden_size + rnn_module.hidden_size
+    return macs
 
 
-def rnn_flops_counter_hook(rnn_module, input, output):
+def rnn_macs_counter_hook(rnn_module, input, output):
     """
     Takes into account batch goes at first position, contrary
     to pytorch common rule (but actually it doesn't matter).
-    If sigmoid and tanh are hard, only a comparison FLOPS should be accurate
+    If sigmoid and tanh are hard, only a comparison macs should be accurate
     """
-    flops = 0
+    macs = 0
     # input is a tuple containing a sequence to process and (optionally) hidden state
     inp = input[0]
     batch_size = inp[0].shape[0]
@@ -195,38 +168,38 @@ def rnn_flops_counter_hook(rnn_module, input, output):
             input_size = rnn_module.input_size
         else:
             input_size = rnn_module.hidden_size
-        flops = rnn_flops(flops, rnn_module, w_ih, w_hh, input_size)
+        macs = rnn_macs(macs, rnn_module, w_ih, w_hh, input_size)
         if rnn_module.bias:
             b_ih = rnn_module.__getattr__('bias_ih_l' + str(i))
             b_hh = rnn_module.__getattr__('bias_hh_l' + str(i))
-            flops += b_ih.shape[0] + b_hh.shape[0]
+            macs += b_ih.shape[0] + b_hh.shape[0]
 
-    flops *= batch_size
-    flops *= seq_length
+    macs *= batch_size
+    macs *= seq_length
     if rnn_module.bidirectional:
-        flops *= 2
-    rnn_module.__flops__ += int(flops)
+        macs *= 2
+    rnn_module.__macs__ += int(macs)
 
 
-def rnn_cell_flops_counter_hook(rnn_cell_module, input, output):
-    flops = 0
+def rnn_cell_macs_counter_hook(rnn_cell_module, input, output):
+    macs = 0
     inp = input[0]
     batch_size = inp.shape[0]
     w_ih = rnn_cell_module.__getattr__('weight_ih')
     w_hh = rnn_cell_module.__getattr__('weight_hh')
     input_size = inp.shape[1]
-    flops = rnn_flops(flops, rnn_cell_module, w_ih, w_hh, input_size)
+    macs = rnn_macs(macs, rnn_cell_module, w_ih, w_hh, input_size)
     if rnn_cell_module.bias:
         b_ih = rnn_cell_module.__getattr__('bias_ih')
         b_hh = rnn_cell_module.__getattr__('bias_hh')
-        flops += b_ih.shape[0] + b_hh.shape[0]
+        macs += b_ih.shape[0] + b_hh.shape[0]
 
-    flops *= batch_size
-    rnn_cell_module.__flops__ += int(flops)
+    macs *= batch_size
+    rnn_cell_module.__macs__ += int(macs)
 
 
 def multihead_attention_counter_hook(multihead_attention_module, input, output):
-    flops = 0
+    macs = 0
     q, k, v = input
 
     batch_first = multihead_attention_module.batch_first \
@@ -256,286 +229,281 @@ def multihead_attention_counter_hook(multihead_attention_module, input, output):
     if multihead_attention_module.vdim is None:
         assert vdim == qdim
 
-    flops = 0
+    macs = 0
 
     # Q scaling
-    flops += qlen * qdim
+    macs += qlen * qdim
 
     # Initial projections
-    flops += (
+    macs += (
             (qlen * qdim * qdim)  # QW
             + (klen * kdim * kdim)  # KW
             + (vlen * vdim * vdim)  # VW
     )
 
     if multihead_attention_module.in_proj_bias is not None:
-        flops += (qlen + klen + vlen) * qdim
+        macs += (qlen + klen + vlen) * qdim
 
     # attention heads: scale, matmul, softmax, matmul
     qk_head_dim = qdim // num_heads
     v_head_dim = vdim // num_heads
 
-    head_flops = (
+    head_macs = (
             (qlen * klen * qk_head_dim)  # QK^T
             + (qlen * klen)  # softmax
             + (qlen * klen * v_head_dim)  # AV
     )
 
-    flops += num_heads * head_flops
+    macs += num_heads * head_macs
 
     # final projection, bias is always enabled
-    flops += qlen * vdim * (vdim + 1)
+    macs += qlen * vdim * (vdim + 1)
 
-    flops *= batch_size
-    multihead_attention_module.__flops__ += int(flops)
+    macs *= batch_size
+    multihead_attention_module.__macs__ += int(macs)
 
 
-def qkv_attention_counter_hook(qkv_attention_module, input, output):
-    for m in qkv_attention_module.children():
-        for m_m in m.modules():
-            m_m.accumulate_flops = accumulate_flops.__get__(m_m)
+def gated_attention_counter_hook(gated_attention_module, input, output):
+    if gated_attention_module.total_macs == 0. or gated_attention_module.pruned:
+        gated_attention_module.total_macs, gated_attention_module.prunable_macs = 0., 0.
+        # SpatialNorm
+        if gated_attention_module.spatial_norm is not None:
+            gated_attention_module.total_macs += gated_attention_module.spatial_norm.__macs__
 
-        flops_sum = m.accumulate_flops()
-        qkv_attention_module.__flops__ += flops_sum
+        # GroupNorm
+        if gated_attention_module.group_norm is not None:
+            gated_attention_module.total_macs += gated_attention_module.group_norm.__macs__
 
-    attn_flops = 0
-    batch_size, seq_len, dim = output.shape
-    num_heads, head_dim = qkv_attention_module.heads, dim // qkv_attention_module.heads
+        # NormCross
+        if gated_attention_module.norm_cross:
+            gated_attention_module.total_macs += gated_attention_module.norm_cross.__macs__
 
-    head_flops = (
+        # to_q
+        gated_attention_module.total_macs += gated_attention_module.to_q.__macs__
+        gated_attention_module.prunable_macs += gated_attention_module.to_q.__macs__
+
+        # to_k
+        gated_attention_module.total_macs += gated_attention_module.to_k.__macs__
+        gated_attention_module.prunable_macs += gated_attention_module.to_k.__macs__
+
+        # to_v
+        gated_attention_module.total_macs += gated_attention_module.to_v.__macs__
+        gated_attention_module.prunable_macs += gated_attention_module.to_v.__macs__
+
+        attn_macs = 0
+        batch_size, seq_len, _ = output.shape
+        dim = gated_attention_module.to_q.out_features
+        num_heads, head_dim = gated_attention_module.heads, dim // gated_attention_module.heads
+
+        head_macs = (
+                (seq_len * seq_len * head_dim)  # QK^T
+                + (seq_len * seq_len)  # softmax
+                + (seq_len * seq_len * head_dim)  # AV
+        )
+
+        attn_macs += num_heads * head_macs
+
+        gated_attention_module.total_macs += attn_macs
+        gated_attention_module.prunable_macs += attn_macs
+
+        # to_out
+        gated_attention_module.total_macs += gated_attention_module.to_out[0].__macs__
+        gated_attention_module.prunable_macs += gated_attention_module.to_out[0].__macs__
+
+    gated_attention_module.__macs__ = gated_attention_module.total_macs
+
+
+def attention_counter_hook(attention_module, input, output):
+    total_macs = 0
+    if attention_module.spatial_norm is not None:
+        total_macs += attention_module.spatial_norm.__macs__
+
+    # GroupNorm
+    if attention_module.group_norm is not None:
+        total_macs += attention_module.group_norm.__macs__
+
+    # NormCross
+    if attention_module.norm_cross:
+        total_macs += attention_module.norm_cross.__macs__
+
+    # to_q
+    total_macs += attention_module.to_q.__macs__
+
+    # to_k
+    total_macs += attention_module.to_k.__macs__
+
+    # to_v
+    total_macs += attention_module.to_v.__macs__
+
+    attn_macs = 0
+    batch_size, seq_len, _ = output.shape
+    dim = attention_module.to_q.out_features
+    num_heads, head_dim = attention_module.heads, dim // attention_module.heads
+
+    head_macs = (
             (seq_len * seq_len * head_dim)  # QK^T
             + (seq_len * seq_len)  # softmax
             + (seq_len * seq_len * head_dim)  # AV
     )
 
-    attn_flops += num_heads * head_flops
+    attn_macs += num_heads * head_macs
 
-    attn_flops *= batch_size
+    total_macs += attn_macs
 
-    qkv_attention_module.__flops__ += attn_flops
+    # to_out
+    total_macs += attention_module.to_out[0].__macs__
 
-
-def gated_qkv_attention_counter_hook(qkv_attention_module, input, output):
-    attn_flops = 0
-    batch_size, seq_len, dim = output.shape
-    num_heads, head_dim = qkv_attention_module.heads, dim // qkv_attention_module.heads
-
-    head_flops = (
-            (seq_len * seq_len * head_dim)  # QK^T
-            + (seq_len * seq_len)  # softmax
-            + (seq_len * seq_len * head_dim)  # AV
-    )
-
-    attn_flops += num_heads * head_flops
-
-    attn_flops *= batch_size
-
-    qkv_attention_module.__flops__ += attn_flops
-
-
-def gate_flops_counter_hook(module, input, output):
-    input = input[0]
-    active_elements_count = np.prod(input.shape)
-    module.__flops__ += int(active_elements_count)
+    attention_module.__macs__ = total_macs
 
 
 CUSTOM_MODULES_MAPPING = {}
 
 MODULES_MAPPING = {
     # convolutions
-    nn.Conv1d: conv_flops_counter_hook,
-    nn.Conv2d: conv_flops_counter_hook,
-    nn.Conv3d: conv_flops_counter_hook,
-    LoRACompatibleConv: conv_flops_counter_hook,
+    nn.Conv1d: conv_macs_counter_hook,
+    nn.Conv2d: conv_macs_counter_hook,
+    nn.Conv3d: conv_macs_counter_hook,
+    LoRACompatibleConv: conv_macs_counter_hook,
+
     # activations
-    nn.ReLU: relu_flops_counter_hook,
-    nn.PReLU: relu_flops_counter_hook,
-    nn.ELU: relu_flops_counter_hook,
-    nn.LeakyReLU: relu_flops_counter_hook,
-    nn.ReLU6: relu_flops_counter_hook,
-    nn.SiLU: silu_flops_counter_hook,
-    # GEGLU: geglu_flops_counter_hook,
-    # GEGLUGated: geglu_flops_counter_hook,
+    nn.ReLU: relu_macs_counter_hook,
+    nn.PReLU: relu_macs_counter_hook,
+    nn.ELU: relu_macs_counter_hook,
+    nn.LeakyReLU: relu_macs_counter_hook,
+    nn.ReLU6: relu_macs_counter_hook,
+    nn.SiLU: silu_macs_counter_hook,
 
     # poolings
-    nn.MaxPool1d: pool_flops_counter_hook,
-    nn.AvgPool1d: pool_flops_counter_hook,
-    nn.AvgPool2d: pool_flops_counter_hook,
-    nn.MaxPool2d: pool_flops_counter_hook,
-    nn.MaxPool3d: pool_flops_counter_hook,
-    nn.AvgPool3d: pool_flops_counter_hook,
-    nn.AdaptiveMaxPool1d: pool_flops_counter_hook,
-    nn.AdaptiveAvgPool1d: pool_flops_counter_hook,
-    nn.AdaptiveMaxPool2d: pool_flops_counter_hook,
-    nn.AdaptiveAvgPool2d: pool_flops_counter_hook,
-    nn.AdaptiveMaxPool3d: pool_flops_counter_hook,
-    nn.AdaptiveAvgPool3d: pool_flops_counter_hook,
+    nn.MaxPool1d: pool_macs_counter_hook,
+    nn.AvgPool1d: pool_macs_counter_hook,
+    nn.AvgPool2d: pool_macs_counter_hook,
+    nn.MaxPool2d: pool_macs_counter_hook,
+    nn.MaxPool3d: pool_macs_counter_hook,
+    nn.AvgPool3d: pool_macs_counter_hook,
+    nn.AdaptiveMaxPool1d: pool_macs_counter_hook,
+    nn.AdaptiveAvgPool1d: pool_macs_counter_hook,
+    nn.AdaptiveMaxPool2d: pool_macs_counter_hook,
+    nn.AdaptiveAvgPool2d: pool_macs_counter_hook,
+    nn.AdaptiveMaxPool3d: pool_macs_counter_hook,
+    nn.AdaptiveAvgPool3d: pool_macs_counter_hook,
 
     # BNs
-    nn.BatchNorm1d: bn_flops_counter_hook,
-    nn.BatchNorm2d: bn_flops_counter_hook,
-    nn.BatchNorm3d: bn_flops_counter_hook,
+    nn.BatchNorm1d: bn_macs_counter_hook,
+    nn.BatchNorm2d: bn_macs_counter_hook,
+    nn.BatchNorm3d: bn_macs_counter_hook,
 
-    nn.InstanceNorm1d: bn_flops_counter_hook,
-    nn.InstanceNorm2d: bn_flops_counter_hook,
-    nn.InstanceNorm3d: bn_flops_counter_hook,
-    nn.GroupNorm: bn_flops_counter_hook,
-    SpatialNorm: bn_flops_counter_hook,
-    AdaGroupNorm: bn_flops_counter_hook,
-    nn.LayerNorm: layer_norm_flops_counter_hook,
+    nn.InstanceNorm1d: bn_macs_counter_hook,
+    nn.InstanceNorm2d: bn_macs_counter_hook,
+    nn.InstanceNorm3d: bn_macs_counter_hook,
+    nn.GroupNorm: bn_macs_counter_hook,
+    SpatialNorm: bn_macs_counter_hook,
+    AdaGroupNorm: bn_macs_counter_hook,
+    nn.LayerNorm: layer_norm_macs_counter_hook,
+
     # FC
-    nn.Linear: linear_flops_counter_hook,
-    LoRACompatibleLinear: linear_flops_counter_hook,
+    nn.Linear: linear_macs_counter_hook,
+    LoRACompatibleLinear: linear_macs_counter_hook,
+
     # Upscale
-    nn.Upsample: upsample_flops_counter_hook,
-    Upsample2D: upsample_flops_counter_hook,
+    nn.Upsample: upsample_macs_counter_hook,
+
     # Deconvolution
-    nn.ConvTranspose1d: conv_flops_counter_hook,
-    nn.ConvTranspose2d: conv_flops_counter_hook,
-    nn.ConvTranspose3d: conv_flops_counter_hook,
+    nn.ConvTranspose1d: conv_macs_counter_hook,
+    nn.ConvTranspose2d: conv_macs_counter_hook,
+    nn.ConvTranspose3d: conv_macs_counter_hook,
+
     # RNN
-    nn.RNN: rnn_flops_counter_hook,
-    nn.GRU: rnn_flops_counter_hook,
-    nn.LSTM: rnn_flops_counter_hook,
-    nn.RNNCell: rnn_cell_flops_counter_hook,
-    nn.LSTMCell: rnn_cell_flops_counter_hook,
-    nn.GRUCell: rnn_cell_flops_counter_hook,
+    nn.RNN: rnn_macs_counter_hook,
+    nn.GRU: rnn_macs_counter_hook,
+    nn.LSTM: rnn_macs_counter_hook,
+    nn.RNNCell: rnn_cell_macs_counter_hook,
+    nn.LSTMCell: rnn_cell_macs_counter_hook,
+    nn.GRUCell: rnn_cell_macs_counter_hook,
     nn.MultiheadAttention: multihead_attention_counter_hook,
 
-    # Self-Attention
-    Attention: qkv_attention_counter_hook,
-    GatedAttention: gated_qkv_attention_counter_hook,
-
-    # Gate
-    # BlockVirtualGate: gate_flops_counter_hook,
+    Attention: attention_counter_hook,
+    GatedAttention: gated_attention_counter_hook,
 }
 
-
 if hasattr(nn, 'GELU'):
-    MODULES_MAPPING[nn.GELU] = relu_flops_counter_hook
+    MODULES_MAPPING[nn.GELU] = relu_macs_counter_hook
 
 
-def accumulate_flops(self):
+def accumulate_macs(self):
     if is_supported_instance(self):
-        return self.__flops__
+        return self.__macs__
     else:
         sum = 0
-        if not isinstance(self, (ResnetBlock2DWidthGated, BasicTransformerBlockWidthGated,
-                                 ResnetBlock2DWidthDepthGated, Transformer2DModelWidthGated,
-                                 Transformer2DModelWidthDepthGated)):
-            for m in self.children():
-                sum += m.accumulate_flops()
-            return sum
-
-        elif isinstance(self, (ResnetBlock2DWidthGated, ResnetBlock2DWidthDepthGated)):
-            for m in self.children():
-                sum += m.accumulate_flops()
-            norm1_flops = self.norm1.accumulate_flops()
-            nonlinearity_flops = self.nonlinearity.accumulate_flops()
-            non_prunable_flops = norm1_flops + nonlinearity_flops
-
-            prunable_flops = sum - non_prunable_flops
-            hard_out = hard_concrete(self.gate.gate_f)
-            current_prunable_flops = prunable_flops * hard_out.sum() / hard_out.numel()
-            current_total_flops = current_prunable_flops + non_prunable_flops
-
-        # instance of BasicTransformerBlockGated or BasicTransformerBlockWidthDepthGated
-        elif isinstance(self, BasicTransformerBlockWidthGated):
-            norm1_flops = self.norm1.accumulate_flops()
-            att1_flops = self.attn1.accumulate_flops()
-            norm2_flops = self.norm2.accumulate_flops()
-            att2_flops = self.attn2.accumulate_flops()
-            norm3_flops = self.norm3.accumulate_flops()
-            ff_flops = self.ff.accumulate_flops()
-
-            gate_1_hard_out = hard_concrete(self.attn1.gate.gate_f)
-            gate_2_hard_out = hard_concrete(self.attn2.gate.gate_f)
-            curr_att1_flops = att1_flops * gate_1_hard_out.sum() / gate_1_hard_out.numel()
-            curr_att2_flops = att2_flops * gate_2_hard_out.sum() / gate_2_hard_out.numel()
-            current_total_flops = (
-                    norm1_flops + curr_att1_flops + curr_att2_flops + norm2_flops + norm3_flops + ff_flops)
-
-        elif isinstance(self, (Transformer2DModelWidthGated, Transformer2DModelWidthDepthGated)):
-            current_total_flops = 0
-            for m in self.children():
-                current_total_flops += m.accumulate_flops()
-
-        else:
-            current_total_flops = 0
-            for m in self.children():
-                current_total_flops += m.accumulate_flops()
-
-        if hasattr(self, 'depth_gate'):
-            hard_out = hard_concrete(self.depth_gate.gate_f)
-            current_total_flops = current_total_flops * hard_out.sum() / hard_out.numel()
-
-        return current_total_flops
+        for m in self.children():
+            sum += m.accumulate_macs()
+        return sum
 
 
 def get_model_parameters_number(model):
-    params_num = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # params_num = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    params_num = sum(p.numel() for p in model.parameters())
     return params_num
 
 
-def add_flops_counting_methods(net_main_module):
+def add_macs_counting_methods(net_main_module):
     # adding additional methods to the existing module object,
     # this is done this way so that each function has access to self object
-    net_main_module.start_flops_count = start_flops_count.__get__(net_main_module)
-    net_main_module.stop_flops_count = stop_flops_count.__get__(net_main_module)
-    net_main_module.reset_flops_count = reset_flops_count.__get__(net_main_module)
-    net_main_module.compute_average_flops_cost = compute_average_flops_cost.__get__(
+    net_main_module.start_macs_count = start_macs_count.__get__(net_main_module)
+    net_main_module.stop_macs_count = stop_macs_count.__get__(net_main_module)
+    net_main_module.reset_macs_count = reset_macs_count.__get__(net_main_module)
+    net_main_module.compute_average_macs_cost = compute_average_macs_cost.__get__(
         net_main_module)
 
-    net_main_module.reset_flops_count()
+    net_main_module.reset_macs_count()
 
     return net_main_module
 
 
-def compute_average_flops_cost(self):
+def compute_average_macs_cost(self):
     """
-    A method that will be available after add_flops_counting_methods() is called
+    A method that will be available after add_macs_counting_methods() is called
     on a desired net object.
-    Returns current mean flops consumption per image.
+    Returns current mean macs consumption per image.
     """
-    for m in self.modules():
-        m.accumulate_flops = accumulate_flops.__get__(m)
-
-    flops_sum = self.accumulate_flops()
 
     for m in self.modules():
-        if hasattr(m, 'accumulate_flops'):
-            del m.accumulate_flops
+        m.accumulate_macs = accumulate_macs.__get__(m)
+
+    macs_sum = self.accumulate_macs()
+
+    for m in self.modules():
+        if hasattr(m, 'accumulate_macs'):
+            del m.accumulate_macs
 
     params_sum = get_model_parameters_number(self)
+    return macs_sum / self.__batch_counter__, params_sum
 
-    return flops_sum / self.__batch_counter__, params_sum
 
-
-def start_flops_count(self, **kwargs):
+def start_macs_count(self, **kwargs):
     """
-    A method that will be available after add_flops_counting_methods() is called
+    A method that will be available after add_macs_counting_methods() is called
     on a desired net object.
-    Activates the computation of mean flops consumption per image.
+    Activates the computation of mean macs consumption per image.
     Call it before you run the network.
     """
     add_batch_counter_hook_function(self)
 
     seen_types = set()
 
-    def add_flops_counter_hook_function(module, ost, verbose, ignore_list):
+    def add_macs_counter_hook_function(module, ost, verbose, ignore_list):
         if type(module) in ignore_list:
             seen_types.add(type(module))
             if is_supported_instance(module):
                 module.__params__ = 0
         elif is_supported_instance(module):
-            if hasattr(module, '__flops_handle__'):
+            if hasattr(module, '__macs_handle__'):
                 return
             if type(module) in CUSTOM_MODULES_MAPPING:
                 handle = module.register_forward_hook(
                     CUSTOM_MODULES_MAPPING[type(module)])
             else:
                 handle = module.register_forward_hook(MODULES_MAPPING[type(module)])
-            module.__flops_handle__ = handle
+            module.__macs_handle__ = handle
             seen_types.add(type(module))
         else:
             if verbose and not type(module) in (nn.Sequential, nn.ModuleList) and \
@@ -544,29 +512,29 @@ def start_flops_count(self, **kwargs):
                       ' is treated as a zero-op.', file=ost)
             seen_types.add(type(module))
 
-    self.apply(partial(add_flops_counter_hook_function, **kwargs))
+    self.apply(partial(add_macs_counter_hook_function, **kwargs))
 
 
-def stop_flops_count(self):
+def stop_macs_count(self):
     """
-    A method that will be available after add_flops_counting_methods() is called
+    A method that will be available after add_macs_counting_methods() is called
     on a desired net object.
-    Stops computing the mean flops consumption per image.
+    Stops computing the mean macs consumption per image.
     Call whenever you want to pause the computation.
     """
     remove_batch_counter_hook_function(self)
-    self.apply(remove_flops_counter_hook_function)
-    self.apply(remove_flops_counter_variables)
+    self.apply(remove_macs_counter_hook_function)
+    # self.apply(remove_macs_counter_variables)
 
 
-def reset_flops_count(self):
+def reset_macs_count(self):
     """
-    A method that will be available after add_flops_counting_methods() is called
+    A method that will be available after add_macs_counting_methods() is called
     on a desired net object.
     Resets statistics computed so far.
     """
     add_batch_counter_variables_or_reset(self)
-    self.apply(add_flops_counter_variable_or_reset)
+    self.apply(add_macs_counter_variable_or_reset)
 
 
 # ---- Internal functions
@@ -578,7 +546,7 @@ def batch_counter_hook(module, input, output):
         batch_size = len(input)
     else:
         pass
-        print('Warning! No positional inputs found for a module,'
+        print('\nWarning! No positional inputs found for a module,'
               ' assuming batch size is 1.')
     module.__batch_counter__ += batch_size
 
@@ -601,15 +569,15 @@ def remove_batch_counter_hook_function(module):
         del module.__batch_counter_handle__
 
 
-def add_flops_counter_variable_or_reset(module):
+def add_macs_counter_variable_or_reset(module):
     if is_supported_instance(module):
-        if hasattr(module, '__flops__') or hasattr(module, '__params__'):
-            # print('Warning: variables __flops__ or __params__ are already '
+        if hasattr(module, '__macs__') or hasattr(module, '__params__'):
+            # print('Warning: variables __macs__ or __params__ are already '
             #       'defined for the module' + type(module).__name__ +
-            #       ' ptflops can affect your code!')
-            module.__ptflops_backup_flops__ = module.__flops__
-            module.__ptflops_backup_params__ = module.__params__
-        module.__flops__ = 0
+            #       ' ptmacs can affect your code!')
+            module.__ptmacs_backup_macs__ = module.__macs__
+            module.__ptmacs_backup_params__ = module.__params__
+        module.__macs__ = 0
         module.__params__ = get_model_parameters_number(module)
 
 
@@ -619,20 +587,20 @@ def is_supported_instance(module):
     return False
 
 
-def remove_flops_counter_hook_function(module):
+def remove_macs_counter_hook_function(module):
     if is_supported_instance(module):
-        if hasattr(module, '__flops_handle__'):
-            module.__flops_handle__.remove()
-            del module.__flops_handle__
+        if hasattr(module, '__macs_handle__'):
+            module.__macs_handle__.remove()
+            del module.__macs_handle__
 
 
-def remove_flops_counter_variables(module):
+def remove_macs_counter_variables(module):
     if is_supported_instance(module):
-        if hasattr(module, '__flops__'):
-            del module.__flops__
-            if hasattr(module, '__ptflops_backup_flops__'):
-                module.__flops__ = module.__ptflops_backup_flops__
+        if hasattr(module, '__macs__'):
+            del module.__macs__
+            if hasattr(module, '__ptmacs_backup_macs__'):
+                module.__macs__ = module.__ptmacs_backup_macs__
         if hasattr(module, '__params__'):
             del module.__params__
-            if hasattr(module, '__ptflops_backup_params__'):
-                module.__params__ = module.__ptflops_backup_params__
+            if hasattr(module, '__ptmacs_backup_params__'):
+                module.__params__ = module.__ptmacs_backup_params__

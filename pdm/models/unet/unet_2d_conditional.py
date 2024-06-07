@@ -1192,7 +1192,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
 
         self.structure = {'width': [], 'depth': []}
 
-        self.total_flops, self.prunable_flops = 0., 0.
+        self.total_macs, self.prunable_macs = 0., 0.
 
     @property
     def attn_processors(self) -> Dict[str, AttentionProcessor]:
@@ -2130,55 +2130,55 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
             if "gate_f" not in name:
                 param.requires_grad = False
 
-    def calc_flops(self):
-        out_dict = {"total_flops": 0., "prunable_flops": 0., "cur_prunable_flops": 0., "cur_total_flops": 0.}
+    def calc_macs(self):
+        out_dict = {"total_macs": 0., "prunable_macs": 0., "cur_prunable_macs": 0., "cur_total_macs": 0.}
 
         # Time_embedding
         for m in self.time_embedding.children():
-            out_dict['total_flops'] += m.__flops__
-            out_dict['cur_total_flops'] += m.__flops__
+            out_dict['total_macs'] += m.__macs__
+            out_dict['cur_total_macs'] += m.__macs__
 
         # conv_in
-        out_dict['total_flops'] += self.conv_in.__flops__
-        out_dict['cur_total_flops'] += self.conv_in.__flops__
+        out_dict['total_macs'] += self.conv_in.__macs__
+        out_dict['cur_total_macs'] += self.conv_in.__macs__
 
         # down_blocks
         for i, m in enumerate(self.down_blocks):
-            m_flops = m.calc_flops()
+            m_macs = m.calc_macs()
             for k in out_dict.keys():
-                out_dict[k] = out_dict[k] + m_flops[k]
+                out_dict[k] = out_dict[k] + m_macs[k]
 
         # mid_block
         if self.mid_block:
-            m_flops = self.mid_block.calc_flops()
+            m_macs = self.mid_block.calc_macs()
             for k in out_dict.keys():
-                out_dict[k] = out_dict[k] + m_flops[k]
+                out_dict[k] = out_dict[k] + m_macs[k]
 
         # up_blocks
         for i, m in enumerate(self.up_blocks):
-            m_flops = m.calc_flops()
+            m_macs = m.calc_macs()
             for k in out_dict.keys():
-                out_dict[k] = out_dict[k] + m_flops[k]
+                out_dict[k] = out_dict[k] + m_macs[k]
 
         # conv_norm_out
         if self.conv_norm_out:
-            out_dict['total_flops'] += (self.conv_norm_out.__flops__ + self.conv_act.__flops__)
-            out_dict['cur_total_flops'] += (self.conv_norm_out.__flops__ + self.conv_act.__flops__)
+            out_dict['total_macs'] += (self.conv_norm_out.__macs__ + self.conv_act.__macs__)
+            out_dict['cur_total_macs'] += (self.conv_norm_out.__macs__ + self.conv_act.__macs__)
 
         # conv_out
-        out_dict['total_flops'] += self.conv_out.__flops__
-        out_dict['cur_total_flops'] += self.conv_out.__flops__
+        out_dict['total_macs'] += self.conv_out.__macs__
+        out_dict['cur_total_macs'] += self.conv_out.__macs__
 
         return out_dict
 
-    def get_prunable_flops(self):
-        flops = []
+    def get_prunable_macs(self):
+        macs = []
         for m in self.down_blocks:
-            flops += m.get_prunable_flops()
-        flops += self.mid_block.get_prunable_flops()
+            macs += m.get_prunable_macs()
+        macs += self.mid_block.get_prunable_macs()
         for m in self.up_blocks:
-            flops += m.get_prunable_flops()
-        return flops
+            macs += m.get_prunable_macs()
+        return macs
 
 
 class UNet2DConditionModelPruned(UNet2DConditionModelGated):
@@ -2567,10 +2567,10 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
 
         model.register_to_config(_name_or_path=pretrained_model_name_or_path)
 
-        if os.path.exists(os.path.join(pretrained_model_name_or_path, "arch_vector0.pt")):
+        if os.path.exists(os.path.join(pretrained_model_name_or_path, "arch_vector.pt")):
             logger.info(
-                "Loading architecture vector from %s" % os.path.join(pretrained_model_name_or_path, "arch_vector0.pt"))
-            arch_vector = torch.load(os.path.join(pretrained_model_name_or_path, "arch_vector0.pt"))
+                "Loading architecture vector from %s" % os.path.join(pretrained_model_name_or_path, "arch_vector.pt"))
+            arch_vector = torch.load(os.path.join(pretrained_model_name_or_path, "arch_vector.pt"))
 
         if random_pruning_ratio is not None:
             logger.info("loading arch vector with random pruning ratio %f" % random_pruning_ratio)
