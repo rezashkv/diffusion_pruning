@@ -11,6 +11,7 @@ from pathlib import Path
 from functools import partial
 from typing import Dict
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
@@ -970,6 +971,12 @@ class Pruner(Trainer):
                         with torch.no_grad():
                             batch_resource_ratios = self.accelerator.gather_for_metrics(
                                 batch_resource_ratios).cpu().numpy()
+
+                        # make sure the number of rows is a multiple of 16 by adding zeros. This can be avoided by
+                        # removing corrupt images from the dataset.
+                        if batch_resource_ratios.shape[0] % 16 != 0:
+                            batch_resource_ratios = np.concatenate(
+                                [batch_resource_ratios, np.zeros((16 - len(batch_resource_ratios) % 16, 1))], axis=0)
 
                         img_log_dict["images/batch resource ratio heatmap"] = wandb.Image(
                             create_heatmap(batch_resource_ratios, n_rows=16, n_cols=len(batch_resource_ratios) // 16))

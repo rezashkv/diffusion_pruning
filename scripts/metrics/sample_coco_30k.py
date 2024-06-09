@@ -43,7 +43,7 @@ def main(args):
 
     for i in indices:
         image_id = annotations['annotations'][i]['image_id']
-        # read the image and save it as a npy file
+
         image_path = os.path.join(images_dir, f"COCO_val2014_{image_id:012d}.jpg")
         img = Image.open(image_path).convert("RGB")
         data = np.asarray(img)

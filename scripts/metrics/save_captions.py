@@ -4,7 +4,7 @@ from pdm.datasets.cc3m import load_cc3m_webdataset
 
 
 def save_coco_captions(annotations_file):
-    # annotations files is like 'annotations/captions_val2014_30k.json'
+    # annotations file's name is something like 'annotations/captions_val2014_30k.json'
     split_name = os.path.basename(annotations_file)[len('captions_'):-len('.json')]
     captions_file = json.load(open(annotations_file))
     captions_dir = os.path.dirname(annotations_file)

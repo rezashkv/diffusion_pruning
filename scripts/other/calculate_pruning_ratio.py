@@ -12,7 +12,7 @@ from accelerate.logging import get_logger
 from diffusers import UNet2DConditionModel
 from diffusers.utils import check_min_version
 
-from transformers import CLIPTextModel, AutoModel
+from transformers import CLIPTextModel
 from transformers.utils import ContextManagers
 
 from pdm.models.unet import UNet2DConditionModelGated
@@ -119,7 +119,6 @@ def main():
     macs_dict = unet.calc_macs()
     resource_ratios = macs_dict['cur_total_macs'] / (unet.resource_info_dict['cur_total_macs'].squeeze())
     logging.info(f"Resource Ratios: {resource_ratios}")
-    # save the resource ratios to the checkpoint directory
     torch.save(resource_ratios, os.path.join(config.pruning_ckpt_dir, "resource_ratios.pt"))
 
 

@@ -21,11 +21,9 @@ def get_dataset(config):
 
     train_data_dir = getattr(config, "train_data_dir", None)
     train_data_file = getattr(config, "train_data_file", None)
-    train_bad_images_path = getattr(config, "train_bad_images_path", None)
 
     validation_data_dir = getattr(config, "validation_data_dir", None)
     validation_data_file = getattr(config, "validation_data_file", None)
-    validation_bad_images_path = getattr(config, "validation_bad_images_path", None)
 
     if dataset_name is not None:
         # Downloading and loading a dataset from the hub.
@@ -41,14 +39,12 @@ def get_dataset(config):
             dataset = {"train": load_cc3m_dataset(data_dir,
                                                   split="train",
                                                   split_file=train_data_file,
-                                                  split_dir=train_data_dir,
-                                                  bad_images_path=train_bad_images_path)}
+                                                  split_dir=train_data_dir)}
             if validation_data_dir is not None:
                 dataset["validation"] = load_cc3m_dataset(data_dir,
                                                           split="validation",
                                                           split_file=validation_data_file,
-                                                          split_dir=validation_data_dir,
-                                                          bad_images_path=validation_bad_images_path)
+                                                          split_dir=validation_data_dir)
 
         elif "coco" in data_dir:
             year = config.year
@@ -113,7 +109,14 @@ def download_images_if_missing(samples, image_column):
                     downloaded_images.append(None)
             samples[image_column] = downloaded_images
         else:
-            samples[image_column] = [PIL.Image.open(image) for image in samples[image_column]]
+            imgs = []
+            for image in samples[image_column]:
+                try:
+                    imgs.append(PIL.Image.open(image))
+                except:
+                    samples[image_column] = None
+                    continue
+            samples[image_column] = imgs
     return samples
 
 

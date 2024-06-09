@@ -54,7 +54,6 @@ def main():
     torch._dynamo.config.suppress_errors = True
     args = parse_args()
     config = OmegaConf.load(args.base_config_path)
-    # add args to config
     config.update(vars(args))
 
     if config.seed is not None:

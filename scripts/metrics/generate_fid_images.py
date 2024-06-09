@@ -1,48 +1,29 @@
-#!/usr/bin/env python
-# coding=utf-8
-# Copyright 2023 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-
-
 import os
-import pickle
+from functools import partial
 
-import safetensors
-from accelerate.utils import set_seed
 from omegaconf import OmegaConf
 
 import cv2
-import accelerate
 import numpy as np
+
 import torch
 import torch.utils.checkpoint
+
+import accelerate
 from accelerate.logging import get_logger
+from accelerate.utils import set_seed
+
 from datasets import load_dataset
-from pdm.datasets.coco import load_coco_dataset
 
 from diffusers import PNDMScheduler
 from diffusers.utils import check_min_version
 from diffusers import StableDiffusionPipeline
 
+import safetensors
+
 from pdm.models.diffusion import UNet2DConditionModelPruned
 from pdm.utils.arg_utils import parse_args
-from pdm.datasets.cc3m import load_cc3m_dataset, load_cc3m_webdataset
-import webdataset as wds
-import torch._dynamo
-
-DATASET_NAME_MAPPING = {
-    "lambdalabs/pokemon-blip-captions": ("image", "text"),
-}
+from pdm.utils.data_utils import get_dataset
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.22.0.dev0")
@@ -59,7 +40,7 @@ def main():
     if config.seed is not None:
         set_seed(config.seed)
 
-    # #################################################### Accelerator ####################################################
+    # #################################################### Accelerator #################################################
     accelerator = accelerate.Accelerator()
 
     # #################################################### Datasets ####################################################
@@ -73,17 +54,15 @@ def main():
     dataset_name = getattr(config.data, "dataset_name", None)
     dataset_config_name = getattr(config.data, "dataset_config_name", None)
     data_dir = getattr(config.data, "data_dir", None)
+    img_col = getattr(config.data, "image_column", "image")
+    capt_col = getattr(config.data, "caption_column", "caption")
 
     assert config.expert_id is not None, "expert index must be provided"
 
-    def collate_fn(examples):
-        # get a list of images and captions from examples which is a list of dictionaries
-        captions = [example["caption"] for example in examples]
-        images = [example["image"] for example in examples]
-        if "__key__" not in examples[0]:
-            return {"image": images, "caption": captions}
-        else:
-            return {"caption": captions, "key": [example["__key__"] for example in examples], "image": images}
+    def collate_fn(examples, caption_column="caption", image_column="image"):
+        captions = [example[caption_column] for example in examples]
+        images = [example[image_column] for example in examples]
+        return {"image": images, "caption": captions}
 
     if dataset_name is not None:
         # Downloading and loading a dataset from the hub.
@@ -95,70 +74,34 @@ def main():
         )
 
     else:
+        dataset = get_dataset(config.data)
+
         if "conceptual_captions" in data_dir or "cc3m" in data_dir:
             dataset_name = "cc3m"
-            dataset = load_cc3m_webdataset(data_dir, split="validation", resampled=False)
-
-            fid_val_indices_path = os.path.abspath(
-                os.path.join(config.finetuning_ckpt_dir, "..", "..", f"{dataset_name}_validation_mapped_indices.pkl"))
-            assert os.path.exists(fid_val_indices_path), \
-                f"{dataset_name}_validation_mapped_indices.pkl must be present in two upper directory of the checkpoint directory {config.finetuning_ckpt_dir}"
-            val_indices = pickle.load(open(fid_val_indices_path, "rb"))
-            length = len([x for x in val_indices if val_indices[x] == config.expert_id])
-            dataset = dataset.select(lambda x: val_indices[x["__key__"]] == config.expert_id)
-            dataset = dataset.batched(config.data.dataloader.image_generation_batch_size * accelerator.num_processes,
-                                      collation_fn=collate_fn)
-
-            dataloader = wds.WebLoader(dataset,
-                                       batch_size=None,
-                                       shuffle=False, pin_memory=True,
-                                       num_workers=config.data.dataloader.dataloader_num_workers)
-
-            # dataloader = torch.utils.data.DataLoader(
-            #     dataset,
-            #     shuffle=False,
-            #     batch_size=config.data.dataloader.image_generation_batch_size * accelerator.num_processes,
-            #     num_workers=config.data.dataloader.dataloader_num_workers,
-            #     collate_fn=collate_fn
-            # )
-
-
-            logger.info("Dataset of size %d loaded." % length)
 
         elif "coco" in data_dir:
             dataset_name = "coco"
-            year = config.data.year
-            dataset = {
-                "validation": load_coco_dataset(os.path.join(data_dir, "images", f"val{year}"),
-                                                os.path.join(data_dir, "annotations", f"captions_val{year}.json"))}
 
-            def filter_dataset(dataset, validation_indices):
-                dataset["validation"] = dataset["validation"].select(
-                    torch.where(validation_indices == config.expert_id)[0])
-                return dataset
+    dataset = dataset["validation"]
+    fid_val_indices_path = os.path.abspath(
+        os.path.join(config.finetuning_ckpt_dir, "..", "..", f"{dataset_name}_validation_mapped_indices.pt"))
+    assert os.path.exists(fid_val_indices_path), \
+        (f"{dataset_name}_validation_mapped_indices.pt must be present in two upper directory of the checkpoint"
+         f" directory {config.finetuning_ckpt_dir}")
+    val_indices = torch.load(fid_val_indices_path, map_location="cpu")
 
-            fid_val_indices_path = os.path.abspath(
-                os.path.join(config.finetuning_ckpt_dir, "..", "..", f"{dataset_name}_validation_mapped_indices.pt"))
-            assert os.path.exists(fid_val_indices_path), \
-                f"{dataset_name}_validation_mapped_indices.pt must be present in two upper directory of the checkpoint directory {config.finetuning_ckpt_dir}"
-            val_indices = torch.load(fid_val_indices_path, map_location="cpu")
-            dataset = filter_dataset(dataset, validation_indices=val_indices)
-            dataset = dataset["validation"]
-            logger.info("Dataset of size %d loaded." % len(dataset))
+    dataset = dataset.select(torch.where(val_indices == config.expert_id)[0])
+    logger.info("Dataset of size %d loaded." % len(dataset))
 
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        shuffle=False,
+        batch_size=config.data.dataloader.image_generation_batch_size * accelerator.num_processes,
+        num_workers=config.data.dataloader.dataloader_num_workers,
+        collate_fn=partial(collate_fn, caption_column=capt_col, image_column=img_col),
+    )
 
-            dataloader = torch.utils.data.DataLoader(
-                dataset,
-                shuffle=False,
-                batch_size=config.data.dataloader.image_generation_batch_size * accelerator.num_processes,
-                num_workers=config.data.dataloader.dataloader_num_workers,
-                collate_fn=collate_fn
-            )
-
-        else:
-            raise ValueError(f"Dataset {data_dir} not supported.")
-
-        dataloader = accelerator.prepare(dataloader)
+    dataloader = accelerator.prepare(dataloader)
 
     # #################################################### Models ####################################################
     arch_v = torch.load(os.path.join(config.finetuning_ckpt_dir, "arch_vector.pt"), map_location="cpu")
@@ -191,7 +134,7 @@ def main():
 
     pipeline.to(accelerator.device)
 
-    image_output_dir = os.path.join(config.finetuning_ckpt_dir, "..", "..", f"fid_images_{dataset_name}")
+    image_output_dir = os.path.join(config.finetuning_ckpt_dir, "..", "..", f"{dataset_name}_fid_images")
     os.makedirs(image_output_dir, exist_ok=True)
 
     for batch in dataloader:
@@ -199,15 +142,12 @@ def main():
             generator = None
         else:
             generator = torch.Generator(device=accelerator.device).manual_seed(config.seed)
-        gen_images = pipeline(batch["caption"], num_inference_steps=config.training.num_inference_steps,
+        gen_images = pipeline(batch[capt_col], num_inference_steps=config.training.num_inference_steps,
                               generator=generator, output_type="np"
                               ).images
 
-        for idx, caption in enumerate(batch["caption"]):
-            if 'key' not in batch:
-                image_name = batch["image"][idx].split("/")[-1]
-            else:
-                image_name = batch["key"][idx] + ".jpg"
+        for idx, caption in enumerate(batch[capt_col]):
+            image_name = batch["image"][idx].split("/")[-1]
             image_path = os.path.join(image_output_dir, f"{image_name[:-4]}.npy")
             img = gen_images[idx]
             img = img * 255
