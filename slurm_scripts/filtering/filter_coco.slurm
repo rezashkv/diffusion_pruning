@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=sd-prune-coco            # Specify a name for your job
+#SBATCH --job-name=sd-filter-coco            # Specify a name for your job
 #SBATCH --output=logs/out-%x-%j.log         # Specify the output log file
 #SBATCH --error=logs/err-%x-%j.log          # Specify the error log file
 #SBATCH --cpus-per-task=8                   # Number of CPU cores per task
@@ -27,7 +27,7 @@ NNODES=$SLURM_NNODES
 NODE_RANK=$SLURM_PROCID
 WORLD_SIZE=$(($SLURM_GPUS_ON_NODE * $NNODES))
 
-echo "MASTER_ADDR"=$MAIN_ADDR
+echo "MAIN_ADDR"=$MAIN_ADDR
 echo "NNODES"=$NNODES
 echo "NODE_RANK"=$NODE_RANK
 
@@ -59,7 +59,7 @@ CMD=" \
 LAUNCHER="accelerate launch \
     --num_machines $NNODES \
     --num_processes $WORLD_SIZE \
-    --main_process_ip "$MAIN_ADDR" \
+    --main_process_ip $MAIN_ADDR \
     --main_process_port $MAIN_PORT \
     --machine_rank \$SLURM_PROCID \
     --role $SLURMD_NODENAME: \
