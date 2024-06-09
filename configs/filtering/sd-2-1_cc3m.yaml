@@ -1,0 +1,19 @@
+data:
+  dataset_name: cc3m
+  data_files: null
+  dataset_config_name: null
+  data_dir: "/path/to/conceptual_captions"
+
+  train_data_dir: "training"
+  train_data_file: "Train_GCC-training.tsv"
+  max_train_samples: null
+
+  validation_data_dir: "validation"
+  validation_data_file: "Validation_GCC-1.1.0-Validation.tsv"
+  max_validation_samples: 1000
+
+  image_column: "image"
+  caption_column: "caption"
+
+  prompts: null
+  max_generated_samples: 16

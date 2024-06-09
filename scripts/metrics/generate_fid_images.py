@@ -52,8 +52,6 @@ def main():
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
     dataset_name = getattr(config.data, "dataset_name", None)
-    dataset_config_name = getattr(config.data, "dataset_config_name", None)
-    data_dir = getattr(config.data, "data_dir", None)
     img_col = getattr(config.data, "image_column", "image")
     capt_col = getattr(config.data, "caption_column", "caption")
 
@@ -64,23 +62,7 @@ def main():
         images = [example[image_column] for example in examples]
         return {"image": images, "caption": captions}
 
-    if dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            dataset_name,
-            dataset_config_name,
-            cache_dir=config.cache_dir,
-            ignore_verifications=True
-        )
-
-    else:
-        dataset = get_dataset(config.data)
-
-        if "conceptual_captions" in data_dir or "cc3m" in data_dir:
-            dataset_name = "cc3m"
-
-        elif "coco" in data_dir:
-            dataset_name = "coco"
+    dataset = get_dataset(config.data)
 
     dataset = dataset["validation"]
     fid_val_indices_path = os.path.abspath(

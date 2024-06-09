@@ -60,6 +60,7 @@ def main():
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
     dataset = get_dataset(config.data)
+    dataset_name = config.data.dataset_name
     column_names = dataset["train"].column_names
 
     caption_column = config.data.caption_column
@@ -68,12 +69,12 @@ def main():
             f"--caption_column' value '{config.data.caption_column}' needs to be one of: {', '.join(column_names)}"
         )
 
-    if not (os.path.exists(os.path.join(config.pruning_ckpt_dir, "train_mapped_indices.pt")) and
-            os.path.exists(os.path.join(config.pruning_ckpt_dir, "validation_mapped_indices.pt"))):
+    if not (os.path.exists(os.path.join(config.pruning_ckpt_dir, f"{dataset_name}_train_mapped_indices.pt")) and
+            os.path.exists(os.path.join(config.pruning_ckpt_dir, f"{dataset_name}_validation_mapped_indices.pt"))):
         tr_indices, val_indices = filter_dataset(dataset, hyper_net, quantizer, mpnet_model, mpnet_tokenizer,
                                                  caption_column=caption_column)
-        torch.save(tr_indices, os.path.join(config.pruning_ckpt_dir, "train_mapped_indices.pt"))
-        torch.save(val_indices, os.path.join(config.pruning_ckpt_dir, "validation_mapped_indices.pt"))
+        torch.save(tr_indices, os.path.join(config.pruning_ckpt_dir, f"{dataset_name}_train_mapped_indices.pt"))
+        torch.save(val_indices, os.path.join(config.pruning_ckpt_dir, f"{dataset_name}_validation_mapped_indices.pt"))
 
 
 if __name__ == "__main__":

@@ -1475,6 +1475,7 @@ class FineTuner(Trainer):
     def init_datasets(self):
         logger.info("Loading datasets...")
         dataset = get_dataset(self.config.data)
+        dataset_name = self.config.data.dataset_name
 
         column_names = dataset["train"].column_names
         caption_column = self.config.data.caption_column
@@ -1483,8 +1484,10 @@ class FineTuner(Trainer):
                 f"--caption_column '{self.config.data.caption_column}' needs to be one of: {', '.join(column_names)}"
             )
 
-        train_mapped_indices_path = os.path.join(self.config.pruning_ckpt_dir, "train_mapped_indices.pt")
-        validation_mapped_indices_path = os.path.join(self.config.pruning_ckpt_dir, "validation_mapped_indices.pt")
+        train_mapped_indices_path = os.path.join(self.config.pruning_ckpt_dir,
+                                                 f"{dataset_name}_train_mapped_indices.pt")
+        validation_mapped_indices_path = os.path.join(self.config.pruning_ckpt_dir,
+                                                      f"{dataset_name}validation_mapped_indices.pt")
         if os.path.exists(train_mapped_indices_path) and os.path.exists(validation_mapped_indices_path):
             logging.info("Skipping filtering dataset. Loading indices from disk.")
             tr_indices = torch.load(train_mapped_indices_path, map_location="cpu")

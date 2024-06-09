@@ -15,8 +15,6 @@ def get_dataset(config):
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    dataset_name = getattr(config, "dataset_name", None)
-    dataset_config_name = getattr(config, "dataset_config_name", None)
     data_dir = getattr(config, "data_dir", None)
 
     train_data_dir = getattr(config, "train_data_dir", None)
@@ -25,46 +23,36 @@ def get_dataset(config):
     validation_data_dir = getattr(config, "validation_data_dir", None)
     validation_data_file = getattr(config, "validation_data_file", None)
 
-    if dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            dataset_name,
-            dataset_config_name,
-            cache_dir=config.cache_dir,
-            ignore_verifications=True
-        )
+    if "conceptual_captions" in data_dir:
+        dataset = {"train": load_cc3m_dataset(data_dir,
+                                              split="train",
+                                              split_file=train_data_file,
+                                              split_dir=train_data_dir)}
+        if validation_data_dir is not None:
+            dataset["validation"] = load_cc3m_dataset(data_dir,
+                                                      split="validation",
+                                                      split_file=validation_data_file,
+                                                      split_dir=validation_data_dir)
+
+    elif "coco" in data_dir:
+        year = config.year
+        dataset = {"train": load_coco_dataset(os.path.join(data_dir, "images", f"train{year}"),
+                                              os.path.join(data_dir, "annotations", f"captions_train{year}.json")),
+                   "validation": load_coco_dataset(os.path.join(data_dir, "images", f"val{year}"),
+                                                   os.path.join(data_dir, "annotations",
+                                                                f"captions_val{year}.json"))}
 
     else:
-        if "conceptual_captions" in data_dir:
-            dataset = {"train": load_cc3m_dataset(data_dir,
-                                                  split="train",
-                                                  split_file=train_data_file,
-                                                  split_dir=train_data_dir)}
-            if validation_data_dir is not None:
-                dataset["validation"] = load_cc3m_dataset(data_dir,
-                                                          split="validation",
-                                                          split_file=validation_data_file,
-                                                          split_dir=validation_data_dir)
-
-        elif "coco" in data_dir:
-            year = config.year
-            dataset = {"train": load_coco_dataset(os.path.join(data_dir, "images", f"train{year}"),
-                                                  os.path.join(data_dir, "annotations", f"captions_train{year}.json")),
-                       "validation": load_coco_dataset(os.path.join(data_dir, "images", f"val{year}"),
-                                                       os.path.join(data_dir, "annotations",
-                                                                    f"captions_val{year}.json"))}
-
-        else:
-            data_files = {}
-            if config.data_dir is not None:
-                data_files["train"] = os.path.join(config.data_dir, "**")
-            dataset = load_dataset(
-                "imagefolder",
-                data_files=data_files,
-                cache_dir=config.cache_dir,
-            )
-            # See more about loading custom images at
-            # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
+        data_files = {}
+        if config.data_dir is not None:
+            data_files["train"] = os.path.join(config.data_dir, "**")
+        dataset = load_dataset(
+            "imagefolder",
+            data_files=data_files,
+            cache_dir=config.cache_dir,
+        )
+        # See more about loading custom images at
+        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
     return dataset
 

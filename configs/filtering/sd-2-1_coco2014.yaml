@@ -1,0 +1,15 @@
+data:
+  dataset_name: coco
+  data_files: null
+  dataset_config_name: null
+  data_dir: "path/to/coco"
+
+  max_train_samples: null
+  max_validation_samples: 10
+  year: 2014 # 2014 or 2017. 2014 is used in the paper.
+
+  image_column: "image"
+  caption_column: "caption"
+
+  prompts: null
+  max_generated_samples: 2

@@ -62,15 +62,15 @@ data:
 
   dataloader:
     dataloader_num_workers: 0
-    train_batch_size: 64
-    validation_batch_size: 16
-    image_generation_batch_size: 4
+    train_batch_size: 128
+    validation_batch_size: 32
+    image_generation_batch_size: 8
     center_crop: false
     random_flip: true
 
 training:
   num_train_epochs: null
-  max_train_steps: 5000
+  max_train_steps: 30000
   hypernet_pretraining_steps: 500
   validation_steps: 1000
   image_logging_steps: 1000
@@ -86,38 +86,17 @@ training:
   losses:
     diffusion_loss:
       snr_gamma: 5.0
-      weight: 1.0
-
-    resource_loss:
-      type: log
-      weight: 2.0
-      pruning_target: 0.6
-
-    contrastive_loss:
-      arch_vector_temperature: 0.03
-      prompt_embedding_temperature: 0.03
-      weight: 100.0
+      weight: 0.01
 
     distillation_loss:
-      weight: 0.2
+      weight: 0.5
 
     block_loss:
-      weight: 0.2
-
-    std_loss:
-      weight: 0.1
-
-    max_loss:
-      weight: 0.1
+      weight: 0.5
 
 
   optim:
-    hypernet_learning_rate: 2e-4
-    quantizer_learning_rate: 2e-4
-    unet_learning_rate: 5e-5
-
-    quantizer_weight_decay: 0.00
-    hypernet_weight_decay: 0.00
+    unet_learning_rate: 1e-5
     unet_weight_decay: 0.00
 
     use_8bit_adam: false
@@ -127,7 +106,7 @@ training:
 
     scale_lr: true
     lr_scheduler: "constant_with_warmup" # see pdm.utils.arg_utils for available options
-    lr_warmup_steps: 100
+    lr_warmup_steps: 250
 
 
   hf_hub:
@@ -144,5 +123,5 @@ training:
 
     checkpoints_total_limit: 1
     auto_checkpoint_step: false
-    resume_from_checkpoint: null # or latest
+    resume_from_checkpoint: latest # or null
 

@@ -25,52 +25,33 @@ model:
     gated_ff: true
     ff_gate_width: 32
 
-  hypernet:
-    weight_norm: false
-    linear_bias: true
-    single_arch_param: false # if true, train a single experts for all prompts (used as a baseline in the paper)
-
-  quantizer:
-    quantizer_T: 0.4
-    quantizer_base: 3
-    num_arch_vq_codebook_embeddings: 8
-    arch_vq_beta: 0.25
-    depth_order: [-1, -2, 0, 1, -3, -4, 2, 3, -5, -6, 4, 5, -7, 6]
-    non_zero_width: true
-    resource_aware_normalization: false
-    optimal_transport: true
-
 data:
-  dataset_name: cc3m
+  dataset_name: coco
   data_files: null
   dataset_config_name: null
-  data_dir: "/path/to/conceptual_captions"
+  data_dir: "path/to/coco"
 
-  train_data_dir: "training"
-  train_data_file: "Train_GCC-training.tsv"
   max_train_samples: null
-
-  validation_data_dir: "validation"
-  validation_data_file: "Validation_GCC-1.1.0-Validation.tsv"
-  max_validation_samples: 1000
+  max_validation_samples: 10
+  year: 2014 # 2014 or 2017. 2014 is used in the paper.
 
   image_column: "image"
   caption_column: "caption"
 
   prompts: null
-  max_generated_samples: 16
+  max_generated_samples: 2
 
   dataloader:
     dataloader_num_workers: 0
-    train_batch_size: 64
-    validation_batch_size: 16
-    image_generation_batch_size: 4
+    train_batch_size: 128
+    validation_batch_size: 32
+    image_generation_batch_size: 8
     center_crop: false
     random_flip: true
 
 training:
   num_train_epochs: null
-  max_train_steps: 5000
+  max_train_steps: 30000
   hypernet_pretraining_steps: 500
   validation_steps: 1000
   image_logging_steps: 1000
@@ -112,12 +93,7 @@ training:
 
 
   optim:
-    hypernet_learning_rate: 2e-4
-    quantizer_learning_rate: 2e-4
-    unet_learning_rate: 5e-5
-
-    quantizer_weight_decay: 0.00
-    hypernet_weight_decay: 0.00
+    unet_learning_rate: 1e-5
     unet_weight_decay: 0.00
 
     use_8bit_adam: false
@@ -127,7 +103,7 @@ training:
 
     scale_lr: true
     lr_scheduler: "constant_with_warmup" # see pdm.utils.arg_utils for available options
-    lr_warmup_steps: 100
+    lr_warmup_steps: 250
 
 
   hf_hub:
@@ -144,5 +120,5 @@ training:
 
     checkpoints_total_limit: 1
     auto_checkpoint_step: false
-    resume_from_checkpoint: null # or latest
+    resume_from_checkpoint: latest # or null
 
