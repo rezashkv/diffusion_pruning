@@ -1,0 +1,54 @@
+model:
+  unet:
+    pretrained_model_name_or_path: stabilityai/stable-unet-2-1
+    input_perturbation: 0.0
+    revision: null
+    resolution: 256
+    use_ema: false
+    noise_offset: 0.0
+    prediction_type: v_prediction
+    max_scheduler_steps: null
+    unet_down_blocks:
+      - CrossAttnDownBlock2DHalfGated
+      - CrossAttnDownBlock2DHalfGated
+      - CrossAttnDownBlock2DHalfGated
+      - DownBlock2DHalfGated
+
+    unet_mid_block: UNetMidBlock2DCrossAttnWidthGated
+
+    unet_up_blocks:
+      - UpBlock2DHalfGated
+      - CrossAttnUpBlock2DHalfGated
+      - CrossAttnUpBlock2DHalfGated
+      - CrossAttnUpBlock2DHalfGated
+
+    gated_ff: true
+    ff_gate_width: 32
+
+data:
+  dataset_name: cc3m
+  data_files: null
+  dataset_config_name: null
+  data_dir: "/path/to/conceptual_captions"
+
+  train_data_dir: "training"
+  train_data_file: "Train_GCC-training.tsv"
+  max_train_samples: null
+
+  validation_data_dir: "validation"
+  validation_data_file: "Validation_GCC-1.1.0-Validation.tsv"
+  max_validation_samples: null
+
+  image_column: "image"
+  caption_column: "caption"
+
+  dataloader:
+    dataloader_num_workers: 0
+    image_generation_batch_size: 8
+
+training:
+  num_inference_steps: 50 # number of scheduler steps to run for image generation
+  local_rank: -1
+  enable_xformers_memory_efficient_attention: false
+
+

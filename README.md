@@ -109,12 +109,12 @@ accelerate launch scripts/aptp/prune.py \
 ```
 This will create a checkpoint directory named "wandb_run_name" in the logging directory specified in the config file. 
 
-### 2.Data Preparation for Fine-tuning
+### 2. Data Preparation for Fine-tuning
 The pruning stages results in $K$ architecture codes (experts). We need to assign training prompts to its corresponding expert for fine-tuning. Assuming the pruning checkpoint directory is `pruning_checkpoint_dir`, you can run the following command to run this filtering process:
 
 ```bash
 accelerate launch scripts/aptp/filter_dataset.py \
-    --pruning_checkpoint_dir path/to/pruning_checkpoint_dir \
+    --pruning_ckpt_dir path/to/pruning_checkpoint_dir \
     --base_config_path path/to/configs/filtering/dataset.yaml \
     --cache_dir /path/to/.cache/huggingface/
 ```
@@ -124,14 +124,33 @@ After filtering the dataset, you can use the following command to fine-tune an e
 
 ```bash
 accelerate launch scripts/aptp/finteune.py \
-    --pruning_checkpoint_dir path/to/pruning_checkpoint_dir \
+    --pruning_ckpt_dir path/to/pruning_checkpoint_dir \
     --expert_id INDEX \
-    --base_config_path path/to/configs/filtering/dataset.yaml \
+    --base_config_path path/to/configs/finetuning/dataset.yaml \
     --cache_dir /path/to/.cache/huggingface/ \
     --wandb_run_name WANDB_FINETUNING_RUN_NAME
 ```
 
-## Additional Notes
+## Image Generation
+
+To generate images using the experts run:
+
+```bash
+accelerate launch scripts/metrics/generate_fid_images.py \
+    --finetuning_ckpt_dir path/to/pruning_checkpoint_dir \
+    --expert_id INDEX \
+    --base_config_path path/to/configs/img_generation/dataset.yaml \
+    --cache_dir /path/to/.cache/huggingface/
+```
+It will save the generated images in the parent fine-tuning checkpoint directory that includes each expert's directory. The image directory will be named `{DATASET}_fid_images`
+
+## Evaluation
+To evaluate APTP, we report the FID score of the generated images, as well as CLIP Score and CMMD.
+
+### 1. FID Score
+
+
+```bash
 
 ## License
 
