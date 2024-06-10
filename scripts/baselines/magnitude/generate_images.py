@@ -13,13 +13,15 @@ import accelerate
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 
-from diffusers import PNDMScheduler
+from diffusers import PNDMScheduler, UNet2DConditionModel
 from diffusers.utils import check_min_version
 from diffusers import StableDiffusionPipeline
 
 import safetensors
 
-from pdm.models.diffusion import UNet2DConditionModelPruned
+from transformers import CLIPTextModel
+
+from pdm.models.unet import UNet2DConditionModelMagnitudePruned
 from pdm.utils.arg_utils import parse_args
 from pdm.utils.data_utils import get_dataset
 
@@ -85,16 +87,28 @@ def main():
     dataloader = accelerator.prepare(dataloader)
 
     # #################################################### Models ####################################################
-    arch_v = torch.load(os.path.join(config.finetuning_ckpt_dir, "arch_vector.pt"), map_location="cpu")
+    text_encoder = CLIPTextModel.from_pretrained(
+            config.pretrained_model_name_or_path, subfolder="text_encoder", revision=config.revision
+        )
 
-    unet = UNet2DConditionModelPruned.from_pretrained(
+    teacher_unet = UNet2DConditionModel.from_pretrained(
         config.pretrained_model_name_or_path,
         subfolder="unet",
         revision=config.revision,
-        down_block_types=config.model.unet.unet_down_blocks,
-        mid_block_type=config.model.unet.unet_mid_block,
-        up_block_types=config.model.unet.unet_up_blocks,
-        arch_vector=arch_v
+    )
+
+    sample_inputs = {'sample': torch.randn(1, teacher_unet.config.in_channels, teacher_unet.config.sample_size, teacher_unet.config.sample_size),
+                      'timestep': torch.ones((1,)).long(),
+                      'encoder_hidden_states': text_encoder(torch.tensor([[100]]))[0],
+                      }
+
+    unet = UNet2DConditionModelMagnitudePruned.from_pretrained(
+        config.pretrained_model_name_or_path,
+        subfolder="unet",
+        revision=config.non_ema_revision,
+        target_pruning_rate=config.training.pruning_target,
+        pruning_method=config.training.pruning_method,
+        sample_inputs=sample_inputs
     )
 
     state_dict = safetensors.torch.load_file(os.path.join(config.finetuning_ckpt_dir, "unet",
@@ -115,7 +129,7 @@ def main():
 
     pipeline.to(accelerator.device)
 
-    image_output_dir = os.path.join(config.finetuning_ckpt_dir, "..", "..", f"{dataset_name}_fid_images")
+    image_output_dir = os.path.join(config.finetuning_ckpt_dir, f"{dataset_name}_fid_images")
     os.makedirs(image_output_dir, exist_ok=True)
 
     for batch in dataloader:
@@ -131,6 +145,7 @@ def main():
             image_name = batch["image"][idx].split("/")[-1]
             if image_name.endswith(".jpg"):
                 image_name = image_name[:-4]
+
             image_path = os.path.join(image_output_dir, f"{image_name}.npy")
             img = gen_images[idx]
             img = img * 255
