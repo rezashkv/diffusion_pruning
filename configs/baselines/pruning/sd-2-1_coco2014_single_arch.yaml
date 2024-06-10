@@ -67,7 +67,7 @@ data:
 training:
   num_train_epochs: null
   max_train_steps: 5000
-  hypernet_pretraining_steps: 500
+  hypernet_pretraining_steps: 5000
   validation_steps: 1000
   image_logging_steps: 1000
   num_inference_steps: 50 # number of scheduler steps to run for image generation
