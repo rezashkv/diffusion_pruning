@@ -189,7 +189,7 @@ We use the [cmmd-pytorch](https://github.com/sayakpaul/cmmd-pytorch) library to 
 
 
 ## Baselines
-
+Refer to [here](configs/baselines) for config files for all baselines mentioned in the paper. The scripts to run these baselines are in [this directory](scripts/baselines/).
 
 
 ## License

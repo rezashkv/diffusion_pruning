@@ -47,7 +47,7 @@ data:
     image_generation_batch_size: 8
 
 training:
-  num_inference_steps: 50 # number of scheduler steps to run for image generation
+  num_inference_steps: 25 # number of scheduler steps to run for image generation
   local_rank: -1
   enable_xformers_memory_efficient_attention: false
 
