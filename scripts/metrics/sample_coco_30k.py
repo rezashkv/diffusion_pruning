@@ -2,6 +2,7 @@ import os
 import json
 import numpy as np
 import argparse
+import cv2
 
 from PIL import Image
 
@@ -47,6 +48,7 @@ def main(args):
         image_path = os.path.join(images_dir, f"COCO_val2014_{image_id:012d}.jpg")
         img = Image.open(image_path).convert("RGB")
         data = np.asarray(img)
+        data = cv2.resize(data, (256, 256))
         output_path = os.path.join(output_dir, f"COCO_val2014_{image_id:012d}.npy")
         np.save(output_path, data)
 

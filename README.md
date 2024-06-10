@@ -110,7 +110,7 @@ accelerate launch scripts/aptp/prune.py \
 This will create a checkpoint directory named "wandb_run_name" in the logging directory specified in the config file. 
 
 ### 2. Data Preparation for Fine-tuning
-The pruning stages results in $K$ architecture codes (experts). We need to assign training prompts to its corresponding expert for fine-tuning. Assuming the pruning checkpoint directory is `pruning_checkpoint_dir`, you can run the following command to run this filtering process:
+The pruning stages results in $K$ architecture codes (experts). We need to assign training prompts to its corresponding expert for fine-tuning. Assuming the pruning checkpoint directory is `pruning_checkpoint_dir`, you can use the following command to run this filtering process:
 
 ```bash
 accelerate launch scripts/aptp/filter_dataset.py \
@@ -148,9 +148,21 @@ It will save the generated images in the parent fine-tuning checkpoint directory
 To evaluate APTP, we report the FID score of the generated images, as well as CLIP Score and CMMD.
 
 ### 1. FID Score
+We use the library [clean-fid](https://github.com/GaParmar/clean-fid) to calculate the FID score. The numbers reported in the paper are calculated using this pytorch legacy mode.
 
+#### 1.1 FID on Conceptual Captions
+We report FID on the validation set of Conceptual Captions. So we can use the same validation mapped indices file created in the filtering process. First, we need to resize the images to 256x256. You can use the [provided script](scripts/metrics/resize_and_save_images.py). It will save the images as numpy arrays in the same root directory of the dataset.
+Then generate custom statistics for the validation set using the following command:
 
 ```bash
+from cleanfid import fid
+fid.make_custom_stats("cc3m", dataset_path, mode="legacy_pytorch") # mode can be clean too.
+```
+
+### 1.2 FID on MS-COCO
+We sample 30k images from the 2014 validation set of MS-COCO. We provide the [sample and resize script](scripts/metrics/sample_coco_30k.py). Then generate custom statistics for this subset similar to the Conceptual Captions dataset.
+
+Now we can calculate the FID score for the generate images using [the provided script](scripts/metrics/fid.py).
 
 ## License
 

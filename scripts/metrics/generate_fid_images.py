@@ -13,8 +13,6 @@ import accelerate
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 
-from datasets import load_dataset
-
 from diffusers import PNDMScheduler
 from diffusers.utils import check_min_version
 from diffusers import StableDiffusionPipeline
@@ -56,6 +54,7 @@ def main():
     capt_col = getattr(config.data, "caption_column", "caption")
 
     assert config.expert_id is not None, "expert index must be provided"
+    assert config.finetuning_ckpt_dir is not None, "finetuning checkpoint directory must be provided"
 
     def collate_fn(examples, caption_column="caption", image_column="image"):
         captions = [example[caption_column] for example in examples]
