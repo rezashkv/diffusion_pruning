@@ -3,13 +3,31 @@
 An implementation of the
 paper ["Not All Prompts Are Made Equal: Prompt-based Pruning of Text-to-Image Diffusion Models"](https://openreview.net/forum?id=ekR510QsYF)
 
+## Table of Contents
+
+1. [Installation](#installation)
+2. [Data Preparation](#data-preparation)
+   - [Download Conceptual Captions](#1-download-conceptual-captions)
+   - [Download MS-COCO 2014](#2-download-ms-coco-2014)
+3. [Training](#training)
+   - [Pruning](#1-pruning)
+   - [Data Preparation for Fine-tuning](#2-data-preparation-for-fine-tuning)
+   - [Fine-tuning](#3-fine-tuning)
+4. [Image Generation](#image-generation)
+5. [Evaluation](#evaluation)
+   - [FID Score](#1-fid-score)
+   - [CLIP Score](#2-clip-score)
+   - [CMMD](#3-cmmd)
+6. [License](#license)
+7. [Citation](#citation)
+
 ## Installation
 
-To get started, follow these steps:
+Follow these steps to set up the project:
 
 ### 1. Create Conda Environment
 
-Use the provided [env.yaml](env.yaml) file to create a Conda environment:
+Use the provided [env.yaml](env.yaml) file:
 
 ```bash
 conda env create -f env.yaml
@@ -17,7 +35,7 @@ conda env create -f env.yaml
 
 ### 2. Activate the Conda Environment
 
-Activate the newly created Conda environment:
+Activate the environment:
 
 ```bash
 conda activate pdm
@@ -25,7 +43,7 @@ conda activate pdm
 
 ### 3. Install Project Dependencies
 
-Navigate to the project root directory and install the project source using pip:
+From the project root directory, install the dependencies:
 
 ```bash
 pip install -e .
@@ -33,14 +51,11 @@ pip install -e .
 
 ## Data Preparation
 
-Here are the steps to prepare the data for training mentioned in the paper. You can also use your own data with some
-minor modifications to the code.
+Prepare the data for training as mentioned in the paper. You can also adapt the instructions for your own dataset with minor code modifications.
 
 ### 1. Download Conceptual Captions
 
-Download Conceptual captions using the instructions
-provided [here](https://github.com/igorbrigadir/DownloadConceptualCaptions). Place the downloaded data in a directory of
-your choice. Keep the structure of the data as downloaded. The directory should look like this:
+Follow the instructions [here](https://github.com/igorbrigadir/DownloadConceptualCaptions) to download Conceptual Captions. Place the data in a directory of your choice, maintaining the structure:
 
 ```
 conceptual_captions
@@ -54,10 +69,10 @@ conceptual_captions
     └── ...
 ```
 
-#### 1.1 (Optional) Remove Corrupt Images
+#### 1.1 Remove Corrupt Images (Optional)
 
-There are some urls in the Conceptual Captions dataset that are not valid. These could be removed to ensure a more
-efficient training process.
+There are some urls in the Conceptual Captions dataset that are not valid. The download will result in some corrupt files that can't be opened. These could be removed to ensure a more
+efficient training.
 
 ### 2. Download MS-COCO 2014
 
@@ -65,15 +80,12 @@ efficient training process.
 
 Download [2014 train](http://images.cocodataset.org/zips/train2014.zip)
 and [2014 val](http://images.cocodataset.org/zips/val2014.zip) images from
-the [COCO website](http://cocodataset.org/#download). Place the downloaded images in a directory of your choice.
+the [COCO website](http://cocodataset.org/#download). Place them in your chosen directory.
 
 #### 2.2 Download the annotations
 
-Download the [2014 train/val annotations](http://images.cocodataset.org/annotations/annotations_trainval2014.zip) from
-the [COCO website](http://cocodataset.org/#download). Place the downloaded annotations in the same directory as the
-images.
-
-The directory should look like this:
+Download the [2014 train/val annotations](http://images.cocodataset.org/annotations/annotations_trainval2014.zip)
+and place them in the same directory as the images. Your directory should look like this:
 
 ```
 coco
@@ -94,7 +106,7 @@ coco
 
 Training is done in two stages: pruning the pretrained T2I model (Stable Diffusion 2.1 in this case) and fine-tuning each expert on the prompts assigned to it.
 Configuration files for both Conceptual Captions and MS-COCO are provided in the [configs](configs) directory. 
-You can use these configuration files to run the pruning process. Sample [SLURM](https://slurm.schedmd.com/) scripts can be found in the [slurm_scripts](slurm_scripts) for all stages.
+You can use these configuration files to run the pruning process. Sample [SLURM](https://slurm.schedmd.com/) scripts for all stages are in the [slurm_scripts](slurm_scripts).
 
 ### 1. Pruning
 
@@ -107,10 +119,10 @@ accelerate launch scripts/aptp/prune.py \
     --cache_dir /path/to/.cache/huggingface/ \
     --wandb_run_name WANDB_PRUNING_RUN_NAME 
 ```
-This will create a checkpoint directory named "wandb_run_name" in the logging directory specified in the config file. 
+This creates a checkpoint directory named "wandb_run_name" in the logging directory specified in the config file. 
 
 ### 2. Data Preparation for Fine-tuning
-The pruning stages results in $K$ architecture codes (experts). We need to assign training prompts to its corresponding expert for fine-tuning. Assuming the pruning checkpoint directory is `pruning_checkpoint_dir`, you can use the following command to run this filtering process:
+The pruning stages results in $K$ architecture codes (experts). We need to assign each training prompt to its corresponding expert for fine-tuning. Assuming the pruning checkpoint directory is `pruning_checkpoint_dir`, you can use the following command to run this filtering process:
 
 ```bash
 accelerate launch scripts/aptp/filter_dataset.py \
@@ -118,9 +130,11 @@ accelerate launch scripts/aptp/filter_dataset.py \
     --base_config_path path/to/configs/filtering/dataset.yaml \
     --cache_dir /path/to/.cache/huggingface/
 ```
-This process will create two files named `{DATASET}_train_mapped_indices.pt` and `{DATASET}_validation_mapped_indices.pt` in the `pruning_checkpoint_dir` directory. These files contain the expert ids for each prompt in the training and validation sets.
+This creates two files named `{DATASET}_train_mapped_indices.pt` and `{DATASET}_validation_mapped_indices.pt` in the `pruning_checkpoint_dir` directory. These files contain the expert id for each prompt in the training and validation sets.
+
+
 ### 3. Fine-tuning
-After filtering the dataset, you can use the following command to fine-tune an expert on the prompts assigned to it:
+Fine-tune an expert on the prompts assigned to it:
 
 ```bash
 accelerate launch scripts/aptp/finteune.py \
@@ -133,7 +147,7 @@ accelerate launch scripts/aptp/finteune.py \
 
 ## Image Generation
 
-To generate images using the experts run:
+Generate images using the experts:
 
 ```bash
 accelerate launch scripts/metrics/generate_fid_images.py \
@@ -142,27 +156,41 @@ accelerate launch scripts/metrics/generate_fid_images.py \
     --base_config_path path/to/configs/img_generation/dataset.yaml \
     --cache_dir /path/to/.cache/huggingface/
 ```
-It will save the generated images in the parent fine-tuning checkpoint directory that includes each expert's directory. The image directory will be named `{DATASET}_fid_images`
+The generated images will be saved in the`{DATASET}_fid_images` directory within the root finetuning checkpoint directory.
 
 ## Evaluation
-To evaluate APTP, we report the FID score of the generated images, as well as CLIP Score and CMMD.
+To evaluate APTP, we report the FID, CLIP Score, and CMMD.
 
 ### 1. FID Score
-We use the library [clean-fid](https://github.com/GaParmar/clean-fid) to calculate the FID score. The numbers reported in the paper are calculated using this pytorch legacy mode.
+We use [clean-fid](https://github.com/GaParmar/clean-fid) to calculate the FID score. The numbers reported in the paper are calculated using this pytorch legacy mode.
 
-#### 1.1 FID on Conceptual Captions
+#### 1.1 Conceptual Captions Preparation
 We report FID on the validation set of Conceptual Captions. So we can use the same validation mapped indices file created in the filtering process. First, we need to resize the images to 256x256. You can use the [provided script](scripts/metrics/resize_and_save_images.py). It will save the images as numpy arrays in the same root directory of the dataset.
-Then generate custom statistics for the validation set using the following command:
 
+
+#### 1.2 MS-COCO Preparation
+We sample 30k images from the 2014 validation set of MS-COCO. Check out the [sample and resize script](scripts/metrics/sample_coco_30k.py). We need a [filtering step](#2-data-preparation-for-fine-tuning) on this subset to assign prompts to experts.
+
+#### 1.3 Generate Custom Statistics
+
+Generate custom statistics for both sets of reference images::
 ```bash
 from cleanfid import fid
-fid.make_custom_stats("cc3m", dataset_path, mode="legacy_pytorch") # mode can be clean too.
+fid.make_custom_stats(dataset, dataset_path, mode="legacy_pytorch") # mode can be clean too.
 ```
 
-### 1.2 FID on MS-COCO
-We sample 30k images from the 2014 validation set of MS-COCO. We provide the [sample and resize script](scripts/metrics/sample_coco_30k.py). Then generate custom statistics for this subset similar to the Conceptual Captions dataset.
-
 Now we can calculate the FID score for the generate images using [the provided script](scripts/metrics/fid.py).
+
+### 2. CLIP Score
+To calculate clip score, we use [this library](https://github.com/Taited/clip-score). Extract features of reference images with the [clip feature extraction script](scripts/metrics/clip_features.py) and calculate the score using the [clip score script](scripts/metrics/clip_score.py).
+
+### 3. CMMD
+We use the [cmmd-pytorch](https://github.com/sayakpaul/cmmd-pytorch) library to calculate CMMD. Refer to [save_refs.py](cmmd-pytorch/save_refs.py) and [compute_cmmd.py](cmmd-pytorch/compute_cmmd.py) scripts for reference set feature extraction and distance calculation details.
+
+
+## Baselines
+
+
 
 ## License
 
