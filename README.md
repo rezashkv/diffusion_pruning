@@ -18,8 +18,9 @@ paper ["Not All Prompts Are Made Equal: Prompt-based Pruning of Text-to-Image Di
    - [FID Score](#1-fid-score)
    - [CLIP Score](#2-clip-score)
    - [CMMD](#3-cmmd)
-6. [License](#license)
-7. [Citation](#citation)
+6. [Baselines](#baselines)
+7. [License](#license)
+8. [Citation](#citation)
 
 ## Installation
 
@@ -189,7 +190,7 @@ We use the [cmmd-pytorch](https://github.com/sayakpaul/cmmd-pytorch) library to 
 
 
 ## Baselines
-Refer to [here](configs/baselines) for config files for all baselines mentioned in the paper. The scripts to run these baselines are in [this directory](scripts/baselines/).
+Refer to [here](configs/baselines) for config files for all baselines mentioned in the paper. The scripts to run these baselines are in [this directory](scripts/baselines).
 
 
 ## License
