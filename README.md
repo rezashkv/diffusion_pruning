@@ -6,14 +6,14 @@ paper ["Not All Prompts Are Made Equal: Prompt-based Pruning of Text-to-Image Di
 <p align="center">
   <img src="assets/fig_1.gif" alt="APTP Overview" width="600" />
 </p>
-<p align="center">
+<p align="left">
   <em>APTP: We prune a text-to-image diffusion model like Stable Diffusion (left) into a mixture of efficient experts (right) in a prompt-based manner. Our prompt router routes distinct types of prompts to different experts, allowing experts' architectures to be separately specialized by removing layers or channels.</em>
 </p>
 
 <p align="center">
   <img src="assets/fig_2.gif" alt="APTP Pruning Scheme" width="600" />
 </p>
-<p align="center">
+<p align="left">
   <em>APTP pruning scheme. We train the prompt router and the set of architecture codes to prune a
 T2I diffusion model into a mixture of experts. The prompt router consists of three modules. We use
 a Sentence Transformer as the prompt encoder to encode the input prompt into a representation z. Then,
