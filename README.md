@@ -107,7 +107,7 @@ coco
 
 Training is done in two stages: pruning the pretrained T2I model (Stable Diffusion 2.1 in this case) and fine-tuning each expert on the prompts assigned to it.
 Configuration files for both Conceptual Captions and MS-COCO are provided in the [configs](configs) directory. 
-You can use these configuration files to run the pruning process. Sample [SLURM](https://slurm.schedmd.com/) scripts for all stages are in the [slurm_scripts](slurm_scripts).
+You can use these configuration files to run the pruning process. Sample multi-node [SLURM](https://slurm.schedmd.com/) and [PBS](https://www.openpbs.org/) scripts can be found in [cluster scripts](cluster_scripts). 
 
 ### 1. Pruning
 

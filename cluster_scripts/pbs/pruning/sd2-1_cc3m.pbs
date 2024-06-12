@@ -1,0 +1,38 @@
+#PBS -N sd-prune-cc3m
+#PBS -o out.log
+#PBS -e err.log
+#PBS -l select=2:ncpus=64:mem=128gb:ngpus=2:gpu_model=a100:interconnect=hdr,walltime=72:00:00
+
+set -x -e
+
+# log the PBS environment
+echo "start time: $(date)"
+echo "PBS_JOBID="$PBS_JOBID
+echo "PBS_NODELIST"=$PBS_NODELIST
+echo "PBS_NODEFILE"=$PBS_NODEFILE
+echo "PBS_O_WORKDIR"=$PBS_O_WORKDIR
+echo "PBS_GPU_FILE"=$PBS_GPU_FILE
+
+# Training setup
+NNODES=4 #or $PBS_NUM_NODES if it gets set automatically
+GPUS_PER_NODE=2
+
+MAIN_ADDR=$(cat $PBS_NODEFILE | head -n 1)
+MAIN_PORT=5560
+
+
+echo "MASTER_ADDR"=$MASTER_ADDR
+echo "NNODES"=$NNODES
+echo "NODE_RANK"=$NODE_RANK
+
+export WANDB_CACHE_DIR=/path/to/wandb
+
+export NCCL_DEBUG=INF
+
+
+CONFIG_PATH="/path/to/diffusion_pruning/configs/pruning/sd-2-1_cc3m.yaml"
+WANDB_RUN_NAME="prune-sd-2-1_cc3m"
+
+pbsdsh -- bash /path/to/diffusion_pruning/cluster_scripts/pbs/pruning/helper.sh $MAIN_ADDR $MAIN_PORT $NNODES $GPUS_PER_NODE $CONFIG_PATH $WANDB_RUN_NAME
+
+echo "END TIME: $(date)"
