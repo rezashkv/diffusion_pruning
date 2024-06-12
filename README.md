@@ -52,7 +52,7 @@ pip install -e .
 
 ## Data Preparation
 
-Prepare the data for training as mentioned in the paper. You can also adapt the instructions for your own dataset with minor code modifications.
+Prepare the data for training as mentioned in the paper. You can also adapt aptp for your own dataset with minor code modifications.
 
 ### 1. Download Conceptual Captions
 
