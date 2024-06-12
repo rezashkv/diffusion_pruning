@@ -3,6 +3,30 @@
 An implementation of the
 paper ["Not All Prompts Are Made Equal: Prompt-based Pruning of Text-to-Image Diffusion Models"](https://openreview.net/forum?id=ekR510QsYF)
 
+<p align="center">
+  <img src="assets/fig_1.gif" alt="APTP Overview" width="600" />
+</p>
+<p align="center">
+  <em>APTP: We prune a text-to-image diffusion model like Stable Diffusion (left) into a mixture of efficient experts (right) in a prompt-based manner. Our prompt router routes distinct types of prompts to different experts, allowing experts' architectures to be separately specialized by removing layers or channels.</em>
+</p>
+
+<p align="center">
+  <img src="assets/fig_2.gif" alt="APTP Pruning Scheme" width="600" />
+</p>
+<p align="center">
+  <em>APTP pruning scheme. We train the prompt router and the set of architecture codes to prune a
+T2I diffusion model into a mixture of experts. The prompt router consists of three modules. We use
+a Sentence Transformer as the prompt encoder to encode the input prompt into a representation z. Then,
+the architecture predictor transforms z into the architecture embedding e that has the same dimensionality as
+architecture codes. Finally, the router routes the embedding e into an architecture code a(i). We use optimal
+transport to evenly distribute the prompts in a training batch among the architecture codes. The architecture code
+a(i) = (u(i), v(i)) determines pruning the model’s width and depth. We train the prompt router’s parameters and
+architecture codes in an end-to-end manner using the denoising objective of the pruned model L<sub>DDPM</sub>, distillation
+loss between the pruned and original models L<sub>distill</sub>, average resource usage for the samples in the batch R, and
+contrastive objective L<sub>cont</sub>, encouraging embeddings e preserving semantic similarity of the representations z.
+</em>
+</p>
+
 ## Table of Contents
 
 1. [Installation](#installation)
