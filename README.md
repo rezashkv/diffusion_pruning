@@ -16,7 +16,7 @@ paper ["Not All Prompts Are Made Equal: Prompt-based Pruning of Text-to-Image Di
 <p align="left">
   <em>APTP pruning scheme. We train the prompt router and the set of architecture codes to prune a
 T2I diffusion model into a mixture of experts. The prompt router consists of three modules. We use
-a Sentence Transformer as the prompt encoder to encode the input prompt into a representation \( z \). Then,
+a Sentence Transformer as the prompt encoder to encode the input prompt into a representation z. Then,
 the architecture predictor transforms z into the architecture embedding e that has the same dimensionality as
 architecture codes. Finally, the router routes the embedding e into an architecture code a(i). We use optimal
 transport to evenly distribute the prompts in a training batch among the architecture codes. The architecture code
