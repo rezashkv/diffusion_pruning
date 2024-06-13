@@ -2180,6 +2180,15 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
             macs += m.get_prunable_macs()
         return macs
 
+    def get_block_utilization(self):
+        utilization = []
+        for m in self.down_blocks:
+            utilization.append(m.get_block_utilization())
+        utilization.append(self.mid_block.get_block_utilization())
+        for m in self.up_blocks:
+            utilization.append(m.get_block_utilization())
+        return utilization
+
 
 class UNet2DConditionModelPruned(UNet2DConditionModelGated):
     @classmethod

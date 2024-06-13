@@ -65,7 +65,7 @@ class HyperStructure(ModelMixin, ConfigMixin):
     def forward(self, x):
         if self.single_arch_param:
             # repeat the same architecture for all samples in the batch
-            return self.arch.repeat(x.shape[0], 1)
+            return self.arch
         else:
             return self._forward(x)
 

@@ -418,6 +418,9 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
     def get_prunable_macs(self):
         return [self.prunable_macs]
 
+    def get_block_utilization(self):
+        return hard_concrete(self.gate.gate_f).mean(dim=1)
+
     @torch.no_grad()
     def prune(self):
         assert self.gate.gate_f.shape[0] == 1, "Pruning is only supported for single batch size"
@@ -631,6 +634,9 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
 
     def get_prunable_macs(self):
         return [self.prunable_macs]
+
+    def get_block_utilization(self):
+        return hard_concrete(self.gate.gate_f).mean(dim=1) * hard_concrete(self.depth_gate.gate_f)
 
     @torch.no_grad()
     def prune(self):
@@ -916,6 +922,21 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
             macs.append(self.ff.prunable_macs)
         return macs
 
+    def get_block_utilization(self):
+        attn1_ratio = hard_concrete(self.attn1.gate.gate_f).mean(dim=1)
+        attn2_ratio = hard_concrete(self.attn2.gate.gate_f).mean(dim=1)
+        total_prunable_macs = self.attn1.prunable_macs + self.attn2.prunable_macs + (self.ff.prunable_macs if
+                                                                                     self.gated_ff else 0)
+        if self.gated_ff:
+            ff_ratio = hard_concrete(self.ff.net[0].gate.gate_f).mean(dim=1)
+            return (
+                        attn1_ratio * self.attn1.prunable_macs + attn2_ratio * self.attn2.prunable_macs +
+                        ff_ratio * self.ff.prunable_macs) / total_prunable_macs
+        else:
+            return ((
+                        attn1_ratio * self.attn1.prunable_macs + attn2_ratio * self.attn2.prunable_macs) /
+                    total_prunable_macs)
+
 
 class Transformer2DModelWidthGated(Transformer2DModel):
     @register_to_config
@@ -1038,6 +1059,12 @@ class Transformer2DModelWidthGated(Transformer2DModel):
         for tb in self.transformer_blocks:
             macs += tb.get_prunable_macs()
         return macs
+
+    def get_block_utilization(self):
+        util = []
+        for tb in self.transformer_blocks:
+            util.append(tb.get_block_utilization())
+        return torch.stack(util).mean(dim=0)
 
 
 class Transformer2DModelWidthDepthGated(Transformer2DModel):
@@ -1380,7 +1407,7 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
             self.prunable_macs = out_dict["prunable_macs"]
 
         out_dict["cur_prunable_macs"] = ((out_dict["cur_prunable_macs"] + self.total_macs - self.prunable_macs)
-                                          * depth_ratio)
+                                         * depth_ratio)
         out_dict["cur_total_macs"] = out_dict["cur_total_macs"] * (depth_ratio.detach())
 
         return out_dict
@@ -1390,6 +1417,12 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
         for tb in self.transformer_blocks:
             macs += tb.get_prunable_macs()
         return macs
+
+    def get_block_utilization(self):
+        util = []
+        for tb in self.transformer_blocks:
+            util.append(tb.get_block_utilization())
+        return torch.stack(util).mean(dim=0) * hard_concrete(self.depth_gate.gate_f)
 
     @torch.no_grad()
     def prune_module(self):
@@ -1865,6 +1898,16 @@ class CrossAttnDownBlock2DWidthHalfDepthGated(CrossAttnDownBlock2D):
             macs.append(b.get_prunable_macs())
         return macs
 
+    def get_block_utilization(self):
+        util = []
+        blocks = list(zip(self.resnets, self.attentions))
+        for (resnet, attention) in blocks:
+            resnet_util = resnet.get_block_utilization()
+            util.append(resnet_util)
+            attention_util = attention.get_block_utilization()
+            util.append(attention_util)
+        return util
+
 
 class CrossAttnUpBlock2DWidthDepthGated(CrossAttnUpBlock2D):
     def __init__(
@@ -2189,6 +2232,15 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
             macs.append(b.get_prunable_macs())
         return macs
 
+    def get_block_utilization(self):
+        util = []
+        blocks = list(zip(self.resnets, self.attentions))
+        for (resnet, attention) in blocks:
+            resnet_util = resnet.get_block_utilization()
+            util.append(resnet_util)
+            attention_util = attention.get_block_utilization()
+            util.append(attention_util)
+        return util
 
 class DownBlock2DWidthDepthGated(DownBlock2D):
     def __init__(
@@ -2357,6 +2409,12 @@ class DownBlock2DWidthHalfDepthGated(DownBlock2D):
             macs.append(b.get_prunable_macs())
         return macs
 
+    def get_block_utilization(self):
+        util = []
+        for b in self.resnets:
+            util.append(b.get_block_utilization())
+        return util
+
 
 class UpBlock2DWidthHalfDepthGated(UpBlock2D):
     def __init__(
@@ -2484,6 +2542,13 @@ class UpBlock2DWidthHalfDepthGated(UpBlock2D):
         for b in self.resnets:
             macs.append(b.get_prunable_macs())
         return macs
+
+    def get_block_utilization(self):
+        util = []
+        for b in self.resnets:
+            util.append(b.get_block_utilization())
+        return util
+
 
 
 class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
@@ -2661,3 +2726,11 @@ class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):
         for b in self.attentions:
             macs.append(b.get_prunable_macs())
         return macs
+
+    def get_block_utilization(self):
+        util = []
+        for b in self.resnets:
+            util.append(b.get_block_utilization())
+        for b in self.attentions:
+            util.append(b.get_block_utilization())
+        return util
