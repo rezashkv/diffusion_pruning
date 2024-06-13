@@ -1151,7 +1151,7 @@ class Pruner(Trainer):
 
         # During hyper_net pretraining, we don't cluster the architecture vector and directly use it.
         if pretrain:
-            arch_vectors_separated = hyper_net_unwrapped.transform_structure_vector(arch_vector).repeat(text_embeddings.shape[0], 1)
+            arch_vectors_separated = hyper_net_unwrapped.transform_structure_vector(arch_vector.repeat(text_embeddings.shape[0], 1))
         else:
             arch_vectors_separated = hyper_net_unwrapped.transform_structure_vector(arch_vector_quantized)
 
