@@ -1,6 +1,10 @@
 # APTP: Adaptive Prompt-Tailored Pruning of T2I Diffusion Models
 
-An implementation of the
+[![arXiv](https://img.shields.io/badge/arXiv.svg)]() 
+[![Hugging Face Models](https://img.shields.io/badge/🤗%20Hugging%20Face-Models-yellow)](https://huggingface.co/rezashkv/APTP)
+
+
+The implementation of the
 paper ["Not All Prompts Are Made Equal: Prompt-based Pruning of Text-to-Image Diffusion Models"](https://openreview.net/forum?id=ekR510QsYF)
 
 <p align="center">
