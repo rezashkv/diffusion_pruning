@@ -14,6 +14,9 @@
 from typing import Dict
 
 import torch.utils.checkpoint
+
+from huggingface_hub import hf_hub_download
+
 from diffusers.models.attention import FeedForward
 from diffusers.models.modeling_utils import *
 from diffusers import __version__
@@ -2576,10 +2579,17 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
 
         model.register_to_config(_name_or_path=pretrained_model_name_or_path)
 
-        if os.path.exists(os.path.join(pretrained_model_name_or_path, "arch_vector.pt")):
+        try:
+            arch_vector = hf_hub_download(pretrained_model_name_or_path, subfolder=subfolder.rsplit('/', 1)[0],
+                                          filename='arch_vector.pt')
             logger.info(
-                "Loading architecture vector from %s" % os.path.join(pretrained_model_name_or_path, "arch_vector.pt"))
-            arch_vector = torch.load(os.path.join(pretrained_model_name_or_path, "arch_vector.pt"))
+                "Loading architecture vector from %s" % os.path.join(pretrained_model_name_or_path,
+                                                                     "arch_vector.pt"))
+            if isinstance(arch_vector, str):
+                arch_vector = torch.load(arch_vector)
+
+        except:
+            logger.info("No architecture vector found on %s" % pretrained_model_name_or_path)
 
         if random_pruning_ratio is not None:
             logger.info("loading arch vector with random pruning ratio %f" % random_pruning_ratio)
@@ -2590,6 +2600,8 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
             arch_vector_separated = HyperStructure.transform_arch_vector(arch_vector, model.get_structure())
             model.set_structure(arch_vector_separated)
 
+            model_device = model.device
+            model.to("cpu")
             for name, m in model.named_modules():
                 if hasattr(m, "prune"):
                     m.prune()
@@ -2597,6 +2609,8 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
             for m in model.modules():
                 if hasattr(m, "prune_module"):
                     m.prune_module()
+
+            model.to(model_device)
 
         # Set model in evaluation mode to deactivate DropOut modules by default
         model.eval()
