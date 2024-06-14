@@ -2301,9 +2301,7 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
                ```
                """
         cache_dir = kwargs.pop("cache_dir", DIFFUSERS_CACHE)
-        ignore_mismatched_sizes = kwargs.pop("ignore_mismatched_sizes", False)
         force_download = kwargs.pop("force_download", False)
-        from_flax = kwargs.pop("from_flax", False)
         resume_download = kwargs.pop("resume_download", False)
         proxies = kwargs.pop("proxies", None)
         output_loading_info = kwargs.pop("output_loading_info", False)
@@ -2312,50 +2310,27 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
         revision = kwargs.pop("revision", None)
         torch_dtype = kwargs.pop("torch_dtype", None)
         subfolder = kwargs.pop("subfolder", None)
-        device_map = kwargs.pop("device_map", None)
         max_memory = kwargs.pop("max_memory", None)
         offload_folder = kwargs.pop("offload_folder", None)
         offload_state_dict = kwargs.pop("offload_state_dict", False)
-        low_cpu_mem_usage = kwargs.pop("low_cpu_mem_usage", _LOW_CPU_MEM_USAGE_DEFAULT)
         variant = kwargs.pop("variant", None)
-        use_safetensors = kwargs.pop("use_safetensors", None)
         down_block_types = kwargs.pop("down_block_types", None)
         mid_block_type = kwargs.pop("mid_block_type", None)
         up_block_types = kwargs.pop("up_block_types", None)
         arch_vector = kwargs.pop("arch_vector", None)
         random_pruning_ratio = kwargs.pop("random_pruning_ratio", None)
 
+        low_cpu_mem_usage = False
+        ignore_mismatched_sizes = True
         allow_pickle = False
-        if use_safetensors is None:
-            use_safetensors = True
-            allow_pickle = True
-
-        if low_cpu_mem_usage and not is_accelerate_available():
-            low_cpu_mem_usage = False
-            logger.warning(
-                "Cannot initialize model with low cpu memory usage because `accelerate` was not found in the"
-                " environment. Defaulting to `low_cpu_mem_usage=False`. It is strongly recommended to install"
-                " `accelerate` for faster and less memory-intense model loading. You can do so with: \n```\npip"
-                " install accelerate\n```\n."
-            )
-
-        if device_map is not None and not is_accelerate_available():
-            raise NotImplementedError(
-                "Loading and dispatching requires `accelerate`. Please make sure to install accelerate or set"
-                " `device_map=None`. You can install accelerate with `pip install accelerate`."
-            )
+        device_map = None
+        use_safetensors = True
 
         # Check if we can handle device_map and dispatching the weights
         if device_map is not None and not is_torch_version(">=", "1.9.0"):
             raise NotImplementedError(
                 "Loading and dispatching requires torch >= 1.9.0. Please either update your PyTorch version or set"
                 " `device_map=None`."
-            )
-
-        if low_cpu_mem_usage is True and not is_torch_version(">=", "1.9.0"):
-            raise NotImplementedError(
-                "Low memory initialization requires torch >= 1.9.0. Please either update your PyTorch version or set"
-                " `low_cpu_mem_usage=False`."
             )
 
         if low_cpu_mem_usage is False and device_map is not None:
@@ -2403,52 +2378,12 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
 
         # load model
         model_file = None
-        if from_flax:
-            model_file = _get_model_file(
-                pretrained_model_name_or_path,
-                weights_name=FLAX_WEIGHTS_NAME,
-                cache_dir=cache_dir,
-                force_download=force_download,
-                resume_download=resume_download,
-                proxies=proxies,
-                local_files_only=local_files_only,
-                use_auth_token=use_auth_token,
-                revision=revision,
-                subfolder=subfolder,
-                user_agent=user_agent,
-                commit_hash=commit_hash,
-            )
-            model = cls.from_config(config, **unused_kwargs)
 
-            # Convert the weights
-            from diffusers.models.modeling_pytorch_flax_utils import load_flax_checkpoint_in_pytorch_model
-
-            model = load_flax_checkpoint_in_pytorch_model(model, model_file)
-        else:
-            if use_safetensors:
-                try:
-                    model_file = _get_model_file(
-                        pretrained_model_name_or_path,
-                        weights_name=_add_variant(SAFETENSORS_WEIGHTS_NAME, variant),
-                        cache_dir=cache_dir,
-                        force_download=force_download,
-                        resume_download=resume_download,
-                        proxies=proxies,
-                        local_files_only=local_files_only,
-                        use_auth_token=use_auth_token,
-                        revision=revision,
-                        subfolder=subfolder,
-                        user_agent=user_agent,
-                        commit_hash=commit_hash,
-                    )
-                except IOError as e:
-                    if not allow_pickle:
-                        raise e
-                    pass
-            if model_file is None:
+        if use_safetensors:
+            try:
                 model_file = _get_model_file(
                     pretrained_model_name_or_path,
-                    weights_name=_add_variant(WEIGHTS_NAME, variant),
+                    weights_name=_add_variant(SAFETENSORS_WEIGHTS_NAME, variant),
                     cache_dir=cache_dir,
                     force_download=force_download,
                     resume_download=resume_download,
@@ -2460,124 +2395,28 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
                     user_agent=user_agent,
                     commit_hash=commit_hash,
                 )
+            except IOError as e:
+                if not allow_pickle:
+                    raise e
+                pass
 
-            if low_cpu_mem_usage:
-                # Instantiate model with empty weights
-                with accelerate.init_empty_weights():
-                    model = cls.from_config(config, **unused_kwargs)
-
-                # if device_map is None, load the state dict and move the params from meta device to the cpu
-                if device_map is None:
-                    param_device = "cpu"
-                    state_dict = load_state_dict(model_file, variant=variant)
-                    model._convert_deprecated_attention_blocks(state_dict)
-                    # move the params from meta device to cpu
-                    missing_keys = set(model.state_dict().keys()) - set(state_dict.keys())
-                    if len(missing_keys) > 0:
-                        raise ValueError(
-                            f"Cannot load {cls} from {pretrained_model_name_or_path} because the following keys are"
-                            f" missing: \n {', '.join(missing_keys)}. \n Please make sure to pass"
-                            " `low_cpu_mem_usage=False` and `device_map=None` if you want to randomly initialize"
-                            " those weights or else make sure your checkpoint file is correct."
-                        )
-
-                    unexpected_keys = load_model_dict_into_meta(
-                        model,
-                        state_dict,
-                        device=param_device,
-                        dtype=torch_dtype,
-                        model_name_or_path=pretrained_model_name_or_path,
-                    )
-
-                    if cls._keys_to_ignore_on_load_unexpected is not None:
-                        for pat in cls._keys_to_ignore_on_load_unexpected:
-                            unexpected_keys = [k for k in unexpected_keys if re.search(pat, k) is None]
-
-                    if len(unexpected_keys) > 0:
-                        logger.warn(
-                            f"Some weights of the model checkpoint were not used when initializing {cls.__name__}: \n {[', '.join(unexpected_keys)]}"
-                        )
-
-                else:  # else let accelerate handle loading and dispatching.
-                    # Load weights and dispatch according to the device_map
-                    # by default the device_map is None and the weights are loaded on the CPU
-                    try:
-                        accelerate.load_checkpoint_and_dispatch(
-                            model,
-                            model_file,
-                            device_map,
-                            max_memory=max_memory,
-                            offload_folder=offload_folder,
-                            offload_state_dict=offload_state_dict,
-                            dtype=torch_dtype,
-                        )
-                    except AttributeError as e:
-                        # When using accelerate loading, we do not have the ability to load the state
-                        # dict and rename the weight names manually. Additionally, accelerate skips
-                        # torch loading conventions and directly writes into `module.{_buffers, _parameters}`
-                        # (which look like they should be private variables?), so we can't use the standard hooks
-                        # to rename parameters on load. We need to mimic the original weight names so the correct
-                        # attributes are available. After we have loaded the weights, we convert the deprecated
-                        # names to the new non-deprecated names. Then we _greatly encourage_ the user to convert
-                        # the weights so we don't have to do this again.
-
-                        if "'Attention' object has no attribute" in str(e):
-                            logger.warn(
-                                f"Taking `{str(e)}` while using `accelerate.load_checkpoint_and_dispatch` to mean {pretrained_model_name_or_path}"
-                                " was saved with deprecated attention block weight names. We will load it with the deprecated attention block"
-                                " names and convert them on the fly to the new attention block format. Please re-save the model after this conversion,"
-                                " so we don't have to do the on the fly renaming in the future. If the model is from a hub checkpoint,"
-                                " please also re-upload it or open a PR on the original repository."
-                            )
-                            model._temp_convert_self_to_deprecated_attention_blocks()
-                            accelerate.load_checkpoint_and_dispatch(
-                                model,
-                                model_file,
-                                device_map,
-                                max_memory=max_memory,
-                                offload_folder=offload_folder,
-                                offload_state_dict=offload_state_dict,
-                                dtype=torch_dtype,
-                            )
-                            model._undo_temp_convert_self_to_deprecated_attention_blocks()
-                        else:
-                            raise e
-
-                loading_info = {
-                    "missing_keys": [],
-                    "unexpected_keys": [],
-                    "mismatched_keys": [],
-                    "error_msgs": [],
-                }
-            else:
-                model = cls.from_config(config, **unused_kwargs)
-
-                state_dict = load_state_dict(model_file, variant=variant)
-                model._convert_deprecated_attention_blocks(state_dict)
-
-                model, missing_keys, unexpected_keys, mismatched_keys, error_msgs = cls._load_pretrained_model(
-                    model,
-                    state_dict,
-                    model_file,
-                    pretrained_model_name_or_path,
-                    ignore_mismatched_sizes=ignore_mismatched_sizes,
-                )
-
-                loading_info = {
-                    "missing_keys": missing_keys,
-                    "unexpected_keys": unexpected_keys,
-                    "mismatched_keys": mismatched_keys,
-                    "error_msgs": error_msgs,
-                }
-
-        if torch_dtype is not None and not isinstance(torch_dtype, torch.dtype):
-            raise ValueError(
-                f"{torch_dtype} needs to be of type `torch.dtype`, e.g. `torch.float16`, but is {type(torch_dtype)}."
+        if model_file is None:
+            model_file = _get_model_file(
+                pretrained_model_name_or_path,
+                weights_name=_add_variant(WEIGHTS_NAME, variant),
+                cache_dir=cache_dir,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                local_files_only=local_files_only,
+                use_auth_token=use_auth_token,
+                revision=revision,
+                subfolder=subfolder,
+                user_agent=user_agent,
+                commit_hash=commit_hash,
             )
-        elif torch_dtype is not None:
-            model = model.to(torch_dtype)
 
-        model.register_to_config(_name_or_path=pretrained_model_name_or_path)
+        model = cls.from_config(config, **unused_kwargs)
 
         try:
             arch_vector = hf_hub_download(pretrained_model_name_or_path, subfolder=subfolder.rsplit('/', 1)[0],
@@ -2600,8 +2439,6 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
             arch_vector_separated = HyperStructure.transform_arch_vector(arch_vector, model.get_structure())
             model.set_structure(arch_vector_separated)
 
-            model_device = model.device
-            model.to("cpu")
             for name, m in model.named_modules():
                 if hasattr(m, "prune"):
                     m.prune()
@@ -2610,7 +2447,32 @@ class UNet2DConditionModelPruned(UNet2DConditionModelGated):
                 if hasattr(m, "prune_module"):
                     m.prune_module()
 
-            model.to(model_device)
+        state_dict = load_state_dict(model_file, variant=variant)
+        model._convert_deprecated_attention_blocks(state_dict)
+
+        model, missing_keys, unexpected_keys, mismatched_keys, error_msgs = cls._load_pretrained_model(
+            model,
+            state_dict,
+            model_file,
+            pretrained_model_name_or_path,
+            ignore_mismatched_sizes=ignore_mismatched_sizes,
+        )
+
+        loading_info = {
+            "missing_keys": missing_keys,
+            "unexpected_keys": unexpected_keys,
+            "mismatched_keys": mismatched_keys,
+            "error_msgs": error_msgs,
+        }
+
+        if torch_dtype is not None and not isinstance(torch_dtype, torch.dtype):
+            raise ValueError(
+                f"{torch_dtype} needs to be of type `torch.dtype`, e.g. `torch.float16`, but is {type(torch_dtype)}."
+            )
+        elif torch_dtype is not None:
+            model = model.to(torch_dtype)
+
+        model.register_to_config(_name_or_path=pretrained_model_name_or_path)
 
         # Set model in evaluation mode to deactivate DropOut modules by default
         model.eval()
