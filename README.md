@@ -5,7 +5,7 @@
 
 
 The implementation of the
-paper ["Not All Prompts Are Made Equal: Prompt-based Pruning of Text-to-Image Diffusion Models"](https://openreview.net/forum?id=ekR510QsYF)
+paper ["Not All Prompts Are Made Equal: Prompt-based Pruning of Text-to-Image Diffusion Models"]()
 
 <p align="center">
   <img src="assets/fig_1.gif" alt="APTP Overview" width="600" />
