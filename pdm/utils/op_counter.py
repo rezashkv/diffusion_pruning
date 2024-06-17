@@ -1,19 +1,12 @@
-'''
+"""
 This opcounter is adapted from https://github.com/sovrasov/macs-counter.pytorch
-
-Copyright (C) 2021 Sovrasov V. - All Rights Reserved
- * You may use, distribute and modify this code under the
- * terms of the MIT license.
- * You should have received a copy of the MIT license with
- * this file. If not visit https://opensource.org/licenses/MIT
-'''
+"""
 
 import numpy as np
 import torch
 
 from diffusers.models.attention_processor import SpatialNorm
 from diffusers.models.normalization import AdaGroupNorm
-# from diffusers.models.activations import GEGLU
 from diffusers.models.lora import (LoRACompatibleConv, LoRACompatibleLinear)
 from pdm.models.unet.blocks import GatedAttention
 from diffusers.models.attention_processor import Attention
@@ -28,7 +21,7 @@ def count_ops_and_params(model, example_inputs):
     macs_model = add_macs_counting_methods(model)
     macs_model.eval()
     macs_model.start_macs_count(ost=sys.stdout, verbose=False,
-                                  ignore_list=[])
+                                ignore_list=[])
     if isinstance(example_inputs, dict):
         _ = macs_model(**example_inputs)
     elif isinstance(example_inputs, (tuple, list)):
@@ -107,7 +100,7 @@ def conv_macs_counter_hook(conv_module, input, output):
 
     filters_per_channel = out_channels // groups
     conv_per_position_macs = int(np.prod(kernel_dims)) * \
-                              in_channels * filters_per_channel
+                             in_channels * filters_per_channel
 
     active_elements_count = batch_size * int(np.prod(output_dims))
 
