@@ -231,7 +231,7 @@ If you find this work useful, please consider citing the following paper:
 ```bibtex
 @article{2024aptp,
   title={Not All Prompts Are Made Equal: Prompt-based Pruning of Text-to-Image Diffusion Models},
-  author={Shirkavand, Reza and Ganjdanesh, Alireza, and Gao, Shangqian and Huang, Heng},
+  author={Ganjdanesh, Alireza, and Shirkavand, Reza and Gao, Shangqian and Huang, Heng},
   journal={arXiv preprint arXiv:2406.12042},
   year={2024}
 }
