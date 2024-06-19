@@ -226,3 +226,13 @@ Refer to [here](configs/baselines) for config files for all baselines mentioned 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Citation
+If you find this work useful, please consider citing the following paper:
+
+```bibtex
+@article{2024aptp,
+  title={Not All Prompts Are Made Equal: Prompt-based Pruning of Text-to-Image Diffusion Models},
+  author={Shirkavand, Reza and Ganjdanesh, Alireza, and Gao, Shangqian and Huang, Heng},
+  journal={arXiv preprint arXiv:2406.12042},
+  year={2024}
+}
+```
