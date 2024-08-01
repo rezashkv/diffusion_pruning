@@ -1,6 +1,6 @@
 # T2I training skeleton from the diffusers repo:
 # https://github.com/huggingface/diffusers/blob/main/examples/text_to_image/train_text_to_image.py
-
+import copy
 import os
 import shutil
 import logging
@@ -256,7 +256,12 @@ class Trainer(ABC):
         def save_model_hook(models, weights, output_dir):
             if self.accelerator.is_main_process:
                 for i, model in enumerate(models):
-                    if isinstance(model, (UNet2DConditionModel, UNet2DConditionModelGated)):
+                    if (hasattr(self, "pruning_type") and
+                            self.pruning_type == "structural" and
+                            isinstance(model, UNet2DConditionModel)):
+                        logger.info("Save pruned UNet")
+                        model.save_pretrained(os.path.join(output_dir, "unet"))
+                    elif isinstance(model, (UNet2DConditionModel, UNet2DConditionModelGated)):
                         logger.info("Save UNet")
                         model.save_pretrained(os.path.join(output_dir, "unet"))
                     elif isinstance(model, HyperStructure):
@@ -275,7 +280,13 @@ class Trainer(ABC):
             for _ in range(len(models)):
                 # pop models so that they are not loaded again
                 model = models.pop()
-                if isinstance(model, (UNet2DConditionModelPruned, UNet2DConditionModelMagnitudePruned)):
+                if (hasattr(self, "pruning_type") and self.pruning_type == "structural" and
+                        isinstance(model, UNet2DConditionModel)):
+                    state_dict = safetensors.torch.load_file(os.path.join(input_dir, "unet",
+                                                                          "diffusion_pytorch_model.safetensors"))
+                    model.load_state_dict(state_dict)
+                    del state_dict
+                elif isinstance(model, (UNet2DConditionModelPruned, UNet2DConditionModelMagnitudePruned)):
                     state_dict = safetensors.torch.load_file(os.path.join(input_dir, "unet",
                                                                           "diffusion_pytorch_model.safetensors"))
                     model.load_state_dict(state_dict)
@@ -1259,9 +1270,9 @@ class Pruner(Trainer):
         encoder_hidden_states = self.text_encoder(batch["input_ids"][:1])[0]
 
         macs, params = count_ops_and_params(self.unet,
-                                             {'sample': latents,
-                                              'timestep': timesteps,
-                                              'encoder_hidden_states': encoder_hidden_states})
+                                            {'sample': latents,
+                                             'timestep': timesteps,
+                                             'encoder_hidden_states': encoder_hidden_states})
 
         logger.info(
             "UNet's Params/MACs calculated by OpCounter:\tparams: {:.3f}M\t MACs: {:.3f}G".format(
@@ -1269,7 +1280,7 @@ class Pruner(Trainer):
 
         sanity_macs_dict = unet_unwrapped.calc_macs()
         prunable_macs_list = [[e / sanity_macs_dict['prunable_macs'] for e in elem] for elem in
-                               unet_unwrapped.get_prunable_macs()]
+                              unet_unwrapped.get_prunable_macs()]
 
         unet_unwrapped.prunable_macs_list = prunable_macs_list
         unet_unwrapped.resource_info_dict = sanity_macs_dict
@@ -1924,7 +1935,7 @@ class SingleArchFinetuner(FineTuner):
 class BaselineFineTuner(FineTuner):
 
     def __init__(self, config: DictConfig, pruning_type="magnitude"):
-        assert pruning_type in ["magnitude", "random"]
+        assert pruning_type in ["no-pruning", "magnitude", "random", "structural"]
         self.pruning_type = pruning_type
         super().__init__(config)
 
@@ -1972,6 +1983,14 @@ class BaselineFineTuner(FineTuner):
                 pruning_method=self.config.training.pruning_method,
                 sample_inputs=sample_inputs
             )
+        elif self.pruning_type == "structural":
+            unet = torch.load(
+                os.path.join(self.config.pruning_ckpt_dir, "unet_pruned.pth"),
+                map_location="cpu"
+            )
+        elif self.pruning_type == "no-pruning":
+            unet = copy.deepcopy(teacher_unet)
+            unet.requires_grad_(True)
         else:
             unet = UNet2DConditionModelPruned.from_pretrained(
                 self.config.pretrained_model_name_or_path,
