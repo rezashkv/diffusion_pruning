@@ -79,22 +79,23 @@ def main():
     dataloader = accelerator.prepare(dataloader)
 
     # #################################################### Models ####################################################
-    unet = UNet2DConditionModel.from_pretrained(
-        config.pretrained_model_name_or_path,
-        subfolder="unet",
-        revision=config.revision,
-    )
-
-    state_dict = safetensors.torch.load_file(os.path.join(config.finetuning_ckpt_dir, "unet",
-                                                          "diffusion_pytorch_model.safetensors"))
-    unet.load_state_dict(state_dict)
+    # unet = UNet2DConditionModel.from_pretrained(
+    #     config.pretrained_model_name_or_path,
+    #     subfolder="unet",
+    #     revision=config.revision,
+    # )
+    #
+    # state_dict = safetensors.torch.load_file(os.path.join(config.finetuning_ckpt_dir, "unet",
+    #                                                       "diffusion_pytorch_model.safetensors"))
+    # unet.load_state_dict(state_dict)
 
     noise_scheduler = PNDMScheduler.from_pretrained(config.pretrained_model_name_or_path, subfolder="scheduler")
     pipeline = StableDiffusionPipeline.from_pretrained(
         config.pretrained_model_name_or_path,
-        unet=unet,
         scheduler=noise_scheduler,
     )
+
+    pipeline.load_lora_weights(config.finetuning_ckpt_dir)
 
     if config.enable_xformers_memory_efficient_attention:
         pipeline.enable_xformers_memory_efficient_attention()
