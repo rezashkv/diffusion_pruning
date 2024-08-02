@@ -55,7 +55,6 @@ def main():
     img_col = getattr(config.data, "image_column", "image")
     capt_col = getattr(config.data, "caption_column", "caption")
 
-    assert config.expert_id is not None, "expert index must be provided"
     assert config.finetuning_ckpt_dir is not None, "finetuning checkpoint directory must be provided"
 
     def collate_fn(examples, caption_column="caption", image_column="image"):
