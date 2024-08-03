@@ -55,7 +55,7 @@ def main():
     img_col = getattr(config.data, "image_column", "image")
     capt_col = getattr(config.data, "caption_column", "caption")
 
-    assert config.expert_id is not None, "expert index must be provided"
+    assert config.pruning_ckpt_dir is not None, "pruning checkpoint directory must be provided"
     assert config.finetuning_ckpt_dir is not None, "finetuning checkpoint directory must be provided"
 
     def collate_fn(examples, caption_column="caption", image_column="image"):
@@ -66,14 +66,7 @@ def main():
     dataset = get_dataset(config.data)
 
     dataset = dataset["validation"]
-    fid_val_indices_path = os.path.abspath(
-        os.path.join(config.finetuning_ckpt_dir, "..", "..", f"{dataset_name}_validation_mapped_indices.pt"))
-    assert os.path.exists(fid_val_indices_path), \
-        (f"{dataset_name}_validation_mapped_indices.pt must be present in two upper directory of the checkpoint"
-         f" directory {config.finetuning_ckpt_dir}")
-    val_indices = torch.load(fid_val_indices_path, map_location="cpu")
 
-    dataset = dataset.select(torch.where(val_indices == config.expert_id)[0])
     logger.info("Dataset of size %d loaded." % len(dataset))
 
     dataloader = torch.utils.data.DataLoader(
