@@ -5,15 +5,12 @@
 
 from __future__ import absolute_import
 
-import os
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn.utils.parametrizations import weight_norm
 from diffusers import ModelMixin, ConfigMixin
 from diffusers.configuration_utils import register_to_config
-from pdm.utils.estimation_utils import hard_concrete
+from projects.diffusion_pruning.pdm.utils.estimation_utils import hard_concrete
 
 
 class SimpleGate(nn.Module):

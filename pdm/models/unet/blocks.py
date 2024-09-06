@@ -8,15 +8,15 @@ from diffusers.configuration_utils import register_to_config
 from diffusers.models import DualTransformer2DModel, Transformer2DModel
 from diffusers.models.activations import GEGLU
 from diffusers.models.resnet import ResnetBlock2D, Upsample2D, Downsample2D
-from diffusers.models.transformer_2d import Transformer2DModelOutput
+from diffusers.models.transformers.transformer_2d import Transformer2DModelOutput
 from diffusers.models.attention import BasicTransformerBlock, FeedForward
-from diffusers.models.unet_2d_blocks import (CrossAttnDownBlock2D, CrossAttnUpBlock2D, DownBlock2D, UpBlock2D,
+from diffusers.models.unets.unet_2d_blocks import (CrossAttnDownBlock2D, CrossAttnUpBlock2D, DownBlock2D, UpBlock2D,
                                              UNetMidBlock2DCrossAttn)
 from diffusers.models.attention_processor import AttnProcessor2_0, Attention
 from diffusers.utils import logging, USE_PEFT_BACKEND
 
-from pdm.models.unet.gates import DepthGate, WidthGate, LinearWidthGate
-from pdm.utils.estimation_utils import hard_concrete
+from ..gates import DepthGate, WidthGate, LinearWidthGate
+from ...utils.estimation_utils import hard_concrete
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 

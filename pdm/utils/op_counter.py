@@ -4,15 +4,17 @@ This opcounter is adapted from https://github.com/sovrasov/macs-counter.pytorch
 
 import numpy as np
 import torch
+import sys
 
 from diffusers.models.attention_processor import SpatialNorm
 from diffusers.models.normalization import AdaGroupNorm
 from diffusers.models.lora import (LoRACompatibleConv, LoRACompatibleLinear)
-from pdm.models.unet.blocks import GatedAttention
 from diffusers.models.attention_processor import Attention
-import sys
+
 from functools import partial
 import torch.nn as nn
+
+from ..models.unet.blocks import GatedAttention
 
 
 @torch.no_grad()

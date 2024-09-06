@@ -1,20 +1,20 @@
 from diffusers.pipelines.pipeline_utils import *
 from diffusers.pipelines.pipeline_utils import _get_pipeline_class
-import os
-from typing import Optional, Union
 from diffusers import UNet2DConditionModel, AutoencoderKL
 from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
 from diffusers.pipelines.stable_diffusion.pipeline_output import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import rescale_noise_cfg
+from diffusers.pipelines.pipeline_loading_utils import (get_class_obj_and_candidates, DUMMY_MODULES_FOLDER,
+                                                        TRANSFORMERS_DUMMY_MODULES_FOLDER)
 from diffusers.schedulers import KarrasDiffusionSchedulers
-from diffusers.utils import replace_example_docstring
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPImageProcessor
-import diffusers
-
-from pdm.models.unet.unet_2d_conditional import UNet2DConditionModelGated
-
+from diffusers.utils import replace_example_docstring, is_transformers_available
 from diffusers import StableDiffusionPipeline, DiffusionPipeline
 from diffusers.models.modeling_utils import _LOW_CPU_MEM_USAGE_DEFAULT
+import diffusers
+import transformers
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPImageProcessor, PreTrainedModel
+
+from ..models.unet.unet_2d_conditional import UNet2DConditionModelGated
 
 logger = logging.get_logger(__name__)
 
@@ -325,11 +325,11 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
         >>> pipeline.scheduler = scheduler
         ```
         """
-        cache_dir = kwargs.pop("cache_dir", DIFFUSERS_CACHE)
+        cache_dir = kwargs.pop("cache_dir", None)
         resume_download = kwargs.pop("resume_download", False)
         force_download = kwargs.pop("force_download", False)
         proxies = kwargs.pop("proxies", None)
-        local_files_only = kwargs.pop("local_files_only", HF_HUB_OFFLINE)
+        local_files_only = kwargs.pop("local_files_only", None)
         use_auth_token = kwargs.pop("use_auth_token", None)
         revision = kwargs.pop("revision", None)
         from_flax = kwargs.pop("from_flax", False)

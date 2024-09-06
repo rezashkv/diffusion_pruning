@@ -12,8 +12,15 @@ class VirtualGate(nn.Module):
         self.width = width
         self.gate_f = torch.ones(bs, width)
 
-    def forward(self, x):
-        mask = self.gate_f.repeat_interleave(x.shape[1] // self.width, dim=1).unsqueeze(-1).unsqueeze(-1)
+    def forward(self, x, dim=1):
+        mask = self.gate_f.repeat_interleave(x.shape[dim] // self.width, dim=1)
+        if dim == -1:
+            expand_dim = -2
+        else:
+            expand_dim = -1
+        for _ in range(len(x.shape) - len(mask.shape)):
+            mask = mask.unsqueeze(expand_dim)
+
         # to handle cfg where actual batch size is double the value of the batch size used to create the gate.
         if mask.shape[0] != x.shape[0]:
             mask = mask.repeat(x.shape[0] // mask.shape[0], 1, 1, 1)

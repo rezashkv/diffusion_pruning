@@ -1,13 +1,12 @@
 # credit to taming-transformers:
 # https://github.com/CompVis/taming-transformers/blob/3ba01b241669f5ade541ce990f7650a3b8f65318/taming/modules/vqvae/quantize.py#L112
-import os
 from typing import Tuple
 
 import numpy as np
 import torch
 from diffusers.configuration_utils import register_to_config, ConfigMixin
-from torch import nn, Tensor
-from pdm.utils.estimation_utils import gumbel_softmax_sample, hard_concrete, importance_gumbel_softmax_sample
+from torch import nn
+from projects.diffusion_pruning.pdm.utils.estimation_utils import gumbel_softmax_sample, hard_concrete, importance_gumbel_softmax_sample
 from diffusers import ModelMixin
 import torch.distributed as dist
 

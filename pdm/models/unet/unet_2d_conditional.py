@@ -1,4 +1,3 @@
-# Credits: The HuggingFace Team, Diffusers
 from typing import Dict
 
 import torch.utils.checkpoint
@@ -10,7 +9,7 @@ from diffusers.models.modeling_utils import *
 from diffusers import __version__
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import UNet2DConditionLoadersMixin
-from diffusers.models.unet_2d_condition import UNet2DConditionOutput, UNet2DConditionModel
+from diffusers.models.unets.unet_2d_condition import UNet2DConditionOutput, UNet2DConditionModel
 from diffusers.utils import logging, _get_model_file, _add_variant
 from diffusers.models.activations import get_activation
 from diffusers.models.attention_processor import (
@@ -26,22 +25,21 @@ from diffusers.models.embeddings import (
     ImageHintTimeEmbedding,
     ImageProjection,
     ImageTimeEmbedding,
-    PositionNet,
     TextImageProjection,
     TextImageTimeEmbedding,
     TextTimeEmbedding,
     TimestepEmbedding,
-    Timesteps,
+    Timesteps, GLIGENTextBoundingboxProjection,
 )
 from diffusers.models.modeling_utils import ModelMixin, _LOW_CPU_MEM_USAGE_DEFAULT
-from diffusers.models.unet_2d_blocks import (
+from diffusers.models.unets.unet_2d_blocks import (
     UNetMidBlock2DSimpleCrossAttn, DownBlock2D, ResnetDownsampleBlock2D, AttnDownBlock2D, SimpleCrossAttnDownBlock2D,
     SkipDownBlock2D, CrossAttnDownBlock2D, AttnSkipDownBlock2D, DownEncoderBlock2D, AttnDownEncoderBlock2D,
     KDownBlock2D, KCrossAttnDownBlock2D, UpBlock2D, ResnetUpsampleBlock2D, CrossAttnUpBlock2D, SimpleCrossAttnUpBlock2D,
     AttnUpBlock2D, SkipUpBlock2D, AttnSkipUpBlock2D, UpDecoderBlock2D, AttnUpDecoderBlock2D, KUpBlock2D,
     KCrossAttnUpBlock2D, UNetMidBlock2D
 )
-from pdm.models.hypernet import HyperStructure
+from ...models.hypernet import HyperStructure
 
 from .blocks import (CrossAttnDownBlock2DWidthDepthGated, CrossAttnUpBlock2DWidthDepthGated,
                      CrossAttnUpBlock2DWidthHalfDepthGated, CrossAttnDownBlock2DWidthHalfDepthGated,
@@ -1169,17 +1167,7 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
             block_out_channels[0], out_channels, kernel_size=conv_out_kernel, padding=conv_out_padding
         )
 
-        if attention_type in ["gated", "gated-text-image"]:
-            positive_len = 768
-            if isinstance(cross_attention_dim, int):
-                positive_len = cross_attention_dim
-            elif isinstance(cross_attention_dim, tuple) or isinstance(cross_attention_dim, list):
-                positive_len = cross_attention_dim[0]
-
-            feature_type = "text-only" if attention_type == "gated" else "text-image"
-            self.position_net = PositionNet(
-                positive_len=positive_len, out_dim=cross_attention_dim, feature_type=feature_type
-            )
+        self._set_pos_net_if_use_gligen(attention_type=attention_type, cross_attention_dim=cross_attention_dim)
 
         self.structure = {'width': [], 'depth': []}
 
@@ -1244,6 +1232,19 @@ class UNet2DConditionModelGated(ModelMixin, ConfigMixin, UNet2DConditionLoadersM
 
         for name, module in self.named_children():
             fn_recursive_attn_processor(name, module, processor)
+
+    def _set_pos_net_if_use_gligen(self, attention_type: str, cross_attention_dim: int):
+        if attention_type in ["gated", "gated-text-image"]:
+            positive_len = 768
+            if isinstance(cross_attention_dim, int):
+                positive_len = cross_attention_dim
+            elif isinstance(cross_attention_dim, (list, tuple)):
+                positive_len = cross_attention_dim[0]
+
+            feature_type = "text-only" if attention_type == "gated" else "text-image"
+            self.position_net = GLIGENTextBoundingboxProjection(
+                positive_len=positive_len, out_dim=cross_attention_dim, feature_type=feature_type
+            )
 
     def set_default_attn_processor(self):
         """

@@ -1,7 +1,10 @@
 # T2I training skeleton from the diffusers repo:
 # https://github.com/huggingface/diffusers/blob/main/examples/text_to_image/train_text_to_image.py
 import copy
+import functools
+import gc
 import os
+import random
 import shutil
 import logging
 from abc import abstractmethod, ABC
@@ -25,7 +28,9 @@ from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration
 
 import transformers
-from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, AutoModel
+from torchvision import transforms
+from torchvision.transforms.functional import crop
+from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, AutoModel, PretrainedConfig, T5EncoderModel
 from transformers.utils import ContextManagers
 
 import diffusers
@@ -33,7 +38,7 @@ from diffusers import AutoencoderKL, DDIMScheduler
 from diffusers import UNet2DConditionModel, get_scheduler
 from diffusers.utils import make_image_grid, is_xformers_available, is_wandb_available
 
-from datasets import Dataset
+from datasets import Dataset, concatenate_datasets
 from datasets.utils.logging import set_verbosity_error, set_verbosity_warning
 
 import wandb
@@ -43,16 +48,17 @@ from omegaconf import DictConfig, OmegaConf
 from packaging import version
 from tqdm.auto import tqdm
 
-from pdm.losses import ContrastiveLoss, ResourceLoss
-from pdm.models import UNet2DConditionModelGated, HyperStructure, StructureVectorQuantizer
-from pdm.models.unet import UNet2DConditionModelPruned, UNet2DConditionModelMagnitudePruned
-from pdm.pipelines import StableDiffusionPruningPipeline
-from pdm.utils import compute_snr
-from pdm.utils.data_utils import (get_dataset, get_transforms, preprocess_samples, collate_fn,
-                                  preprocess_prompts, prompts_collator, filter_dataset)
-from pdm.utils.logging_utils import create_heatmap
-from pdm.utils.op_counter import count_ops_and_params
-from pdm.utils.dist_utils import deepspeed_zero_init_disabled_context_manager
+from ..losses import ContrastiveLoss, ResourceLoss
+from ..models import UNet2DConditionModelGated, HyperStructure, StructureVectorQuantizer, GatedFluxTransformer2DModel
+from ..models.unet import UNet2DConditionModelPruned, UNet2DConditionModelMagnitudePruned
+from ..pipelines import StableDiffusionPruningPipeline
+from ..utils import compute_snr
+from ..utils.data_utils import (get_dataset, get_transforms, preprocess_samples, collate_fn,
+                                preprocess_prompts, prompts_collator, filter_dataset, get_mpnet_embeddings,
+                                download_images_if_missing)
+from ..utils.logging_utils import create_heatmap
+from ..utils.op_counter import count_ops_and_params
+from ..utils.dist_utils import deepspeed_zero_init_disabled_context_manager
 
 logger = get_logger(__name__)
 
@@ -853,8 +859,9 @@ class Pruner(Trainer):
         self.init_weight_dtype()
 
         # Move text_encode and vae to gpu and cast to weight_dtype
-        self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
-        self.vae.to(self.accelerator.device, dtype=self.weight_dtype)
+        if hasattr(self, "text_encoder"):
+            self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
+            self.vae.to(self.accelerator.device, dtype=self.weight_dtype)
 
         self.update_train_steps()
         # Train!
@@ -891,119 +898,122 @@ class Pruner(Trainer):
 
         for epoch in range(first_epoch, self.config.training.num_train_epochs):
             for step, batch in enumerate(self.train_dataloader):
-
-                if batch["pixel_values"].numel() == 0:
-                    continue
-
-                train_loss = 0.0
-                self.hyper_net.train()
-                self.quantizer.train()
-                self.unet.eval()
-
-                # Calculating the MACs of each module of the model in the first iteration.
-                if global_step == initial_global_step:
-                    self.count_macs(batch)
-
-                # pruning target is for total macs. we calculate loss for prunable macs.
-                if global_step == 0:
-                    self.update_pruning_target()
-
-                pretrain = (self.config.training.hypernet_pretraining_steps and
-                            global_step < self.config.training.hypernet_pretraining_steps)
-                (loss, diff_loss, distillation_loss, block_loss, contrastive_loss, resource_loss,
-                 arch_vectors_similarity, resource_ratio, macs_dict, arch_vector_quantized,
-                 quantizer_embedding_pairwise_similarity, batch_resource_ratios) = self.step(batch, pretrain=pretrain)
-
-                avg_loss = loss
-                train_loss += avg_loss.item() / self.config.training.gradient_accumulation_steps
-
-                # Back-propagate
-                try:
-                    self.accelerator.backward(loss)
-                except RuntimeError as e:
-                    if "returned nan values" in str(e):
-                        logger.error("NaNs detected in the loss. Skipping batch.")
-                        self.optimizer.zero_grad()
+                with self.accelerator.accumulate(self.unet):
+                    if "pixel_values" in batch and batch["pixel_values"].numel() == 0:
                         continue
-                    else:
-                        raise e
 
-                self.optimizer.step()
-                self.lr_scheduler.step()
-                self.optimizer.zero_grad()
+                    train_loss = 0.0
+                    self.hyper_net.train()
+                    self.quantizer.train()
+                    self.unet.eval()
 
-                # Checks if the accelerator has performed an optimization step behind the scenes
-                if self.accelerator.sync_gradients:
-                    progress_bar.update(1)
-                    log_dict = {
-                        "training/loss": train_loss,
-                        "training/diffusion_loss": diff_loss,
-                        "training/distillation_loss": distillation_loss.detach().item(),
-                        "training/block_loss": block_loss.detach().item(),
-                        "training/resource_loss": resource_loss.detach().item(),
-                        "training/contrastive_loss": contrastive_loss.detach().item(),
-                        "training/hyper_net_lr": self.lr_scheduler.get_last_lr()[0],
-                        "training/quantizer_lr": self.lr_scheduler.get_last_lr()[1],
-                        "training/resource_ratio": resource_ratio.detach().item(),
-                    }
-                    for k, v in macs_dict.items():
-                        if isinstance(v, torch.Tensor):
-                            log_dict[f"training/{k}"] = v.detach().mean().item()
+                    # Calculating the MACs of each module of the model in the first iteration.
+                    if global_step == initial_global_step:
+                        self.count_macs(batch)
+
+                    # pruning target is for total macs. we calculate loss for prunable macs.
+                    if global_step == 0:
+                        self.update_pruning_target()
+
+                    pretrain = (self.config.training.hypernet_pretraining_steps and
+                                global_step < self.config.training.hypernet_pretraining_steps)
+                    (loss, diff_loss, distillation_loss, block_loss, contrastive_loss, resource_loss,
+                     arch_vectors_similarity, resource_ratio, macs_dict, arch_vector_quantized,
+                     quantizer_embedding_pairwise_similarity, batch_resource_ratios) = self.step(batch,
+                                                                                                 pretrain=pretrain)
+
+                    avg_loss = loss
+                    train_loss += avg_loss.item() / self.config.training.gradient_accumulation_steps
+
+                    # Back-propagate
+                    try:
+                        self.accelerator.backward(loss)
+                    except RuntimeError as e:
+                        if "returned nan values" in str(e):
+                            logger.error("NaNs detected in the loss. Skipping batch.")
+                            self.optimizer.zero_grad()
+                            continue
                         else:
-                            log_dict[f"training/{k}"] = v
+                            raise e
 
-                    self.accelerator.log(log_dict)
+                    self.optimizer.step()
+                    self.lr_scheduler.step()
+                    self.optimizer.zero_grad()
 
-                    logs = {"diff_loss": diff_loss.detach().item(),
-                            "dist_loss": distillation_loss.detach().item(),
-                            "block_loss": block_loss.detach().item(),
-                            "c_loss": contrastive_loss.detach().item(),
-                            "r_loss": resource_loss.detach().item(),
-                            "step_loss": loss.detach().item(),
-                            "h_lr": self.lr_scheduler.get_last_lr()[0],
-                            "q_lr": self.lr_scheduler.get_last_lr()[1],
-                            }
-                    progress_bar.set_postfix(**logs)
-
-                    if global_step % self.config.training.validation_steps == 0:
-                        if self.eval_dataset is not None:
-                            self.validate(pretrain=pretrain)
-
-                    if (global_step % self.config.training.image_logging_steps == 0 or
-                            (epoch == self.config.training.num_train_epochs - 1 and step == len(
-                                self.train_dataloader) - 1)):
-                        img_log_dict = {
-                            "images/arch vector pairwise similarity image": wandb.Image(
-                                arch_vectors_similarity),
-                            "images/quantizer_embedding_pairwise_similarity": wandb.Image(
-                                quantizer_embedding_pairwise_similarity)
+                    # Checks if the accelerator has performed an optimization step behind the scenes
+                    if self.accelerator.sync_gradients:
+                        progress_bar.update(1)
+                        log_dict = {
+                            "training/loss": train_loss,
+                            "training/diffusion_loss": diff_loss,
+                            "training/distillation_loss": distillation_loss.detach().item(),
+                            "training/block_loss": block_loss.detach().item(),
+                            "training/resource_loss": resource_loss.detach().item(),
+                            "training/contrastive_loss": contrastive_loss.detach().item(),
+                            "training/hyper_net_lr": self.lr_scheduler.get_last_lr()[0],
+                            "training/quantizer_lr": self.lr_scheduler.get_last_lr()[1],
+                            "training/resource_ratio": resource_ratio.detach().item(),
                         }
+                        for k, v in macs_dict.items():
+                            if isinstance(v, torch.Tensor):
+                                log_dict[f"training/{k}"] = v.detach().mean().item()
+                            else:
+                                log_dict[f"training/{k}"] = v
 
-                        with torch.no_grad():
-                            batch_resource_ratios = self.accelerator.gather_for_metrics(
-                                batch_resource_ratios).cpu().numpy()
+                        self.accelerator.log(log_dict)
 
-                        # make sure the number of rows is a multiple of 16 by adding zeros. This can be avoided by
-                        # removing corrupt images from the dataset.
-                        if batch_resource_ratios.shape[0] % 16 != 0:
-                            batch_resource_ratios = np.concatenate(
-                                [batch_resource_ratios, np.zeros((16 - len(batch_resource_ratios) % 16, 1))], axis=0)
+                        logs = {"diff_loss": diff_loss.detach().item(),
+                                "dist_loss": distillation_loss.detach().item(),
+                                "block_loss": block_loss.detach().item(),
+                                "c_loss": contrastive_loss.detach().item(),
+                                "r_loss": resource_loss.detach().item(),
+                                "step_loss": loss.detach().item(),
+                                "h_lr": self.lr_scheduler.get_last_lr()[0],
+                                "q_lr": self.lr_scheduler.get_last_lr()[1],
+                                }
+                        progress_bar.set_postfix(**logs)
 
-                        img_log_dict["images/batch resource ratio heatmap"] = wandb.Image(
-                            create_heatmap(batch_resource_ratios, n_rows=16, n_cols=len(batch_resource_ratios) // 16))
-                        self.accelerator.log(img_log_dict, log_kwargs={"wandb": {"commit": False}})
+                        if global_step % self.config.training.validation_steps == 0:
+                            if self.eval_dataset is not None:
+                                self.validate(pretrain=pretrain)
 
-                        # generate some validation images
-                        if self.config.data.prompts is not None:
-                            val_images = self.generate_samples_from_prompts(pretrain=pretrain)
+                        if (global_step % self.config.training.image_logging_steps == 0 or
+                                (epoch == self.config.training.num_train_epochs - 1 and step == len(
+                                    self.train_dataloader) - 1)):
+                            img_log_dict = {
+                                "images/arch vector pairwise similarity image": wandb.Image(
+                                    arch_vectors_similarity),
+                                "images/quantizer_embedding_pairwise_similarity": wandb.Image(
+                                    quantizer_embedding_pairwise_similarity)
+                            }
 
-                        # visualize the quantizer embeddings
-                        self.log_quantizer_embedding_samples(global_step)
+                            with torch.no_grad():
+                                batch_resource_ratios = self.accelerator.gather_for_metrics(
+                                    batch_resource_ratios).cpu().numpy()
 
-                    global_step += 1
+                            # make sure the number of rows is a multiple of 16 by adding zeros. This can be avoided by
+                            # removing corrupt images from the dataset.
+                            if batch_resource_ratios.shape[0] % 16 != 0:
+                                batch_resource_ratios = np.concatenate(
+                                    [batch_resource_ratios, np.zeros((16 - len(batch_resource_ratios) % 16, 1))],
+                                    axis=0)
 
-                if global_step >= self.config.training.max_train_steps:
-                    break
+                            img_log_dict["images/batch resource ratio heatmap"] = wandb.Image(
+                                create_heatmap(batch_resource_ratios, n_rows=16,
+                                               n_cols=len(batch_resource_ratios) // 16))
+                            self.accelerator.log(img_log_dict, log_kwargs={"wandb": {"commit": False}})
+
+                            # generate some validation images
+                            if self.config.data.prompts is not None:
+                                val_images = self.generate_samples_from_prompts(pretrain=pretrain)
+
+                            # visualize the quantizer embeddings
+                            self.log_quantizer_embedding_samples(global_step)
+
+                        global_step += 1
+
+                    if global_step >= self.config.training.max_train_steps:
+                        break
 
             # checkpoint at the end of each epoch
             if self.accelerator.is_main_process:
@@ -1400,6 +1410,609 @@ class Pruner(Trainer):
                               "images/embedding resource ratio heatmap": wandb.Image(
                                   embeddings_resource_ratios_images)},
                              log_kwargs={"wandb": {"commit": False}})
+
+
+class SDXLPruner(Pruner):
+    def __init__(self, config: DictConfig):
+        super().__init__(config)
+        self.tokenizer2 = None
+        self.text_encoder2 = None
+        self.vae_path = None
+
+    def init_models(self):
+
+        def import_model_class_from_model_name_or_path(
+                pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
+        ):
+            text_encoder_config = PretrainedConfig.from_pretrained(
+                pretrained_model_name_or_path, subfolder=subfolder, revision=revision
+            )
+            model_class = text_encoder_config.architectures[0]
+
+            if model_class == "CLIPTextModel":
+                from transformers import CLIPTextModel
+
+                return CLIPTextModel
+            elif model_class == "CLIPTextModelWithProjection":
+                from transformers import CLIPTextModelWithProjection
+
+                return CLIPTextModelWithProjection
+            else:
+                raise ValueError(f"{model_class} is not supported.")
+
+        logger.info("Loading models...")
+        noise_scheduler = DDIMScheduler.from_pretrained(self.config.pretrained_model_name_or_path,
+                                                        subfolder="scheduler")
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.config.pretrained_model_name_or_path, subfolder="tokenizer", revision=self.config.revision,
+            use_fast=False
+        )
+
+        tokenizer2 = AutoTokenizer.from_pretrained(
+            self.config.pretrained_model_name_or_path, subfolder="tokenizer_2", revision=self.config.revision,
+            use_fast=False
+        )
+
+        # import correct text encoder classes
+        text_encoder_cls_one = import_model_class_from_model_name_or_path(
+            self.config.pretrained_model_name_or_path, self.config.revision
+        )
+        text_encoder_cls_two = import_model_class_from_model_name_or_path(
+            self.config.pretrained_model_name_or_path, self.config.revision, subfolder="text_encoder_2"
+        )
+
+        text_encoder_one = text_encoder_cls_one.from_pretrained(
+            self.config.pretrained_model_name_or_path, subfolder="text_encoder", revision=self.config.revision,
+        )
+        text_encoder_two = text_encoder_cls_two.from_pretrained(
+            self.config.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=self.config.revision,
+        )
+
+        vae_path = (
+            self.config.pretrained_model_name_or_path
+            if self.config.pretrained_vae_model_name_or_path is None
+            else self.config.pretrained_vae_model_name_or_path
+        )
+
+        self.vae_path = vae_path
+
+        vae = AutoencoderKL.from_pretrained(
+            vae_path,
+            subfolder="vae" if self.config.pretrained_vae_model_name_or_path is None else None,
+            revision=self.config.revision,
+        )
+
+        # Freeze vae and text encoders.
+        vae.requires_grad_(False)
+        text_encoder_one.requires_grad_(False)
+        text_encoder_two.requires_grad_(False)
+
+        mpnet_tokenizer = AutoTokenizer.from_pretrained(self.config.prompt_encoder_model_name_or_path)
+        mpnet_model = AutoModel.from_pretrained(self.config.prompt_encoder_model_name_or_path)
+
+        unet = UNet2DConditionModelGated.from_pretrained(
+            self.config.pretrained_model_name_or_path,
+            subfolder="unet",
+            revision=self.config.non_ema_revision,
+            down_block_types=tuple(self.config.model.unet.unet_down_blocks),
+            mid_block_type=self.config.model.unet.unet_mid_block,
+            up_block_types=tuple(self.config.model.unet.unet_up_blocks),
+            gated_ff=self.config.model.unet.gated_ff,
+            ff_gate_width=self.config.model.unet.ff_gate_width,
+
+        )
+
+        unet.freeze()
+        unet_structure = unet.get_structure()
+
+        hyper_net = HyperStructure(input_dim=mpnet_model.config.hidden_size,
+                                   structure=unet_structure,
+                                   wn_flag=self.config.model.hypernet.weight_norm,
+                                   linear_bias=self.config.model.hypernet.linear_bias,
+                                   single_arch_param=self.config.model.hypernet.single_arch_param
+                                   )
+
+        quantizer = StructureVectorQuantizer(n_e=self.config.model.quantizer.num_arch_vq_codebook_embeddings,
+                                             structure=unet_structure,
+                                             beta=self.config.model.quantizer.arch_vq_beta,
+                                             temperature=self.config.model.quantizer.quantizer_T,
+                                             base=self.config.model.quantizer.quantizer_base,
+                                             depth_order=list(self.config.model.quantizer.depth_order),
+                                             non_zero_width=self.config.model.quantizer.non_zero_width,
+                                             resource_aware_normalization=self.config.model.quantizer.resource_aware_normalization,
+                                             optimal_transport=self.config.model.quantizer.optimal_transport
+                                             )
+        self.tokenizer = tokenizer
+        self.tokenizer2 = tokenizer2
+        self.text_encoder = text_encoder_one
+        self.text_encoder2 = text_encoder_two
+        self.vae = vae
+        self.noise_scheduler = noise_scheduler
+        self.mpnet_tokenizer = mpnet_tokenizer
+        self.mpnet_model = mpnet_model
+        self.unet = unet
+        self.hyper_net = hyper_net
+        self.quantizer = quantizer
+
+    @staticmethod
+    def encode_prompt(batch, text_encoders, tokenizers, mpnet_model, mpnet_tokenizer, proportion_empty_prompts,
+                      caption_column, is_train=True):
+        prompt_embeds_list = []
+        prompt_batch = batch[caption_column]
+
+        captions = []
+        for caption in prompt_batch:
+            if random.random() < proportion_empty_prompts:
+                captions.append("")
+            elif isinstance(caption, str):
+                captions.append(caption)
+            elif isinstance(caption, (list, np.ndarray)):
+                # take a random caption if there are multiple
+                captions.append(random.choice(caption) if is_train else caption[0])
+
+        with torch.no_grad():
+
+            for tokenizer, text_encoder in zip(tokenizers, text_encoders):
+                text_inputs = tokenizer(
+                    captions,
+                    padding="max_length",
+                    max_length=tokenizer.model_max_length,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                text_input_ids = text_inputs.input_ids
+                prompt_embeds = text_encoder(
+                    text_input_ids.to(text_encoder.device),
+                    output_hidden_states=True,
+                    return_dict=False,
+                )
+
+                # We are only ALWAYS interested in the pooled output of the final text encoder
+                pooled_prompt_embeds = prompt_embeds[0]
+                prompt_embeds = prompt_embeds[-1][-2]
+                bs_embed, seq_len, _ = prompt_embeds.shape
+                prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
+                prompt_embeds_list.append(prompt_embeds)
+
+        prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
+        pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
+        mpnet_embeddings = get_mpnet_embeddings(captions, mpnet_model, mpnet_tokenizer, is_train=is_train)
+        return {"prompt_embeds": prompt_embeds.cpu(), "pooled_prompt_embeds": pooled_prompt_embeds.cpu(),
+                "mpnet_embeddings": mpnet_embeddings.cpu()}
+
+    @staticmethod
+    def compute_vae_encodings(batch, vae):
+        images = batch.pop("pixel_values")
+        pixel_values = torch.stack(list(images))
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        pixel_values = pixel_values.to(vae.device, dtype=vae.dtype)
+
+        with torch.no_grad():
+            model_input = vae.encode(pixel_values).latent_dist.sample()
+        model_input = model_input * vae.config.scaling_factor
+        return {"model_input": model_input.cpu()}
+
+    @staticmethod
+    def generate_timestep_weights(args, num_timesteps):
+        weights = torch.ones(num_timesteps)
+
+        # Determine the indices to bias
+        num_to_bias = int(args.timestep_bias_portion * num_timesteps)
+
+        if args.timestep_bias_strategy == "later":
+            bias_indices = slice(-num_to_bias, None)
+        elif args.timestep_bias_strategy == "earlier":
+            bias_indices = slice(0, num_to_bias)
+        elif args.timestep_bias_strategy == "range":
+            # Out of the possible 1000 timesteps, we might want to focus on eg. 200-500.
+            range_begin = args.timestep_bias_begin
+            range_end = args.timestep_bias_end
+            if range_begin < 0:
+                raise ValueError(
+                    "When using the range strategy for timestep bias, you must provide a beginning timestep greater or equal to zero."
+                )
+            if range_end > num_timesteps:
+                raise ValueError(
+                    "When using the range strategy for timestep bias, you must provide an ending timestep smaller than the number of timesteps."
+                )
+            bias_indices = slice(range_begin, range_end)
+        else:  # 'none' or any other string
+            return weights
+        if args.timestep_bias_multiplier <= 0:
+            return ValueError(
+                "The parameter --timestep_bias_multiplier is not intended to be used to disable the training of specific timesteps."
+                " If it was intended to disable timestep bias, use `--timestep_bias_strategy none` instead."
+                " A timestep bias multiplier less than or equal to 0 is not allowed."
+            )
+
+        # Apply the bias
+        weights[bias_indices] *= args.timestep_bias_multiplier
+
+        # Normalize
+        weights /= weights.sum()
+
+        return weights
+
+    def prepare_datasets(self, preprocess_train, preprocess_eval, preprocess_prompts):
+        # Preprocessing the datasets.
+        train_resize = transforms.Resize(self.config.model.unet.resolution,
+                                         interpolation=transforms.InterpolationMode.BILINEAR)
+        train_crop = transforms.CenterCrop(
+            self.config.model.unet.resolution) if self.config.data.dataloader.center_crop else transforms.RandomCrop(
+            self.config.model.unet.resolution)
+        train_flip = transforms.RandomHorizontalFlip()
+        train_transforms = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
+
+        def preprocess_train(examples):
+            samples = download_images_if_missing(examples, "image")
+            images = [image.convert("RGB") if image is not None else image for image in samples["image"]]
+            # image aug
+            original_sizes = []
+            all_images = []
+            crop_top_lefts = []
+            for image in images:
+                original_sizes.append((image.height, image.width))
+                image = train_resize(image)
+                if self.config.data.dataloader.random_flip and random.random() < 0.5:
+                    # flip
+                    image = train_flip(image)
+                if self.config.data.dataloader.center_crop:
+                    y1 = max(0, int(round((image.height - self.config.model.unet.resolution) / 2.0)))
+                    x1 = max(0, int(round((image.width - self.config.model.unet.resolution) / 2.0)))
+                    image = train_crop(image)
+                else:
+                    y1, x1, h, w = train_crop.get_params(image, (self.config.model.unet.resolution,
+                                                                 self.config.model.unet.resolution))
+                    image = crop(image, y1, x1, h, w)
+                crop_top_left = (y1, x1)
+                crop_top_lefts.append(crop_top_left)
+                image = train_transforms(image)
+                all_images.append(image)
+
+            examples["original_sizes"] = original_sizes
+            examples["crop_top_lefts"] = crop_top_lefts
+            examples["pixel_values"] = all_images
+            return examples
+
+        with self.accelerator.main_process_first():
+            if self.config.data.max_train_samples is not None:
+                self.train_dataset = self.train_dataset.shuffle(seed=self.config.seed).select(
+                    range(self.config.data.max_train_samples))
+            # Set the training transforms
+            train_dataset = self.train_dataset.with_transform(preprocess_train)
+
+        # Let's first compute all the embeddings so that we can free up the text encoders
+        # from memory. We will pre-compute the VAE encodings too.
+        text_encoders = [self.text_encoder, self.text_encoder2]
+        tokenizers = [self.tokenizer, self.tokenizer2]
+        compute_embeddings_fn = functools.partial(
+            self.encode_prompt,
+            text_encoders=text_encoders,
+            tokenizers=tokenizers,
+            mpnet_model=self.mpnet_model,
+            mpnet_tokenizer=self.mpnet_tokenizer,
+            proportion_empty_prompts=self.config.training.proportion_empty_prompts,
+            caption_column=self.config.data.caption_column,
+        )
+        compute_vae_encodings_fn = functools.partial(self.compute_vae_encodings, vae=self.vae)
+        with self.accelerator.main_process_first():
+            from datasets.fingerprint import Hasher
+
+            # fingerprint used by the cache for the other processes to load the result
+            # details: https://github.com/huggingface/diffusers/pull/4038#discussion_r1266078401
+            new_fingerprint = Hasher.hash(self.config)
+            new_fingerprint_for_vae = Hasher.hash(self.vae_path)
+            train_dataset_with_embeddings = train_dataset.map(
+                compute_embeddings_fn, batched=True, new_fingerprint=new_fingerprint
+            )
+            train_dataset_with_vae = train_dataset.map(
+                compute_vae_encodings_fn,
+                batched=True,
+                batch_size=self.config.data.dataloader.train_batch_size,
+                new_fingerprint=new_fingerprint_for_vae,
+            )
+            precomputed_dataset = concatenate_datasets(
+                [train_dataset_with_embeddings, train_dataset_with_vae.remove_columns(["image", "caption"])], axis=1
+            )
+            precomputed_dataset = precomputed_dataset.with_transform(preprocess_train)
+
+        del compute_vae_encodings_fn, compute_embeddings_fn, self.text_encoder, self.text_encoder2
+        del text_encoders, tokenizers, self.vae
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        self.train_dataset = precomputed_dataset
+
+    def init_dataloaders(self, data_collate_fn, prompts_collate_fn):
+        def collate_fn(examples):
+            model_input = torch.stack([torch.tensor(example["model_input"]) for example in examples])
+            original_sizes = [example["original_sizes"] for example in examples]
+            crop_top_lefts = [example["crop_top_lefts"] for example in examples]
+            prompt_embeds = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples])
+            pooled_prompt_embeds = torch.stack([torch.tensor(example["pooled_prompt_embeds"]) for example in examples])
+
+            return {
+                "model_input": model_input,
+                "prompt_embeds": prompt_embeds,
+                "pooled_prompt_embeds": pooled_prompt_embeds,
+                "original_sizes": original_sizes,
+                "crop_top_lefts": crop_top_lefts,
+            }
+
+            # DataLoaders creation:
+
+        train_dataloader = torch.utils.data.DataLoader(
+            self.train_dataset,
+            shuffle=True,
+            collate_fn=collate_fn,
+            batch_size=self.config.data.dataloader.train_batch_size,
+            num_workers=self.config.data.dataloader.dataloader_num_workers,
+        )
+
+        self.train_dataloader = train_dataloader
+
+    def step(self, batch, pretrain=False):
+        unet_unwrapped = self.unet.module if hasattr(self.unet, "module") else self.unet
+        quantizer_unwrapped = self.quantizer.module if hasattr(self.quantizer, "module") else self.quantizer
+        hyper_net_unwrapped = self.hyper_net.module if hasattr(self.hyper_net, "module") else self.hyper_net
+
+        model_input = batch["model_input"].to(self.accelerator.device)
+        noise = torch.randn_like(model_input)
+        if self.config.model.unet.noise_offset:
+            # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+            noise += self.config.model.unet.noise_offset * torch.randn(
+                (model_input.shape[0], model_input.shape[1], 1, 1), device=model_input.device
+            )
+
+        bsz = model_input.shape[0]
+        if self.config.model.unet.timestep_bias_strategy == "none":
+            # Sample a random timestep for each image without bias.
+            timesteps = torch.randint(
+                0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=model_input.device
+            )
+        else:
+            # Sample a random timestep for each image, potentially biased by the timestep weights.
+            # Biasing the timestep weights allows us to spend less time training irrelevant timesteps.
+            weights = self.generate_timestep_weights(self.config.model.unet,
+                                                     self.config.noise_scheduler.config.num_train_timesteps).to(
+                model_input.device
+            )
+            timesteps = torch.multinomial(weights, bsz, replacement=True).long()
+
+        # Add noise to the model input according to the noise magnitude at each timestep
+        # (this is the forward diffusion process)
+        noisy_model_input = self.noise_scheduler.add_noise(model_input, noise, timesteps)
+
+        # time ids
+        def compute_time_ids(original_size, crops_coords_top_left):
+            # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
+            target_size = (self.config.model.unet.resolution, self.config.model.unet.resolution)
+            add_time_ids = list(original_size + crops_coords_top_left + target_size)
+            add_time_ids = torch.tensor([add_time_ids])
+            add_time_ids = add_time_ids.to(self.accelerator.device, dtype=self.weight_dtype)
+            return add_time_ids
+
+        add_time_ids = torch.cat(
+            [compute_time_ids(s, c) for s, c in zip(batch["original_sizes"], batch["crop_top_lefts"])]
+        )
+
+        # Predict the noise residual
+        unet_added_conditions = {"time_ids": add_time_ids}
+        prompt_embeds = batch["prompt_embeds"].to(self.accelerator.device)
+        pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(self.accelerator.device)
+        unet_added_conditions.update({"text_embeds": pooled_prompt_embeds})
+
+        # Get the text embedding for conditioning
+        text_embeddings = batch["mpnet_embeddings"]
+
+        arch_vector = self.hyper_net(text_embeddings)
+        arch_vector_quantized, _ = self.quantizer(arch_vector)
+
+        arch_vector = quantizer_unwrapped.gumbel_sigmoid_trick(arch_vector)
+
+        if hyper_net_unwrapped.single_arch_param:
+            arch_vector = arch_vector.repeat(text_embeddings.shape[0], 1)
+            hyper_net_unwrapped.arch_gs = arch_vector
+
+        arch_vector_width_depth_normalized = quantizer_unwrapped.width_depth_normalize(arch_vector)
+        with torch.no_grad():
+            quantizer_embeddings = quantizer_unwrapped.get_codebook_entry_gumbel_sigmoid(
+                torch.arange(quantizer_unwrapped.n_e, device=self.accelerator.device),
+                hard=True).detach()
+
+            quantizer_embeddings /= quantizer_embeddings.norm(dim=-1, keepdim=True)
+            quantizer_embeddings_pairwise_similarity = quantizer_embeddings @ quantizer_embeddings.t()
+
+            text_embeddings_list = [torch.zeros_like(text_embeddings) for _ in
+                                    range(self.accelerator.num_processes)]
+            arch_vector_list = [torch.zeros_like(arch_vector) for _ in
+                                range(self.accelerator.num_processes)]
+
+            if self.accelerator.num_processes > 1:
+                torch.distributed.all_gather(text_embeddings_list, text_embeddings)
+                torch.distributed.all_gather(arch_vector_list, arch_vector_width_depth_normalized)
+            else:
+                text_embeddings_list[self.accelerator.process_index] = text_embeddings
+                arch_vector_list[self.accelerator.process_index] = arch_vector_width_depth_normalized
+
+        text_embeddings_list[self.accelerator.process_index] = text_embeddings
+        arch_vector_list[self.accelerator.process_index] = arch_vector_width_depth_normalized
+        text_embeddings_list = torch.cat(text_embeddings_list, dim=0)
+        arch_vector_list = torch.cat(arch_vector_list, dim=0)
+
+        # During hyper_net pretraining, we don't cluster the architecture vector and directly use it.
+        if pretrain:
+            arch_vectors_separated = hyper_net_unwrapped.transform_structure_vector(arch_vector)
+        else:
+            arch_vectors_separated = hyper_net_unwrapped.transform_structure_vector(arch_vector_quantized)
+
+        contrastive_loss, arch_vectors_similarity = self.contrastive_loss(text_embeddings_list, arch_vector_list,
+                                                                          return_similarity=True)
+
+        # Get the target for loss depending on the prediction type
+        if self.config.model.unet.prediction_type is not None:
+            # set prediction_type of scheduler if defined
+            self.noise_scheduler.register_to_config(prediction_type=self.config.model.unet.prediction_type)
+
+        if self.noise_scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif self.noise_scheduler.config.prediction_type == "v_prediction":
+            target = self.noise_scheduler.get_velocity(model_input, noise, timesteps)
+        else:
+            raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
+
+        with torch.no_grad():
+            full_arch_vector = torch.ones_like(arch_vector)
+            full_arch_vector = hyper_net_unwrapped.transform_structure_vector(full_arch_vector)
+            unet_unwrapped.set_structure(full_arch_vector)
+            full_model_pred = self.unet(noisy_model_input, timesteps, prompt_embeds,
+                                        added_cond_kwargs=unet_added_conditions, return_dict=False, ).sample.detach()
+            teacher_block_activations = self.block_activations.copy()
+
+        unet_unwrapped.set_structure(arch_vectors_separated)
+        # Predict the noise residual and compute loss
+        model_pred = self.unet(noisy_model_input, timesteps, prompt_embeds, return_dict=False)[0]
+        student_block_activations = self.block_activations.copy()
+
+        if self.config.training.losses.diffusion_loss.snr_gamma is None:
+            loss = self.ddpm_loss(model_pred.float(), target.float(), reduction="mean")
+        else:
+            # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+            # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+            # This is discussed in Section 4.2 of the same paper.
+            snr = compute_snr(self.noise_scheduler, timesteps)
+            if self.noise_scheduler.config.prediction_type == "v_prediction":
+                # Velocity objective requires that we add one to SNR values before we divide by them.
+                snr = snr + 1
+            mse_loss_weights = (
+                    torch.stack(
+                        [snr,
+                         self.config.training.losses.diffusion_loss.snr_gamma * torch.ones_like(timesteps)],
+                        dim=1).min(dim=1)[0] / snr
+            )
+
+            loss = self.ddpm_loss(model_pred.float(), target.float(), reduction="none")
+            loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+            loss = loss.mean()
+
+        distillation_loss = self.distillation_loss(model_pred.float(), full_model_pred.float(), reduction="mean")
+
+        block_loss = torch.tensor(0.0, device=self.accelerator.device)
+        for key in student_block_activations.keys():
+            block_loss += self.distillation_loss(student_block_activations[key],
+                                                 teacher_block_activations[key].detach(),
+                                                 reduction="mean")
+        block_loss /= len(student_block_activations)
+
+        macs_dict = unet_unwrapped.calc_macs()
+        curr_macs = macs_dict['cur_prunable_macs']
+
+        # The reason is that sanity['prunable_macs'] does not have depth-related pruning
+        # macs like skip connections of resnets in it.
+        resource_ratios = (curr_macs / (
+            unet_unwrapped.resource_info_dict['cur_prunable_macs'].squeeze()))
+
+        resource_loss = self.resource_loss(resource_ratios.mean())
+
+        max_loss = 1. - torch.max(resource_ratios)
+        std_loss = -torch.std(resource_ratios)
+        with torch.no_grad():
+            batch_resource_ratios = macs_dict['cur_prunable_macs'] / (
+                unet_unwrapped.resource_info_dict['cur_prunable_macs'].squeeze())
+
+        diff_loss = loss.clone().detach().mean()
+        loss += self.config.training.losses.resource_loss.weight * resource_loss
+        loss += self.config.training.losses.contrastive_loss.weight * contrastive_loss
+        loss += self.config.training.losses.distillation_loss.weight * distillation_loss
+        loss += self.config.training.losses.block_loss.weight * block_loss
+        loss += self.config.training.losses.std_loss.weight * std_loss
+        loss += self.config.training.losses.max_loss.weight * max_loss
+
+        return (
+            loss, diff_loss, distillation_loss, block_loss, contrastive_loss, resource_loss,
+            arch_vectors_similarity, resource_ratios.mean(),
+            macs_dict, arch_vector_quantized, quantizer_embeddings_pairwise_similarity, batch_resource_ratios)
+
+
+class FluxPruner(Pruner):
+    def __init__(self, config: DictConfig):
+        super().__init__(config)
+        self.tokenizer2 = None
+        self.text_encoder2 = None
+
+    def init_models(self):
+        logger.info("Loading models...")
+        noise_scheduler = DDIMScheduler.from_pretrained(self.config.pretrained_model_name_or_path,
+                                                        subfolder="scheduler")
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.config.pretrained_model_name_or_path, subfolder="tokenizer", revision=self.config.revision,
+            use_fast=False
+        )
+
+        tokenizer_2 = AutoTokenizer.from_pretrained(
+            self.config.pretrained_model_name_or_path, subfolder="tokenizer_2", revision=self.config.revision,
+            use_fast=False
+        )
+
+        text_encoder = CLIPTextModel.from_pretrained(
+            self.config.pretrained_model_name_or_path, subfolder="text_encoder", revision=self.config.revision,
+        )
+        text_encoder_2 = T5EncoderModel.from_pretrained(
+            self.config.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=self.config.revision,
+        )
+
+        vae = AutoencoderKL.from_pretrained(
+            self.config.pretrained_model_name_or_path, subfolder="vae", revision=self.config.revision
+        )
+
+        # Freeze vae and text encoders.
+        vae.requires_grad_(False)
+        text_encoder.requires_grad_(False)
+        text_encoder_2.requires_grad_(False)
+
+        mpnet_tokenizer = AutoTokenizer.from_pretrained(self.config.prompt_encoder_model_name_or_path)
+        mpnet_model = AutoModel.from_pretrained(self.config.prompt_encoder_model_name_or_path)
+
+        transformer = GatedFluxTransformer2DModel.from_pretrained(
+            self.config.pretrained_model_name_or_path,
+            subfolder="transformer",
+            revision=self.config.non_ema_revision,
+            ff_gate_width=self.config.model.transformer.ff_gate_width,
+        )
+
+        transformer.freeze()
+        transformer_structure = transformer.get_structure()
+
+        hyper_net = HyperStructure(input_dim=mpnet_model.config.hidden_size,
+                                   structure=transformer_structure,
+                                   wn_flag=self.config.model.hypernet.weight_norm,
+                                   linear_bias=self.config.model.hypernet.linear_bias,
+                                   single_arch_param=self.config.model.hypernet.single_arch_param
+                                   )
+
+        quantizer = StructureVectorQuantizer(n_e=self.config.model.quantizer.num_arch_vq_codebook_embeddings,
+                                             structure=transformer_structure,
+                                             beta=self.config.model.quantizer.arch_vq_beta,
+                                             temperature=self.config.model.quantizer.quantizer_T,
+                                             base=self.config.model.quantizer.quantizer_base,
+                                             depth_order=list(self.config.model.quantizer.depth_order),
+                                             non_zero_width=self.config.model.quantizer.non_zero_width,
+                                             resource_aware_normalization=self.config.model.quantizer.resource_aware_normalization,
+                                             optimal_transport=self.config.model.quantizer.optimal_transport
+                                             )
+        self.tokenizer = tokenizer
+        self.tokenizer2 = tokenizer_2
+        self.text_encoder = text_encoder
+        self.text_encoder2 = text_encoder_2
+        self.vae = vae
+        self.noise_scheduler = noise_scheduler
+        self.mpnet_tokenizer = mpnet_tokenizer
+        self.mpnet_model = mpnet_model
+        self.unet = unet
+        self.hyper_net = hyper_net
+        self.quantizer = quantizer
 
 
 class FineTuner(Trainer):

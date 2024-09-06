@@ -30,7 +30,6 @@ limitations under the License.
 """
 import os
 import os.path as osp
-from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 
 import clip
 import torch

@@ -1,3 +1,4 @@
-from .unet.unet_2d_conditional import UNet2DConditionModelGated, UNet2DConditionModelPruned
-from .hypernet.hypernet import HyperStructure
-from .vq.quantizer import StructureVectorQuantizer
+from .unet import UNet2DConditionModelGated, UNet2DConditionModelPruned
+from .quantizer import StructureVectorQuantizer
+from .transformers import GatedFluxTransformer2DModel
+from .hypernet import HyperStructure

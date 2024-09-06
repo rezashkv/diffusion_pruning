@@ -1,5 +1,5 @@
 from datasets import load_dataset
-from pdm.datasets import load_cc3m_dataset, load_coco_dataset
+from ..datasets import load_cc3m_dataset, load_coco_dataset
 import os
 import random
 import numpy as np
@@ -36,8 +36,12 @@ def get_dataset(config):
 
     elif "coco" in data_dir:
         year = config.year
-        dataset = {"train": load_coco_dataset(os.path.join(data_dir, "images", f"train{year}"),
-                                              os.path.join(data_dir, "annotations", f"captions_train{year}.json")),
+        if year == "2014_30k":
+            train_year = "2014"
+        else:
+            train_year = year
+        dataset = {"train": load_coco_dataset(os.path.join(data_dir, "images", f"train{train_year}"),
+                                              os.path.join(data_dir, "annotations", f"captions_train{train_year}.json")),
                    "validation": load_coco_dataset(os.path.join(data_dir, "images", f"val{year}"),
                                                    os.path.join(data_dir, "annotations",
                                                                 f"captions_val{year}.json"))}
