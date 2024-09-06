@@ -1,1 +1,1 @@
-from .trainer import Pruner, FineTuner, BaselineFineTuner, SingleArchFinetuner
+from .trainer import UnetPruner, UnetFineTuner, BaselineFineTuner, SingleArchUnetFinetuner

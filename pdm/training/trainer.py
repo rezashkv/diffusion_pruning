@@ -66,11 +66,12 @@ logger = get_logger(__name__)
 class Trainer(ABC):
     def __init__(self, config: DictConfig):
         self.tokenizer, self.text_encoder, self.vae, self.noise_scheduler, self.mpnet_tokenizer, self.mpnet_model, \
-            self.unet, self.hyper_net, self.quantizer = None, None, None, None, None, None, None, None, None
+            self.prediction_model, self.hyper_net, self.quantizer = None, None, None, None, None, None, None, None, None
         self.train_dataset, self.eval_dataset, self.prompt_dataset = None, None, None
         (self.train_dataloader, self.eval_dataloader, self.prompt_dataloader,
          self.quantizer_embeddings_dataloader) = None, None, None, None
         self.ddpm_loss, self.distillation_loss, self.resource_loss, self.contrastive_loss = None, None, None, None
+        self.prediction_model_name = "Model"
 
         self.config = config
 
@@ -157,13 +158,13 @@ class Trainer(ABC):
                     logger.warn(
                         "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
                     )
-                self.unet.enable_xformers_memory_efficient_attention()
+                self.prediction_model.enable_xformers_memory_efficient_attention()
             else:
                 raise ValueError("xformers is not available. Make sure it is installed correctly")
 
     def enable_grad_checkpointing(self):
         if self.config.training.gradient_checkpointing:
-            self.unet.enable_gradient_checkpointing()
+            self.prediction_model.enable_gradient_checkpointing()
 
     def get_main_dataloaders(self, data_collate_fn, prompts_collate_fn):
         train_dataloader = torch.utils.data.DataLoader(
@@ -265,11 +266,11 @@ class Trainer(ABC):
                     if (hasattr(self, "pruning_type") and
                             self.pruning_type == "structural" and
                             isinstance(model, UNet2DConditionModel)):
-                        logger.info("Save pruned UNet")
-                        model.save_pretrained(os.path.join(output_dir, "unet"))
+                        logger.info(f"Save pruned {self.prediction_model_name}")
+                        model.save_pretrained(os.path.join(output_dir, self.prediction_model_name))
                     elif isinstance(model, (UNet2DConditionModel, UNet2DConditionModelGated)):
-                        logger.info("Save UNet")
-                        model.save_pretrained(os.path.join(output_dir, "unet"))
+                        logger.info(f"Save {self.prediction_model_name}")
+                        model.save_pretrained(os.path.join(output_dir, self.prediction_model_name))
                     elif isinstance(model, HyperStructure):
                         logger.info(f"Saving HyperStructure")
                         model.save_pretrained(os.path.join(output_dir, "hypernet"))
@@ -288,18 +289,19 @@ class Trainer(ABC):
                 model = models.pop()
                 if (hasattr(self, "pruning_type") and self.pruning_type == "structural" and
                         isinstance(model, UNet2DConditionModel)):
-                    state_dict = safetensors.torch.load_file(os.path.join(input_dir, "unet",
+                    state_dict = safetensors.torch.load_file(os.path.join(input_dir, self.prediction_model_name,
                                                                           "diffusion_pytorch_model.safetensors"))
                     model.load_state_dict(state_dict)
                     del state_dict
                 elif isinstance(model, (UNet2DConditionModelPruned, UNet2DConditionModelMagnitudePruned)):
-                    state_dict = safetensors.torch.load_file(os.path.join(input_dir, "unet",
+                    state_dict = safetensors.torch.load_file(os.path.join(input_dir, self.prediction_model_name,
                                                                           "diffusion_pytorch_model.safetensors"))
                     model.load_state_dict(state_dict)
                     del state_dict
                 # load diffusers style into model
                 elif isinstance(model, (UNet2DConditionModel, UNet2DConditionModelGated)):
-                    load_model = UNet2DConditionModelGated.from_pretrained(input_dir, subfolder="unet")
+                    load_model = UNet2DConditionModelGated.from_pretrained(input_dir,
+                                                                           subfolder=self.prediction_model_name)
                     model.register_to_config(**load_model.config)
                     model.load_state_dict(load_model.state_dict())
                     model.total_macs = load_model.total_macs
@@ -460,7 +462,8 @@ class Trainer(ABC):
         return initial_global_step, first_epoch
 
     def init_weight_dtype(self):
-        # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet)
+        # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder
+        # and non-lora unet,transformer)
         # to half-precision as these weights are only used for inference, keeping weights in full precision is not
         # required.
         self.weight_dtype = torch.float32
@@ -499,7 +502,7 @@ class Trainer(ABC):
                     token=self.config.training.hf_hub.hub_token
                 ).repo_id
 
-    def cast_block_act_hooks(self, unet, dicts):
+    def cast_block_act_hooks(self, prediction_model, dicts):
         def get_activation(activation, name, residuals_present):
             if residuals_present:
                 def hook(model, input, output):
@@ -509,12 +512,12 @@ class Trainer(ABC):
                     activation[name] = output
             return hook
 
-        unet = self.accelerator.unwrap_model(unet)
-        for i in range(len(unet.down_blocks)):
-            unet.down_blocks[i].register_forward_hook(get_activation(dicts, 'd' + str(i), True))
-        unet.mid_block.register_forward_hook(get_activation(dicts, 'm', False))
-        for i in range(len(unet.up_blocks)):
-            unet.up_blocks[i].register_forward_hook(get_activation(dicts, 'u' + str(i), False))
+        prediction_model = self.accelerator.unwrap_model(prediction_model)
+        for i in range(len(prediction_model.down_blocks)):
+            prediction_model.down_blocks[i].register_forward_hook(get_activation(dicts, 'd' + str(i), True))
+        prediction_model.mid_block.register_forward_hook(get_activation(dicts, 'm', False))
+        for i in range(len(prediction_model.up_blocks)):
+            prediction_model.up_blocks[i].register_forward_hook(get_activation(dicts, 'u' + str(i), False))
 
     def save_model_card(
             self,
@@ -574,7 +577,7 @@ class Trainer(ABC):
                 * Quantizer Learning rate: {self.config.training.optim.quantizer_learning_rate}
                 * Batch size: {self.config.data.dataloader.train_batch_size}
                 * Gradient accumulation steps: {self.config.training.gradient_accumulation_steps}
-                * Image resolution: {self.config.model.unet.resolution}
+                * Image resolution: {self.config.model.prediction_model.resolution}
                 * Mixed-precision: {self.config.mixed_precision}
 
                 """
@@ -612,7 +615,7 @@ class Trainer(ABC):
             vae=self.accelerator.unwrap_model(self.vae),
             text_encoder=self.accelerator.unwrap_model(self.text_encoder),
             tokenizer=self.tokenizer,
-            unet=self.accelerator.unwrap_model(self.unet),
+            unet=self.accelerator.unwrap_model(self.prediction_model),
             safety_checker=None,
             revision=self.config.revision,
             torch_dtype=self.weight_dtype,
@@ -630,12 +633,13 @@ class Trainer(ABC):
     def depth_analysis(self, n_consecutive_blocks=1):
         logger.info("Generating depth analysis samples from the given prompts... ")
         pipeline = self.get_pipeline()
-        unet_unwrapped = self.unet.module if hasattr(self.unet, "module") else self.unet
+        prediction_model_unwrapped = self.prediction_model.module if hasattr(self.prediction_model,
+                                                                             "module") else self.prediction_model
 
         image_output_dir = os.path.join(self.config.training.logging.logging_dir, "depth_analysis_images")
         os.makedirs(image_output_dir, exist_ok=True)
 
-        n_depth_pruned_blocks = sum([sum(d) for d in unet_unwrapped.get_structure()['depth']])
+        n_depth_pruned_blocks = sum([sum(d) for d in prediction_model_unwrapped.get_structure()['depth']])
 
         # index n_depth_pruned_blocks is for no pruning
         images = {i: [] for i in range(n_depth_pruned_blocks + 1)}
@@ -696,9 +700,10 @@ class Trainer(ABC):
         return gen_images
 
 
-class Pruner(Trainer):
+class UnetPruner(Trainer):
     def __init__(self, config: DictConfig):
         super().__init__(config)
+        self.prediction_model_name = "unet"
 
     def init_models(self):
 
@@ -735,13 +740,13 @@ class Pruner(Trainer):
 
         unet = UNet2DConditionModelGated.from_pretrained(
             self.config.pretrained_model_name_or_path,
-            subfolder="unet",
+            subfolder=self.prediction_model_name,
             revision=self.config.non_ema_revision,
-            down_block_types=tuple(self.config.model.unet.unet_down_blocks),
-            mid_block_type=self.config.model.unet.unet_mid_block,
-            up_block_types=tuple(self.config.model.unet.unet_up_blocks),
-            gated_ff=self.config.model.unet.gated_ff,
-            ff_gate_width=self.config.model.unet.ff_gate_width,
+            down_block_types=tuple(self.config.model.prediction_model.unet_down_blocks),
+            mid_block_type=self.config.model.prediction_model.unet_mid_block,
+            up_block_types=tuple(self.config.model.prediction_model.unet_up_blocks),
+            gated_ff=self.config.model.prediction_model.gated_ff,
+            ff_gate_width=self.config.model.prediction_model.ff_gate_width,
 
         )
 
@@ -772,7 +777,7 @@ class Pruner(Trainer):
         self.noise_scheduler = noise_scheduler
         self.mpnet_tokenizer = mpnet_tokenizer
         self.mpnet_model = mpnet_model
-        self.unet = unet
+        self.prediction_model = unet
         self.hyper_net = hyper_net
         self.quantizer = quantizer
 
@@ -783,9 +788,9 @@ class Pruner(Trainer):
 
     def prepare_with_accelerator(self):
         # Prepare everything with our `accelerator`.
-        (self.unet, self.optimizer, self.train_dataloader, self.eval_dataloader, self.prompt_dataloader,
+        (self.prediction_model, self.optimizer, self.train_dataloader, self.eval_dataloader, self.prompt_dataloader,
          self.quantizer_embeddings_dataloader, self.lr_scheduler, self.hyper_net,
-         self.quantizer) = (self.accelerator.prepare(self.unet, self.optimizer, self.train_dataloader,
+         self.quantizer) = (self.accelerator.prepare(self.prediction_model, self.optimizer, self.train_dataloader,
                                                      self.eval_dataloader, self.prompt_dataloader,
                                                      self.quantizer_embeddings_dataloader, self.lr_scheduler,
                                                      self.hyper_net,
@@ -819,8 +824,8 @@ class Pruner(Trainer):
             self.config.training.optim.quantizer_learning_rate = (
                     self.config.training.optim.quantizer_learning_rate * math.sqrt(scaling_factor)
             )
-            self.config.training.optim.unet_learning_rate = (
-                    self.config.training.optim.unet_learning_rate * math.sqrt(scaling_factor)
+            self.config.training.optim.prediction_model_learning_rate = (
+                    self.config.training.optim.prediction_model_learning_rate * math.sqrt(scaling_factor)
             )
 
         optimizer_cls = self.get_optimizer_cls()
@@ -830,9 +835,9 @@ class Pruner(Trainer):
                  "weight_decay": self.config.training.optim.hypernet_weight_decay},
                 {"params": self.quantizer.parameters(), "lr": self.config.training.optim.quantizer_learning_rate,
                  "weight_decay": self.config.training.optim.quantizer_weight_decay},
-                {"params": [p for p in self.unet.parameters() if p.requires_grad],
-                 "lr": self.config.training.optim.unet_learning_rate,
-                 "weight_decay": self.config.training.optim.unet_weight_decay},
+                {"params": [p for p in self.prediction_model.parameters() if p.requires_grad],
+                 "lr": self.config.training.optim.prediction_model_learning_rate,
+                 "weight_decay": self.config.training.optim.prediciton_model_weight_decay},
             ],
             betas=(self.config.training.optim.adam_beta1, self.config.training.optim.adam_beta2),
             eps=self.config.training.optim.adam_epsilon,
@@ -894,18 +899,18 @@ class Pruner(Trainer):
         )
 
         self.block_activations = {}
-        self.cast_block_act_hooks(self.unet, self.block_activations)
+        self.cast_block_act_hooks(self.prediction_model, self.block_activations)
 
         for epoch in range(first_epoch, self.config.training.num_train_epochs):
             for step, batch in enumerate(self.train_dataloader):
-                with self.accelerator.accumulate(self.unet):
+                with self.accelerator.accumulate(self.prediction_model):
                     if "pixel_values" in batch and batch["pixel_values"].numel() == 0:
                         continue
 
                     train_loss = 0.0
                     self.hyper_net.train()
                     self.quantizer.train()
-                    self.unet.eval()
+                    self.prediction_model.eval()
 
                     # Calculating the MACs of each module of the model in the first iteration.
                     if global_step == initial_global_step:
@@ -1052,7 +1057,7 @@ class Pruner(Trainer):
 
         self.hyper_net.eval()
         self.quantizer.eval()
-        self.unet.eval()
+        self.prediction_model.eval()
         (total_val_loss, total_diff_loss, total_distillation_loss, total_block_loss, total_c_loss,
          total_r_loss) = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         for step, batch in enumerate(self.eval_dataloader):
@@ -1100,7 +1105,8 @@ class Pruner(Trainer):
             log_kwargs={"wandb": {"commit": False}})
 
     def step(self, batch, pretrain=False):
-        unet_unwrapped = self.unet.module if hasattr(self.unet, "module") else self.unet
+        prediction_model_unwrapped = self.prediction_model.module if hasattr(self.prediction_model,
+                                                                 "module") else self.prediction_model
         quantizer_unwrapped = self.quantizer.module if hasattr(self.quantizer, "module") else self.quantizer
         hyper_net_unwrapped = self.hyper_net.module if hasattr(self.hyper_net, "module") else self.hyper_net
 
@@ -1109,25 +1115,25 @@ class Pruner(Trainer):
 
         # Sample noise that we'll add to the latents
         noise = torch.randn_like(latents)
-        if self.config.model.unet.noise_offset:
+        if self.config.model.prediction_model.noise_offset:
             # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-            noise += self.config.model.unet.noise_offset * torch.randn(
+            noise += self.config.model.prediction_model.noise_offset * torch.randn(
                 (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
             )
-        if self.config.model.unet.input_perturbation:
-            new_noise = noise + self.config.model.unet.input_perturbation * torch.randn_like(noise)
+        if self.config.model.prediction_model.input_perturbation:
+            new_noise = noise + self.config.model.prediction_model.input_perturbation * torch.randn_like(noise)
 
         bsz = latents.shape[0]
         # Sample a random timestep for each image
-        if self.config.model.unet.max_scheduler_steps is None:
-            self.config.model.unet.max_scheduler_steps = self.noise_scheduler.config.num_train_timesteps
-        timesteps = torch.randint(0, self.config.model.unet.max_scheduler_steps, (bsz,),
+        if self.config.model.prediction_model.max_scheduler_steps is None:
+            self.config.model.prediction_model.max_scheduler_steps = self.noise_scheduler.config.num_train_timesteps
+        timesteps = torch.randint(0, self.config.model.prediction_model.max_scheduler_steps, (bsz,),
                                   device=latents.device)
         timesteps = timesteps.long()
 
         # Add noise to the latents according to the noise magnitude at each timestep
-        # (this is the forward unet process)
-        if self.config.model.unet.input_perturbation:
+        # (this is the forward process)
+        if self.config.model.prediction_model.input_perturbation:
             noisy_latents = self.noise_scheduler.add_noise(latents, new_noise, timesteps)
         else:
             noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
@@ -1181,9 +1187,9 @@ class Pruner(Trainer):
                                                                           return_similarity=True)
 
         # Get the target for loss depending on the prediction type
-        if self.config.model.unet.prediction_type is not None:
+        if self.config.model.prediction_model.prediction_type is not None:
             # set prediction_type of scheduler if defined
-            self.noise_scheduler.register_to_config(prediction_type=self.config.model.unet.prediction_type)
+            self.noise_scheduler.register_to_config(prediction_type=self.config.model.prediction_model.prediction_type)
 
         if self.noise_scheduler.config.prediction_type == "epsilon":
             target = noise
@@ -1195,13 +1201,13 @@ class Pruner(Trainer):
         with torch.no_grad():
             full_arch_vector = torch.ones_like(arch_vector)
             full_arch_vector = hyper_net_unwrapped.transform_structure_vector(full_arch_vector)
-            unet_unwrapped.set_structure(full_arch_vector)
-            full_model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample.detach()
+            prediction_model_unwrapped.set_structure(full_arch_vector)
+            full_model_pred = self.prediction_model(noisy_latents, timesteps, encoder_hidden_states).sample.detach()
             teacher_block_activations = self.block_activations.copy()
 
-        unet_unwrapped.set_structure(arch_vectors_separated)
+        prediction_model_unwrapped.set_structure(arch_vectors_separated)
         # Predict the noise residual and compute loss
-        model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+        model_pred = self.prediction_model(noisy_latents, timesteps, encoder_hidden_states).sample
         student_block_activations = self.block_activations.copy()
 
         if self.config.training.losses.diffusion_loss.snr_gamma is None:
@@ -1234,13 +1240,13 @@ class Pruner(Trainer):
                                                  reduction="mean")
         block_loss /= len(student_block_activations)
 
-        macs_dict = unet_unwrapped.calc_macs()
+        macs_dict = prediction_model_unwrapped.calc_macs()
         curr_macs = macs_dict['cur_prunable_macs']
 
         # The reason is that sanity['prunable_macs'] does not have depth-related pruning
         # macs like skip connections of resnets in it.
         resource_ratios = (curr_macs / (
-            unet_unwrapped.resource_info_dict['cur_prunable_macs'].squeeze()))
+            prediction_model_unwrapped.resource_info_dict['cur_prunable_macs'].squeeze()))
 
         resource_loss = self.resource_loss(resource_ratios.mean())
 
@@ -1248,7 +1254,7 @@ class Pruner(Trainer):
         std_loss = -torch.std(resource_ratios)
         with torch.no_grad():
             batch_resource_ratios = macs_dict['cur_prunable_macs'] / (
-                unet_unwrapped.resource_info_dict['cur_prunable_macs'].squeeze())
+                prediction_model_unwrapped.resource_info_dict['cur_prunable_macs'].squeeze())
 
         diff_loss = loss.clone().detach().mean()
         loss += self.config.training.losses.resource_loss.weight * resource_loss
@@ -1267,33 +1273,34 @@ class Pruner(Trainer):
     def count_macs(self, batch):
         hyper_net_unwrapped = self.hyper_net.module if hasattr(self.hyper_net, "module") else self.hyper_net
         quantizer_unwrapped = self.quantizer.module if hasattr(self.quantizer, "module") else self.quantizer
-        unet_unwrapped = self.unet.module if hasattr(self.unet, "module") else self.unet
+        prediction_model_unwrapped = self.prediction_model.module if hasattr(self.prediction_model,
+                                                                             "module") else self.prediction_model
 
         arch_vecs_separated = hyper_net_unwrapped.transform_structure_vector(
             torch.ones((1, quantizer_unwrapped.vq_embed_dim), device=self.accelerator.device))
 
-        unet_unwrapped.set_structure(arch_vecs_separated)
+        prediction_model_unwrapped.set_structure(arch_vecs_separated)
 
         latents = self.vae.encode(batch["pixel_values"][:1].to(self.weight_dtype)).latent_dist.sample()
         timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (1,),
                                   device=self.accelerator.device).long()
         encoder_hidden_states = self.text_encoder(batch["input_ids"][:1])[0]
 
-        macs, params = count_ops_and_params(self.unet,
+        macs, params = count_ops_and_params(self.prediction_model,
                                             {'sample': latents,
                                              'timestep': timesteps,
                                              'encoder_hidden_states': encoder_hidden_states})
 
         logger.info(
-            "UNet's Params/MACs calculated by OpCounter:\tparams: {:.3f}M\t MACs: {:.3f}G".format(
-                params / 1e6, macs / 1e9))
+            "{}'s Params/MACs calculated by OpCounter:\tparams: {:.3f}M\t MACs: {:.3f}G".format(
+                self.prediction_model_name, params / 1e6, macs / 1e9))
 
-        sanity_macs_dict = unet_unwrapped.calc_macs()
+        sanity_macs_dict = prediction_model_unwrapped.calc_macs()
         prunable_macs_list = [[e / sanity_macs_dict['prunable_macs'] for e in elem] for elem in
-                              unet_unwrapped.get_prunable_macs()]
+                              prediction_model_unwrapped.get_prunable_macs()]
 
-        unet_unwrapped.prunable_macs_list = prunable_macs_list
-        unet_unwrapped.resource_info_dict = sanity_macs_dict
+        prediction_model_unwrapped.prunable_macs_list = prunable_macs_list
+        prediction_model_unwrapped.resource_info_dict = sanity_macs_dict
 
         quantizer_unwrapped.set_prunable_macs_template(prunable_macs_list)
 
@@ -1307,11 +1314,12 @@ class Pruner(Trainer):
 
     @torch.no_grad()
     def update_pruning_target(self):
-        unet_unwrapped = self.unet.module if hasattr(self.unet, "module") else self.unet
+        prediction_model_unwrapped = self.prediction_model.module if hasattr(self.prediction_model,
+                                                                 "module") else self.prediction_model
         p = self.config.training.losses.resource_loss.pruning_target
 
-        p_actual = (1 - (1 - p) * unet_unwrapped.resource_info_dict['total_macs'] /
-                    unet_unwrapped.resource_info_dict['cur_prunable_macs']).item()
+        p_actual = (1 - (1 - p) * prediction_model_unwrapped.resource_info_dict['total_macs'] /
+                    prediction_model_unwrapped.resource_info_dict['cur_prunable_macs']).item()
 
         self.resource_loss.p = p_actual
 
@@ -1412,7 +1420,7 @@ class Pruner(Trainer):
                              log_kwargs={"wandb": {"commit": False}})
 
 
-class SDXLPruner(Pruner):
+class SDXLPruner(UnetPruner):
     def __init__(self, config: DictConfig):
         super().__init__(config)
         self.tokenizer2 = None
@@ -1493,13 +1501,13 @@ class SDXLPruner(Pruner):
 
         unet = UNet2DConditionModelGated.from_pretrained(
             self.config.pretrained_model_name_or_path,
-            subfolder="unet",
+            subfolder=self.prediction_model_name,
             revision=self.config.non_ema_revision,
-            down_block_types=tuple(self.config.model.unet.unet_down_blocks),
-            mid_block_type=self.config.model.unet.unet_mid_block,
-            up_block_types=tuple(self.config.model.unet.unet_up_blocks),
-            gated_ff=self.config.model.unet.gated_ff,
-            ff_gate_width=self.config.model.unet.ff_gate_width,
+            down_block_types=tuple(self.config.model.prediction_model.unet_down_blocks),
+            mid_block_type=self.config.model.prediction_model.unet_mid_block,
+            up_block_types=tuple(self.config.model.prediction_model.unet_up_blocks),
+            gated_ff=self.config.model.prediction_model.gated_ff,
+            ff_gate_width=self.config.model.prediction_model.ff_gate_width,
 
         )
 
@@ -1531,7 +1539,7 @@ class SDXLPruner(Pruner):
         self.noise_scheduler = noise_scheduler
         self.mpnet_tokenizer = mpnet_tokenizer
         self.mpnet_model = mpnet_model
-        self.unet = unet
+        self.prediction_model = unet
         self.hyper_net = hyper_net
         self.quantizer = quantizer
 
@@ -1636,11 +1644,11 @@ class SDXLPruner(Pruner):
 
     def prepare_datasets(self, preprocess_train, preprocess_eval, preprocess_prompts):
         # Preprocessing the datasets.
-        train_resize = transforms.Resize(self.config.model.unet.resolution,
+        train_resize = transforms.Resize(self.config.model.prediction_model.resolution,
                                          interpolation=transforms.InterpolationMode.BILINEAR)
         train_crop = transforms.CenterCrop(
-            self.config.model.unet.resolution) if self.config.data.dataloader.center_crop else transforms.RandomCrop(
-            self.config.model.unet.resolution)
+            self.config.model.prediction_model.resolution) if self.config.data.dataloader.center_crop else transforms.RandomCrop(
+            self.config.model.prediction_model.resolution)
         train_flip = transforms.RandomHorizontalFlip()
         train_transforms = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
 
@@ -1658,12 +1666,12 @@ class SDXLPruner(Pruner):
                     # flip
                     image = train_flip(image)
                 if self.config.data.dataloader.center_crop:
-                    y1 = max(0, int(round((image.height - self.config.model.unet.resolution) / 2.0)))
-                    x1 = max(0, int(round((image.width - self.config.model.unet.resolution) / 2.0)))
+                    y1 = max(0, int(round((image.height - self.config.model.prediction_model.resolution) / 2.0)))
+                    x1 = max(0, int(round((image.width - self.config.model.prediction_model.resolution) / 2.0)))
                     image = train_crop(image)
                 else:
-                    y1, x1, h, w = train_crop.get_params(image, (self.config.model.unet.resolution,
-                                                                 self.config.model.unet.resolution))
+                    y1, x1, h, w = train_crop.get_params(image, (self.config.model.prediction_model.resolution,
+                                                                 self.config.model.prediction_model.resolution))
                     image = crop(image, y1, x1, h, w)
                 crop_top_left = (y1, x1)
                 crop_top_lefts.append(crop_top_left)
@@ -1753,20 +1761,21 @@ class SDXLPruner(Pruner):
         self.train_dataloader = train_dataloader
 
     def step(self, batch, pretrain=False):
-        unet_unwrapped = self.unet.module if hasattr(self.unet, "module") else self.unet
+        prediction_model_unwrapped = self.prediction_model.module if hasattr(self.prediction_model,
+                                                                 "module") else self.prediction_model
         quantizer_unwrapped = self.quantizer.module if hasattr(self.quantizer, "module") else self.quantizer
         hyper_net_unwrapped = self.hyper_net.module if hasattr(self.hyper_net, "module") else self.hyper_net
 
         model_input = batch["model_input"].to(self.accelerator.device)
         noise = torch.randn_like(model_input)
-        if self.config.model.unet.noise_offset:
+        if self.config.model.prediction_model.noise_offset:
             # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-            noise += self.config.model.unet.noise_offset * torch.randn(
+            noise += self.config.model.prediction_model.noise_offset * torch.randn(
                 (model_input.shape[0], model_input.shape[1], 1, 1), device=model_input.device
             )
 
         bsz = model_input.shape[0]
-        if self.config.model.unet.timestep_bias_strategy == "none":
+        if self.config.model.prediction_model.timestep_bias_strategy == "none":
             # Sample a random timestep for each image without bias.
             timesteps = torch.randint(
                 0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=model_input.device
@@ -1774,7 +1783,7 @@ class SDXLPruner(Pruner):
         else:
             # Sample a random timestep for each image, potentially biased by the timestep weights.
             # Biasing the timestep weights allows us to spend less time training irrelevant timesteps.
-            weights = self.generate_timestep_weights(self.config.model.unet,
+            weights = self.generate_timestep_weights(self.config.model.prediction_model,
                                                      self.config.noise_scheduler.config.num_train_timesteps).to(
                 model_input.device
             )
@@ -1787,7 +1796,7 @@ class SDXLPruner(Pruner):
         # time ids
         def compute_time_ids(original_size, crops_coords_top_left):
             # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
-            target_size = (self.config.model.unet.resolution, self.config.model.unet.resolution)
+            target_size = (self.config.model.prediction_model.resolution, self.config.model.prediction_model.resolution)
             add_time_ids = list(original_size + crops_coords_top_left + target_size)
             add_time_ids = torch.tensor([add_time_ids])
             add_time_ids = add_time_ids.to(self.accelerator.device, dtype=self.weight_dtype)
@@ -1798,10 +1807,10 @@ class SDXLPruner(Pruner):
         )
 
         # Predict the noise residual
-        unet_added_conditions = {"time_ids": add_time_ids}
+        prediction_model_added_conditions = {"time_ids": add_time_ids}
         prompt_embeds = batch["prompt_embeds"].to(self.accelerator.device)
         pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(self.accelerator.device)
-        unet_added_conditions.update({"text_embeds": pooled_prompt_embeds})
+        prediction_model_added_conditions.update({"text_embeds": pooled_prompt_embeds})
 
         # Get the text embedding for conditioning
         text_embeddings = batch["mpnet_embeddings"]
@@ -1851,9 +1860,9 @@ class SDXLPruner(Pruner):
                                                                           return_similarity=True)
 
         # Get the target for loss depending on the prediction type
-        if self.config.model.unet.prediction_type is not None:
+        if self.config.model.prediction_model.prediction_type is not None:
             # set prediction_type of scheduler if defined
-            self.noise_scheduler.register_to_config(prediction_type=self.config.model.unet.prediction_type)
+            self.noise_scheduler.register_to_config(prediction_type=self.config.model.prediction_model.prediction_type)
 
         if self.noise_scheduler.config.prediction_type == "epsilon":
             target = noise
@@ -1865,14 +1874,15 @@ class SDXLPruner(Pruner):
         with torch.no_grad():
             full_arch_vector = torch.ones_like(arch_vector)
             full_arch_vector = hyper_net_unwrapped.transform_structure_vector(full_arch_vector)
-            unet_unwrapped.set_structure(full_arch_vector)
-            full_model_pred = self.unet(noisy_model_input, timesteps, prompt_embeds,
-                                        added_cond_kwargs=unet_added_conditions, return_dict=False, ).sample.detach()
+            prediction_model_unwrapped.set_structure(full_arch_vector)
+            full_model_pred = self.prediction_model(noisy_model_input, timesteps, prompt_embeds,
+                                                    added_cond_kwargs=prediction_model_added_conditions,
+                                                    return_dict=False, ).sample.detach()
             teacher_block_activations = self.block_activations.copy()
 
-        unet_unwrapped.set_structure(arch_vectors_separated)
+        prediction_model_unwrapped.set_structure(arch_vectors_separated)
         # Predict the noise residual and compute loss
-        model_pred = self.unet(noisy_model_input, timesteps, prompt_embeds, return_dict=False)[0]
+        model_pred = self.prediction_model(noisy_model_input, timesteps, prompt_embeds, return_dict=False)[0]
         student_block_activations = self.block_activations.copy()
 
         if self.config.training.losses.diffusion_loss.snr_gamma is None:
@@ -1905,13 +1915,13 @@ class SDXLPruner(Pruner):
                                                  reduction="mean")
         block_loss /= len(student_block_activations)
 
-        macs_dict = unet_unwrapped.calc_macs()
+        macs_dict = prediction_model_unwrapped.calc_macs()
         curr_macs = macs_dict['cur_prunable_macs']
 
         # The reason is that sanity['prunable_macs'] does not have depth-related pruning
         # macs like skip connections of resnets in it.
         resource_ratios = (curr_macs / (
-            unet_unwrapped.resource_info_dict['cur_prunable_macs'].squeeze()))
+            prediction_model_unwrapped.resource_info_dict['cur_prunable_macs'].squeeze()))
 
         resource_loss = self.resource_loss(resource_ratios.mean())
 
@@ -1919,7 +1929,7 @@ class SDXLPruner(Pruner):
         std_loss = -torch.std(resource_ratios)
         with torch.no_grad():
             batch_resource_ratios = macs_dict['cur_prunable_macs'] / (
-                unet_unwrapped.resource_info_dict['cur_prunable_macs'].squeeze())
+                prediction_model_unwrapped.resource_info_dict['cur_prunable_macs'].squeeze())
 
         diff_loss = loss.clone().detach().mean()
         loss += self.config.training.losses.resource_loss.weight * resource_loss
@@ -1935,7 +1945,7 @@ class SDXLPruner(Pruner):
             macs_dict, arch_vector_quantized, quantizer_embeddings_pairwise_similarity, batch_resource_ratios)
 
 
-class FluxPruner(Pruner):
+class FluxPruner(UnetPruner):
     def __init__(self, config: DictConfig):
         super().__init__(config)
         self.tokenizer2 = None
@@ -2010,16 +2020,17 @@ class FluxPruner(Pruner):
         self.noise_scheduler = noise_scheduler
         self.mpnet_tokenizer = mpnet_tokenizer
         self.mpnet_model = mpnet_model
-        self.unet = unet
+        self.transformer = transformer
         self.hyper_net = hyper_net
         self.quantizer = quantizer
 
 
-class FineTuner(Trainer):
+class UnetFineTuner(Trainer):
     def __init__(self, config: DictConfig):
         self.teacher_model = None
         super().__init__(config)
         self.hyper_net, self.quantizer, self.mpnet_model, self.mpnet_tokenizer = None, None, None, None
+        self.prediction_model_name = "unet"
 
     def init_models(self):
         logger.info("Loading models...")
@@ -2044,19 +2055,19 @@ class FineTuner(Trainer):
             vae = AutoencoderKL.from_pretrained(
                 self.config.pretrained_model_name_or_path, subfolder="vae", revision=self.config.revision
             )
-        teacher_unet = UNet2DConditionModel.from_pretrained(
+        teacher_model = UNet2DConditionModel.from_pretrained(
             self.config.pretrained_model_name_or_path,
-            subfolder="unet",
+            subfolder=self.prediction_model_name,
             revision=self.config.revision,
         )
 
-        sample_inputs = {'sample': torch.randn(1, teacher_unet.config.in_channels, teacher_unet.config.sample_size,
-                                               teacher_unet.config.sample_size),
+        sample_inputs = {'sample': torch.randn(1, teacher_model.config.in_channels, teacher_model.config.sample_size,
+                                               teacher_model.config.sample_size),
                          'timestep': torch.ones((1,)).long(),
                          'encoder_hidden_states': text_encoder(torch.tensor([[100]]))[0],
                          }
 
-        teacher_macs, teacher_params = count_ops_and_params(teacher_unet, sample_inputs)
+        teacher_macs, teacher_params = count_ops_and_params(teacher_model, sample_inputs)
 
         embeddings_gs = torch.load(os.path.join(self.config.pruning_ckpt_dir, "quantizer_embeddings.pt"),
                                    map_location="cpu")
@@ -2066,25 +2077,26 @@ class FineTuner(Trainer):
 
         unet = UNet2DConditionModelPruned.from_pretrained(
             self.config.pretrained_model_name_or_path,
-            subfolder="unet",
+            subfolder=self.prediction_model_name,
             revision=self.config.non_ema_revision,
-            down_block_types=tuple(self.config.model.unet.unet_down_blocks),
-            mid_block_type=self.config.model.unet.unet_mid_block,
-            up_block_types=tuple(self.config.model.unet.unet_up_blocks),
-            gated_ff=self.config.model.unet.gated_ff,
-            ff_gate_width=self.config.model.unet.ff_gate_width,
+            down_block_types=tuple(self.config.model.prediction_model.unet_down_blocks),
+            mid_block_type=self.config.model.prediction_model.unet_mid_block,
+            up_block_types=tuple(self.config.model.prediction_model.unet_up_blocks),
+            gated_ff=self.config.model.prediction_model.gated_ff,
+            ff_gate_width=self.config.model.prediction_model.ff_gate_width,
             arch_vector=arch_v
         )
 
         unet_macs, unet_params = count_ops_and_params(unet, sample_inputs)
 
         print(f"Teacher macs: {teacher_macs / 1e9}G, Teacher Params: {teacher_params / 1e6}M")
-        print(f"Pruned UNet macs: {unet_macs / 1e9}G, Pruned UNet Params: {unet_params / 1e6}M")
+        print(
+            f"Pruned {self.prediction_model_name} macs: {unet_macs / 1e9}G, Pruned {self.prediction_model_name} Params: {unet_params / 1e6}M")
         print(f"Pruning Raio: {unet_macs / teacher_macs:.2f}")
 
         vae.requires_grad_(False)
         text_encoder.requires_grad_(False)
-        teacher_unet.requires_grad_(False)
+        teacher_model.requires_grad_(False)
 
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder
@@ -2092,8 +2104,8 @@ class FineTuner(Trainer):
         self.noise_scheduler = noise_scheduler
         self.mpnet_tokenizer = mpnet_tokenizer
         self.mpnet_model = mpnet_model
-        self.teacher_model = teacher_unet
-        self.unet = unet
+        self.teacher_model = teacher_model
+        self.prediction_model = unet
         self.hyper_net = hyper_net
         self.quantizer = quantizer
 
@@ -2135,17 +2147,17 @@ class FineTuner(Trainer):
                           self.config.data.dataloader.train_batch_size * self.accelerator.num_processes)
 
         if self.config.training.optim.scale_lr:
-            self.config.training.optim.unet_learning_rate = (
-                    self.config.training.optim.unet_learning_rate * math.sqrt(scaling_factor)
+            self.config.training.optim.prediction_model_learning_rate = (
+                    self.config.training.optim.prediction_model_learning_rate * math.sqrt(scaling_factor)
             )
 
         optimizer_cls = self.get_optimizer_cls()
 
         optimizer = optimizer_cls(
             [
-                {"params": [p for p in self.unet.parameters()],
-                 "lr": self.config.training.optim.unet_learning_rate,
-                 "weight_decay": self.config.training.optim.unet_weight_decay},
+                {"params": [p for p in self.prediction_model.parameters()],
+                 "lr": self.config.training.optim.prediction_model_learning_rate,
+                 "weight_decay": self.config.training.optim.prediction_model_weight_decay},
             ],
             betas=(self.config.training.optim.adam_beta1, self.config.training.optim.adam_beta2),
             eps=self.config.training.optim.adam_epsilon,
@@ -2157,8 +2169,8 @@ class FineTuner(Trainer):
         self.distillation_loss = F.mse_loss
 
     def prepare_with_accelerator(self):
-        (self.unet, self.optimizer, self.train_dataloader, self.eval_dataloader, self.prompt_dataloader,
-         self.lr_scheduler) = (self.accelerator.prepare(self.unet, self.optimizer, self.train_dataloader,
+        (self.prediction_model, self.optimizer, self.train_dataloader, self.eval_dataloader, self.prompt_dataloader,
+         self.lr_scheduler) = (self.accelerator.prepare(self.prediction_model, self.optimizer, self.train_dataloader,
                                                         self.eval_dataloader, self.prompt_dataloader,
                                                         self.lr_scheduler))
 
@@ -2210,7 +2222,7 @@ class FineTuner(Trainer):
 
         self.block_act_teacher = {}
         self.block_act_student = {}
-        self.cast_block_act_hooks(self.unet, self.block_act_student)
+        self.cast_block_act_hooks(self.prediction_model, self.block_act_student)
         self.cast_block_act_hooks(self.teacher_model, self.block_act_teacher)
 
         for epoch in range(first_epoch, self.config.training.num_train_epochs):
@@ -2219,7 +2231,7 @@ class FineTuner(Trainer):
                     continue
                 train_loss = 0.0
                 self.teacher_model.eval()
-                self.unet.train()
+                self.prediction_model.train()
 
                 loss, diff_loss, distillation_loss, block_loss = self.step(batch)
                 avg_loss = loss
@@ -2239,7 +2251,7 @@ class FineTuner(Trainer):
                         "finetuning/diffusion_loss": diff_loss,
                         "finetuning/distillation_loss": distillation_loss.detach().item(),
                         "finetuning/block_loss": block_loss.detach().item(),
-                        "finetuning/unet_lr": self.lr_scheduler.get_last_lr()[0],
+                        "finetuning/prediction_model_lr": self.lr_scheduler.get_last_lr()[0],
                     }
                     self.accelerator.log(log_dict)
 
@@ -2300,24 +2312,24 @@ class FineTuner(Trainer):
 
         # Sample noise that we'll add to the latents
         noise = torch.randn_like(latents)
-        if self.config.model.unet.noise_offset:
+        if self.config.model.prediction_model.noise_offset:
             # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-            noise += self.config.model.unet.noise_offset * torch.randn(
+            noise += self.config.model.prediction_model.noise_offset * torch.randn(
                 (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
             )
-        if self.config.model.unet.input_perturbation:
-            new_noise = noise + self.config.model.unet.input_perturbation * torch.randn_like(noise)
+        if self.config.model.prediction_model.input_perturbation:
+            new_noise = noise + self.config.model.prediction_model.input_perturbation * torch.randn_like(noise)
         bsz = latents.shape[0]
         # Sample a random timestep for each image
-        if self.config.model.unet.max_scheduler_steps is None:
-            self.config.model.unet.max_scheduler_steps = self.noise_scheduler.config.num_train_timesteps
-        timesteps = torch.randint(0, self.config.model.unet.max_scheduler_steps, (bsz,),
+        if self.config.model.prediction_model.max_scheduler_steps is None:
+            self.config.model.prediction_model.max_scheduler_steps = self.noise_scheduler.config.num_train_timesteps
+        timesteps = torch.randint(0, self.config.model.prediction_model.max_scheduler_steps, (bsz,),
                                   device=latents.device)
         timesteps = timesteps.long()
 
         # Add noise to the latents according to the noise magnitude at each timestep
-        # (this is the forward unet process)
-        if self.config.model.unet.input_perturbation:
+        # (this is the forward process)
+        if self.config.model.prediction_model.input_perturbation:
             noisy_latents = self.noise_scheduler.add_noise(latents, new_noise, timesteps)
         else:
             noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
@@ -2326,9 +2338,9 @@ class FineTuner(Trainer):
         encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
 
         # Get the target for loss depending on the prediction type
-        if self.config.model.unet.prediction_type is not None:
+        if self.config.model.prediction_model.prediction_type is not None:
             # set prediction_type of scheduler if defined
-            self.noise_scheduler.register_to_config(prediction_type=self.config.model.unet.prediction_type)
+            self.noise_scheduler.register_to_config(prediction_type=self.config.model.prediction_model.prediction_type)
 
         if self.noise_scheduler.config.prediction_type == "epsilon":
             target = noise
@@ -2339,7 +2351,7 @@ class FineTuner(Trainer):
         with torch.no_grad():
             full_model_pred = self.teacher_model(noisy_latents, timesteps, encoder_hidden_states).sample.detach()
         # Predict the noise residual and compute loss
-        model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+        model_pred = self.prediction_model(noisy_latents, timesteps, encoder_hidden_states).sample
         if self.config.training.losses.diffusion_loss.snr_gamma is None:
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
         else:
@@ -2393,7 +2405,7 @@ class FineTuner(Trainer):
             disable=not self.accelerator.is_main_process,
         )
 
-        self.unet.eval()
+        self.prediction_model.eval()
 
         total_val_loss, total_diff_loss, total_distillation_loss, total_block_loss = 0.0, 0.0, 0.0, 0.0
 
@@ -2464,7 +2476,7 @@ class FineTuner(Trainer):
         return images
 
 
-class SingleArchFinetuner(FineTuner):
+class SingleArchUnetFinetuner(UnetFineTuner):
 
     def init_models(self):
         logger.info("Loading models...")
@@ -2489,44 +2501,44 @@ class SingleArchFinetuner(FineTuner):
             vae = AutoencoderKL.from_pretrained(
                 self.config.pretrained_model_name_or_path, subfolder="vae", revision=self.config.revision
             )
-        teacher_unet = UNet2DConditionModel.from_pretrained(
+        teacher_model = UNet2DConditionModel.from_pretrained(
             self.config.pretrained_model_name_or_path,
-            subfolder="unet",
+            subfolder=self.prediction_model,
             revision=self.config.revision,
         )
 
-        sample_inputs = {'sample': torch.randn(1, teacher_unet.config.in_channels, teacher_unet.config.sample_size,
-                                               teacher_unet.config.sample_size),
+        sample_inputs = {'sample': torch.randn(1, teacher_model.config.in_channels, teacher_model.config.sample_size,
+                                               teacher_model.config.sample_size),
                          'timestep': torch.ones((1,)).long(),
                          'encoder_hidden_states': text_encoder(torch.tensor([[100]]))[0],
                          }
-        teacher_macs, teacher_params = count_ops_and_params(teacher_unet, sample_inputs)
+        teacher_macs, teacher_params = count_ops_and_params(teacher_model, sample_inputs)
 
         arch_v = hyper_net.arch
         arch_v = quantizer.gumbel_sigmoid_trick(arch_v).to("cpu")
 
         unet = UNet2DConditionModelPruned.from_pretrained(
             self.config.pretrained_model_name_or_path,
-            subfolder="unet",
+            subfolder=self.prediction_model_name,
             revision=self.config.non_ema_revision,
-            down_block_types=tuple(self.config.model.unet.unet_down_blocks),
-            mid_block_type=self.config.model.unet.unet_mid_block,
-            up_block_types=tuple(self.config.model.unet.unet_up_blocks),
-            gated_ff=self.config.model.unet.gated_ff,
-            ff_gate_width=self.config.model.unet.ff_gate_width,
+            down_block_types=tuple(self.config.model.prediction_model.unet_down_blocks),
+            mid_block_type=self.config.model.prediction_model.unet_mid_block,
+            up_block_types=tuple(self.config.model.prediction_model.unet_up_blocks),
+            gated_ff=self.config.model.prediction_model.gated_ff,
+            ff_gate_width=self.config.model.prediction_model.ff_gate_width,
             arch_vector=arch_v
         )
 
         unet_macs, unet_params = count_ops_and_params(unet, sample_inputs)
 
         print(f"Teacher macs: {teacher_macs / 1e9}G, Teacher Params: {teacher_params / 1e6}M")
-        print(f"Single Arch Pruned UNet macs: {unet_macs / 1e9}G,"
-              f"Single Arch Pruned UNet Params: {unet_params / 1e6}M")
+        print(f"Single Arch Pruned {self.prediction_model_name} macs: {unet_macs / 1e9}G,"
+              f"Single Arch Pruned {self.prediction_model_name} Params: {unet_params / 1e6}M")
         print(f"Pruning Raio: {unet_macs / teacher_macs:.2f}")
 
         vae.requires_grad_(False)
         text_encoder.requires_grad_(False)
-        teacher_unet.requires_grad_(False)
+        teacher_model.requires_grad_(False)
 
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder
@@ -2534,8 +2546,8 @@ class SingleArchFinetuner(FineTuner):
         self.noise_scheduler = noise_scheduler
         self.mpnet_tokenizer = mpnet_tokenizer
         self.mpnet_model = mpnet_model
-        self.teacher_model = teacher_unet
-        self.unet = unet
+        self.teacher_model = teacher_model
+        self.prediction_model = unet
         self.hyper_net = hyper_net
         self.quantizer = quantizer
 
@@ -2545,7 +2557,7 @@ class SingleArchFinetuner(FineTuner):
         return dataset
 
 
-class BaselineFineTuner(FineTuner):
+class BaselineUnetFineTuner(UnetFineTuner):
 
     def __init__(self, config: DictConfig, pruning_type="magnitude"):
         assert pruning_type in ["no-pruning", "magnitude", "random", "structural"]
@@ -2573,24 +2585,24 @@ class BaselineFineTuner(FineTuner):
                 self.config.pretrained_model_name_or_path, subfolder="vae", revision=self.config.revision
             )
 
-        teacher_unet = UNet2DConditionModel.from_pretrained(
+        teacher_model = UNet2DConditionModel.from_pretrained(
             self.config.pretrained_model_name_or_path,
-            subfolder="unet",
+            subfolder=self.prediction_model_name,
             revision=self.config.revision,
         )
 
-        sample_inputs = {'sample': torch.randn(1, teacher_unet.config.in_channels, teacher_unet.config.sample_size,
-                                               teacher_unet.config.sample_size),
+        sample_inputs = {'sample': torch.randn(1, teacher_model.config.in_channels, teacher_model.config.sample_size,
+                                               teacher_model.config.sample_size),
                          'timestep': torch.ones((1,)).long(),
                          'encoder_hidden_states': text_encoder(torch.tensor([[100]]))[0],
                          }
 
-        teacher_macs, teacher_params = count_ops_and_params(teacher_unet, sample_inputs)
+        teacher_macs, teacher_params = count_ops_and_params(teacher_model, sample_inputs)
 
         if self.pruning_type == "magnitude":
             unet = UNet2DConditionModelMagnitudePruned.from_pretrained(
                 self.config.pretrained_model_name_or_path,
-                subfolder="unet",
+                subfolder=self.prediction_model_name,
                 revision=self.config.non_ema_revision,
                 target_pruning_rate=self.config.training.pruning_target,
                 pruning_method=self.config.training.pruning_method,
@@ -2602,18 +2614,18 @@ class BaselineFineTuner(FineTuner):
                 map_location="cpu"
             )
         elif self.pruning_type == "no-pruning":
-            unet = copy.deepcopy(teacher_unet)
+            unet = copy.deepcopy(teacher_model)
             unet.requires_grad_(True)
         else:
             unet = UNet2DConditionModelPruned.from_pretrained(
                 self.config.pretrained_model_name_or_path,
-                subfolder="unet",
+                subfolder=self.prediction_model_name,
                 revision=self.config.non_ema_revision,
-                down_block_types=tuple(self.config.model.unet.unet_down_blocks),
-                mid_block_type=self.config.model.unet.unet_mid_block,
-                up_block_types=tuple(self.config.model.unet.unet_up_blocks),
-                gated_ff=self.config.model.unet.gated_ff,
-                ff_gate_width=self.config.model.unet.ff_gate_width,
+                down_block_types=tuple(self.config.model.prediction_model.unet_down_blocks),
+                mid_block_type=self.config.model.prediction_model.unet_mid_block,
+                up_block_types=tuple(self.config.model.prediction_model.unet_up_blocks),
+                gated_ff=self.config.model.prediction_model.gated_ff,
+                ff_gate_width=self.config.model.prediction_model.ff_gate_width,
                 random_pruning_ratio=self.config.training.random_pruning_ratio
             )
 
@@ -2621,19 +2633,20 @@ class BaselineFineTuner(FineTuner):
 
         logging.info(f"Teacher macs: {teacher_macs / 1e9}G, Teacher Params: {teacher_params / 1e6}M")
         logger.info(
-            f"Baseline Pruned UNet macs: {unet_macs / 1e9}G, Baseline Pruned UNet Params: {unet_params / 1e6}M")
+            f"Baseline Pruned {self.prediction_model_name} macs: {unet_macs / 1e9}G,"
+            f" Baseline Pruned {self.prediction_model_name} Params: {unet_params / 1e6}M")
         logger.info(f"Pruning Raio: {unet_macs / teacher_macs:.2f}")
 
         vae.requires_grad_(False)
         text_encoder.requires_grad_(False)
-        teacher_unet.requires_grad_(False)
+        teacher_model.requires_grad_(False)
 
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder
         self.vae = vae
         self.noise_scheduler = noise_scheduler
-        self.teacher_model = teacher_unet
-        self.unet = unet
+        self.teacher_model = teacher_model
+        self.prediction_model = unet
         self.mpnet_tokenizer = mpnet_tokenizer
         self.mpnet_model = mpnet_model
 

@@ -64,10 +64,10 @@ def get_dataset(config):
 def get_transforms(config):
     train_transform = transforms.Compose(
         [
-            transforms.Resize(config.model.unet.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.Resize(config.model.prediction_model.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.CenterCrop(
-                config.model.unet.resolution) if config.data.dataloader.center_crop else transforms.RandomCrop(
-                config.model.unet.resolution),
+                config.model.prediction_model.resolution) if config.data.dataloader.center_crop else transforms.RandomCrop(
+                config.model.prediction_model.resolution),
             transforms.RandomHorizontalFlip() if config.data.dataloader.random_flip else transforms.Lambda(lambda x: x),
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
@@ -76,10 +76,10 @@ def get_transforms(config):
 
     validation_transform = transforms.Compose(
         [
-            transforms.Resize(config.model.unet.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.Resize(config.model.prediction_model.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.CenterCrop(
-                config.model.unet.resolution) if config.data.dataloader.center_crop else transforms.RandomCrop(
-                config.model.unet.resolution),
+                config.model.prediction_model.resolution) if config.data.dataloader.center_crop else transforms.RandomCrop(
+                config.model.prediction_model.resolution),
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ]
