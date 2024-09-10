@@ -23,6 +23,9 @@ def get_dataset(config):
     validation_data_dir = getattr(config, "validation_data_dir", None)
     validation_data_file = getattr(config, "validation_data_file", None)
 
+    if data_dir is None:
+        data_dir = ""
+
     if "conceptual_captions" in data_dir:
         dataset = {"train": load_cc3m_dataset(data_dir,
                                               split="train",
