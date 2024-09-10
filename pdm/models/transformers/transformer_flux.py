@@ -1,6 +1,6 @@
 # Adapted from https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/transformers/transformer_flux.py
 
-from typing import Optional, Tuple
+from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,295 +9,15 @@ from diffusers.models import FluxTransformer2DModel
 from diffusers.configuration_utils import register_to_config
 from diffusers.models.attention_processor import (
     Attention,
-    FluxAttnProcessor2_0,
 )
 from diffusers.models.normalization import AdaLayerNormZero, AdaLayerNormZeroSingle
-from diffusers.utils import logging, deprecate, is_torch_npu_available
+from diffusers.utils import logging
 from diffusers.utils.torch_utils import maybe_allow_in_graph
 from ..gates import WidthGate
+from ..attention import GatedFeedForward, GatedAttention, GatedFluxAttnProcessor2_0
+
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
-
-
-class GatedFluxAttnProcessor2_0(FluxAttnProcessor2_0):
-    def __init__(self):
-        super().__init__()
-
-    def __call__(
-            self,
-            attn: Attention,
-            hidden_states: torch.FloatTensor,
-            encoder_hidden_states: torch.FloatTensor = None,
-            attention_mask: Optional[torch.FloatTensor] = None,
-            image_rotary_emb: Optional[torch.Tensor] = None,
-    ) -> torch.FloatTensor:
-        batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
-
-        # `sample` projections.
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(hidden_states)
-        value = attn.to_v(hidden_states)
-
-        inner_dim = key.shape[-1]
-        head_dim = inner_dim // attn.heads
-
-        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-
-        # Apply the gate
-        query = attn.gate(query)
-        key = attn.gate(key)
-        value = attn.gate(value)
-
-        if attn.norm_q is not None:
-            query = attn.norm_q(query)
-        if attn.norm_k is not None:
-            key = attn.norm_k(key)
-
-        # the attention in FluxSingleTransformerBlock does not use `encoder_hidden_states`
-        if encoder_hidden_states is not None:
-            # `context` projections.
-            encoder_hidden_states_query_proj = attn.add_q_proj(encoder_hidden_states)
-            encoder_hidden_states_key_proj = attn.add_k_proj(encoder_hidden_states)
-            encoder_hidden_states_value_proj = attn.add_v_proj(encoder_hidden_states)
-
-            encoder_hidden_states_query_proj = encoder_hidden_states_query_proj.view(
-                batch_size, -1, attn.heads, head_dim
-            ).transpose(1, 2)
-            encoder_hidden_states_key_proj = encoder_hidden_states_key_proj.view(
-                batch_size, -1, attn.heads, head_dim
-            ).transpose(1, 2)
-            encoder_hidden_states_value_proj = encoder_hidden_states_value_proj.view(
-                batch_size, -1, attn.heads, head_dim
-            ).transpose(1, 2)
-
-            # Apply the gate
-            encoder_hidden_states_query_proj = attn.gate(encoder_hidden_states_query_proj)
-            encoder_hidden_states_key_proj = attn.gate(encoder_hidden_states_key_proj)
-            encoder_hidden_states_value_proj = attn.gate(encoder_hidden_states_value_proj)
-
-            if attn.norm_added_q is not None:
-                encoder_hidden_states_query_proj = attn.norm_added_q(encoder_hidden_states_query_proj)
-            if attn.norm_added_k is not None:
-                encoder_hidden_states_key_proj = attn.norm_added_k(encoder_hidden_states_key_proj)
-
-            # attention
-            query = torch.cat([encoder_hidden_states_query_proj, query], dim=2)
-            key = torch.cat([encoder_hidden_states_key_proj, key], dim=2)
-            value = torch.cat([encoder_hidden_states_value_proj, value], dim=2)
-
-        if image_rotary_emb is not None:
-            from diffusers.models.embeddings import apply_rotary_emb
-
-            query = apply_rotary_emb(query, image_rotary_emb)
-            key = apply_rotary_emb(key, image_rotary_emb)
-
-        hidden_states = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
-        hidden_states = hidden_states.to(query.dtype)
-
-        if encoder_hidden_states is not None:
-            encoder_hidden_states, hidden_states = (
-                hidden_states[:, : encoder_hidden_states.shape[1]],
-                hidden_states[:, encoder_hidden_states.shape[1]:],
-            )
-
-            # linear proj
-            hidden_states = attn.to_out[0](hidden_states)
-            # dropout
-            hidden_states = attn.to_out[1](hidden_states)
-            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
-
-            return hidden_states, encoder_hidden_states
-        else:
-            return hidden_states
-
-
-class GatedAttention(Attention):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.gate = WidthGate(self.heads)
-
-
-class GatedGELU(nn.Module):
-    r"""
-    GELU activation function with tanh approximation support with `approximate="tanh"`.
-
-    Parameters:
-        dim_in (`int`): The number of channels in the input.
-        dim_out (`int`): The number of channels in the output.
-        approximate (`str`, *optional*, defaults to `"none"`): If `"tanh"`, use tanh approximation.
-        bias (`bool`, defaults to True): Whether to use a bias in the linear layer.
-        gate_width (`int`, *optional*, defaults to 32): The width of the gate.
-    """
-
-    def __init__(self, dim_in: int, dim_out: int, approximate: str = "none", bias: bool = True, gate_width: int = 32):
-        super().__init__()
-        self.proj = nn.Linear(dim_in, dim_out, bias=bias)
-        self.approximate = approximate
-        self.gate = WidthGate(gate_width)
-
-    def gelu(self, gate: torch.Tensor) -> torch.Tensor:
-        if gate.device.type != "mps":
-            return F.gelu(gate, approximate=self.approximate)
-        # mps: gelu is not implemented for float16
-        return F.gelu(gate.to(dtype=torch.float32), approximate=self.approximate).to(dtype=gate.dtype)
-
-    def forward(self, hidden_states):
-        hidden_states = self.proj(hidden_states)
-        hidden_states = self.gate(hidden_states)
-        hidden_states = self.gelu(hidden_states)
-        return hidden_states
-
-
-class GatedGEGLU(nn.Module):
-    r"""
-    A [variant](https://arxiv.org/abs/2002.05202) of the gated linear unit activation function.
-
-    Parameters:
-        dim_in (`int`): The number of channels in the input.
-        dim_out (`int`): The number of channels in the output.
-        bias (`bool`, defaults to True): Whether to use a bias in the linear layer.
-    """
-
-    def __init__(self, dim_in: int, dim_out: int, bias: bool = True, gate_width: int = 32):
-        super().__init__()
-        self.proj = nn.Linear(dim_in, dim_out * 2, bias=bias)
-        self.gate = WidthGate(gate_width)
-
-    def gelu(self, gate: torch.Tensor) -> torch.Tensor:
-        if gate.device.type != "mps":
-            return F.gelu(gate)
-        # mps: gelu is not implemented for float16
-        return F.gelu(gate.to(dtype=torch.float32)).to(dtype=gate.dtype)
-
-    def forward(self, hidden_states, *args, **kwargs):
-        if len(args) > 0 or kwargs.get("scale", None) is not None:
-            deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
-            deprecate("scale", "1.0.0", deprecation_message)
-        hidden_states = self.proj(hidden_states)
-        if is_torch_npu_available():
-            import torch_npu
-            # using torch_npu.npu_geglu can run faster and save memory on NPU.
-            hidden_states = self.gate(hidden_states)
-            return torch_npu.npu_geglu(hidden_states, dim=-1, approximate=1)[0]
-        else:
-            hidden_states, gate = hidden_states.chunk(2, dim=-1)
-            hidden_states = self.gate(hidden_states)
-            gate = self.gate(gate)
-            return hidden_states * self.gelu(gate)
-
-
-class GatedSwiGLU(nn.Module):
-    r"""
-    A [variant](https://arxiv.org/abs/2002.05202) of the gated linear unit activation function. It's similar to `GEGLU`
-    but uses SiLU / Swish instead of GeLU.
-
-    Parameters:
-        dim_in (`int`): The number of channels in the input.
-        dim_out (`int`): The number of channels in the output.
-        bias (`bool`, defaults to True): Whether to use a bias in the linear layer.
-    """
-
-    def __init__(self, dim_in: int, dim_out: int, bias: bool = True, gate_width: int = 32):
-        super().__init__()
-        self.proj = nn.Linear(dim_in, dim_out * 2, bias=bias)
-        self.activation = nn.SiLU()
-        self.gate = WidthGate(gate_width)
-
-    def forward(self, hidden_states):
-        hidden_states = self.proj(hidden_states)
-        hidden_states, gate = hidden_states.chunk(2, dim=-1)
-        hidden_states = self.gate(hidden_states)
-        gate = self.gate(gate)
-        return hidden_states * self.activation(gate)
-
-
-class GatedApproximateGELU(nn.Module):
-    r"""
-    The approximate form of the Gaussian Error Linear Unit (GELU). For more details, see section 2 of this
-    [paper](https://arxiv.org/abs/1606.08415).
-
-    Parameters:
-        dim_in (`int`): The number of channels in the input.
-        dim_out (`int`): The number of channels in the output.
-        bias (`bool`, defaults to True): Whether to use a bias in the linear layer.
-    """
-
-    def __init__(self, dim_in: int, dim_out: int, bias: bool = True, gate_width: int = 32):
-        super().__init__()
-        self.proj = nn.Linear(dim_in, dim_out, bias=bias)
-        self.gate = WidthGate(gate_width)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x)
-        x = self.gate(x)
-        return x * torch.sigmoid(1.702 * x)
-
-
-class GatedFeedForward(nn.Module):
-    r"""
-    A gated feed-forward layer.
-
-    Parameters:
-        dim (`int`): The number of channels in the input.
-        dim_out (`int`, *optional*): The number of channels in the output. If not given, defaults to `dim`.
-        mult (`int`, *optional*, defaults to 4): The multiplier to use for the hidden dimension.
-        dropout (`float`, *optional*, defaults to 0.0): The dropout probability to use.
-        activation_fn (`str`, *optional*, defaults to `"geglu"`): Activation function to be used in feed-forward.
-        final_dropout (`bool` *optional*, defaults to False): Apply a final dropout.
-        bias (`bool`, defaults to True): Whether to use a bias in the linear layer.
-        gate_width (`int`, *optional*, defaults to 32): The width of the gate.
-    """
-
-    def __init__(
-            self,
-            dim: int,
-            dim_out: Optional[int] = None,
-            mult: int = 4,
-            dropout: float = 0.0,
-            activation_fn: str = "geglu",
-            final_dropout: bool = False,
-            inner_dim=None,
-            bias: bool = True,
-            gate_width: int = 32,
-    ):
-        super().__init__()
-        if inner_dim is None:
-            inner_dim = int(dim * mult)
-        dim_out = dim_out if dim_out is not None else dim
-
-        if activation_fn == "gelu":
-            act_fn = GatedGELU(dim, inner_dim, bias=bias, gate_width=gate_width)
-        if activation_fn == "gelu-approximate":
-            act_fn = GatedGELU(dim, inner_dim, approximate="tanh", bias=bias, gate_width=gate_width)
-        elif activation_fn == "geglu":
-            act_fn = GatedGEGLU(dim, inner_dim, bias=bias, gate_width=gate_width)
-        elif activation_fn == "geglu-approximate":
-            act_fn = GatedApproximateGELU(dim, inner_dim, bias=bias)
-        elif activation_fn == "swiglu":
-            act_fn = GatedSwiGLU(dim, inner_dim, bias=bias)
-
-        self.net = nn.ModuleList([])
-        # project in
-        self.net.append(act_fn)
-        # project dropout
-        self.net.append(nn.Dropout(dropout))
-        # project out
-        self.net.append(nn.Linear(inner_dim, dim_out, bias=bias))
-        # FF as used in Vision Transformer, MLP-Mixer, etc. have a final dropout
-        if final_dropout:
-            self.net.append(nn.Dropout(dropout))
-
-    def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        if len(args) > 0 or kwargs.get("scale", None) is not None:
-            deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
-            deprecate("scale", "1.0.0", deprecation_message)
-        for module in self.net:
-            hidden_states = module(hidden_states)
-        return hidden_states
-
 
 @maybe_allow_in_graph
 class GatedFluxSingleTransformerBlock(nn.Module):
@@ -363,6 +83,9 @@ class GatedFluxSingleTransformerBlock(nn.Module):
             hidden_states = hidden_states.clip(-65504, 65504)
 
         return hidden_states
+
+    def get_structure(self):
+        return {"width": [self.attn.gate.width, self.ff_gate.width]}
 
 
 @maybe_allow_in_graph
@@ -465,6 +188,9 @@ class GatedFluxTransformerBlock(nn.Module):
 
         return encoder_hidden_states, hidden_states
 
+    def get_structure(self):
+        return {"width": [self.attn.gate.width, self.ff.net[0].gate.width, self.ff_context.net[0].gate.width]}
+
 
 class GatedFluxTransformer2DModel(FluxTransformer2DModel):
     """
@@ -535,3 +261,20 @@ class GatedFluxTransformer2DModel(FluxTransformer2DModel):
             ]
         )
 
+        self.structure = None
+
+    def freeze(self):
+        # Freeze all parameters except the gate_f parameters
+        for name, param in self.named_parameters():
+            if "gate_f" not in name:
+                param.requires_grad = False
+
+    def get_structure(self):
+        if self.structure is None:
+            structure = {"width": [], "depth": []}
+            for block in self.transformer_blocks:
+                structure["width"].append(block.get_structure()["width"])
+            for block in self.single_transformer_blocks:
+                structure["width"].append(block.ff_gate.get_structure()["width"])
+            self.structure = structure
+        return self.structure

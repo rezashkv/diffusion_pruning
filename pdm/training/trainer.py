@@ -18,23 +18,25 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
+from diffusers.utils.torch_utils import is_compiled_module
 from torch.utils.data import DataLoader
 
 import safetensors
 
 import accelerate
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration
 
 import transformers
 from torchvision import transforms
 from torchvision.transforms.functional import crop
-from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, AutoModel, PretrainedConfig, T5EncoderModel
+from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, AutoModel, PretrainedConfig, T5EncoderModel, \
+    T5TokenizerFast
 from transformers.utils import ContextManagers
 
 import diffusers
-from diffusers import AutoencoderKL, DDIMScheduler
+from diffusers import AutoencoderKL, DDIMScheduler, FlowMatchEulerDiscreteScheduler
 from diffusers import UNet2DConditionModel, get_scheduler
 from diffusers.utils import make_image_grid, is_xformers_available, is_wandb_available
 
@@ -53,9 +55,8 @@ from ..models import UNet2DConditionModelGated, HyperStructure, StructureVectorQ
 from ..models.unet import UNet2DConditionModelPruned, UNet2DConditionModelMagnitudePruned
 from ..pipelines import StableDiffusionPruningPipeline
 from ..utils import compute_snr
-from ..utils.data_utils import (get_dataset, get_transforms, preprocess_samples, collate_fn,
-                                preprocess_prompts, prompts_collator, filter_dataset, get_mpnet_embeddings,
-                                download_images_if_missing)
+from ..utils.data_utils import (get_dataset, get_transforms, preprocess_sample, collate_fn,
+                                preprocess_prompts, prompts_collator, filter_dataset)
 from ..utils.logging_utils import create_heatmap
 from ..utils.op_counter import count_ops_and_params
 from ..utils.dist_utils import deepspeed_zero_init_disabled_context_manager
@@ -71,11 +72,11 @@ class Trainer(ABC):
         (self.train_dataloader, self.eval_dataloader, self.prompt_dataloader,
          self.quantizer_embeddings_dataloader) = None, None, None, None
         self.ddpm_loss, self.distillation_loss, self.resource_loss, self.contrastive_loss = None, None, None, None
-        self.prediction_model_name = "Model"
 
         self.config = config
 
         self.accelerator = self.create_accelerator()
+        self.set_multi_gpu_logging()
 
         self.init_models()
         self.enable_xformers()
@@ -116,13 +117,22 @@ class Trainer(ABC):
         accelerator_project_config = ProjectConfiguration(project_dir=logging_dir,
                                                           logging_dir=logging_dir,
                                                           total_limit=self.config.training.logging.checkpoints_total_limit)
-
+        kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         return Accelerator(
             gradient_accumulation_steps=self.config.training.gradient_accumulation_steps,
             mixed_precision=self.config.training.mixed_precision,
             log_with=self.config.training.logging.report_to,
             project_config=accelerator_project_config,
+            kwargs_handlers=[kwargs]
         )
+
+    def set_multi_gpu_logging(self):
+        if self.accelerator.is_local_main_process:
+            transformers.utils.logging.set_verbosity_warning()
+            diffusers.utils.logging.set_verbosity_info()
+        else:
+            transformers.utils.logging.set_verbosity_error()
+            diffusers.utils.logging.set_verbosity_error()
 
     @abstractmethod
     def init_models(self):
@@ -212,12 +222,20 @@ class Trainer(ABC):
 
         # Preprocessors and transformers
         train_transform, validation_transform = get_transforms(self.config)
-        preprocess_train = partial(preprocess_samples, tokenizer=self.tokenizer, mpnet_model=self.mpnet_model,
-                                   mpnet_tokenizer=self.mpnet_tokenizer, transform=train_transform,
-                                   image_column=image_column, caption_column=caption_column, is_train=True)
+        preprocess_train = partial(preprocess_sample,
+                                   tokenizers=[self.tokenizer],
+                                   text_encoders=[self.text_encoder],
+                                   mpnet_model=self.mpnet_model, mpnet_tokenizer=self.mpnet_tokenizer,
+                                   transform=train_transform,
+                                   image_column=image_column, caption_column=caption_column,
+                                   is_train=True, max_sequence_length=self.tokenizer.model_max_length)
 
-        preprocess_validation = partial(preprocess_samples, tokenizer=self.tokenizer, mpnet_model=self.mpnet_model,
-                                        mpnet_tokenizer=self.mpnet_tokenizer, transform=validation_transform,
+        preprocess_validation = partial(preprocess_sample,
+                                        tokenizers=[self.tokenizer],
+                                        text_encoders=[self.text_encoder],
+                                        mpnet_model=self.mpnet_model, mpnet_tokenizer=self.mpnet_tokenizer,
+                                        transform=validation_transform,
+                                        max_sequence_length=self.tokenizer.model_max_length,
                                         image_column=image_column, caption_column=caption_column, is_train=False)
 
         preprocess_prompts_ = partial(preprocess_prompts, mpnet_model=self.mpnet_model,
@@ -242,20 +260,51 @@ class Trainer(ABC):
                 self.prompt_dataset = Dataset.from_dict({"prompts": self.config.data.prompts}).with_transform(
                     preprocess_prompts)
 
-    def get_optimizer_cls(self):
-        # Initialize the optimizer
-        if self.config.training.optim.use_8bit_adam:
-            try:
-                import bitsandbytes as bnb
-            except ImportError:
-                raise ImportError(
-                    "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
-                )
+    def get_optimizer(self, params):
+        if self.config.training.optim.optimizer == "adamw":
+            # Initialize the optimizer
+            if self.config.training.optim.use_8bit_adam:
+                try:
+                    import bitsandbytes as bnb
+                except ImportError:
+                    raise ImportError(
+                        "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
+                    )
 
-            optimizer_cls = bnb.optim.AdamW8bit
-        else:
-            optimizer_cls = torch.optim.AdamW
-        return optimizer_cls
+                optimizer_cls = bnb.optim.AdamW8bit
+            else:
+                optimizer_cls = torch.optim.AdamW
+            optimizer = optimizer_cls(
+                params,
+                betas=(self.config.training.optim.adam_beta1, self.config.training.optim.adam_beta2),
+                eps=self.config.training.optim.adam_epsilon,
+            )
+            return optimizer
+        elif self.config.training.optim.optimizer == "prodigy":
+            try:
+                import prodigyopt
+            except ImportError:
+                raise ImportError("To use Prodigy, please install the prodigyopt library: `pip install prodigyopt`")
+
+            optimizer_cls = prodigyopt.Prodigy
+
+            if (self.config.training.optim.hypernet_learning_rate <= 0.1 or
+                    self.config.training.optim.quantizer_learning_rate <= 0.1 or
+                    self.config.training.optim.prediction_model_learning_rate <= 0.1):
+                logger.warning(
+                    "Learning rate is too low. When using prodigy, it's generally better to set learning rate around 1"
+                )
+            optimizer = optimizer_cls(
+                params,
+                betas=(self.config.training.optim.adam_beta1, self.config.training.optim.adam_beta2),
+                beta3=self.config.training.optim.prodigy_beta3,
+                eps=self.config.training.optim.adam_epsilon,
+                decouple=self.config.training.optim.prodigy_decouple,
+                use_bias_correction=self.config.training.optim.prodigy_use_bias_correction,
+                safeguard_warmup=self.config.training.optim.prodigy_safeguard_warmup,
+            )
+
+            return optimizer
 
     def init_accelerate_customized_saving_hooks(self):
 
@@ -263,22 +312,20 @@ class Trainer(ABC):
         def save_model_hook(models, weights, output_dir):
             if self.accelerator.is_main_process:
                 for i, model in enumerate(models):
-                    if (hasattr(self, "pruning_type") and
-                            self.pruning_type == "structural" and
-                            isinstance(model, UNet2DConditionModel)):
-                        logger.info(f"Save pruned {self.prediction_model_name}")
-                        model.save_pretrained(os.path.join(output_dir, self.prediction_model_name))
-                    elif isinstance(model, (UNet2DConditionModel, UNet2DConditionModelGated)):
+                    unwrapped_model = self.unwrap_model(model)
+                    if isinstance(unwrapped_model, (UNet2DConditionModelPruned, UNet2DConditionModelMagnitudePruned,
+                                                    UNet2DConditionModelGated, UNet2DConditionModel,
+                                                    GatedFluxTransformer2DModel)):
                         logger.info(f"Save {self.prediction_model_name}")
-                        model.save_pretrained(os.path.join(output_dir, self.prediction_model_name))
-                    elif isinstance(model, HyperStructure):
+                        unwrapped_model.save_pretrained(os.path.join(output_dir, self.prediction_model_name))
+                    elif isinstance(unwrapped_model, HyperStructure):
                         logger.info(f"Saving HyperStructure")
-                        model.save_pretrained(os.path.join(output_dir, "hypernet"))
+                        unwrapped_model.save_pretrained(os.path.join(output_dir, "hypernet"))
                     elif isinstance(model, StructureVectorQuantizer):
                         logger.info(f"Saving Quantizer")
-                        model.save_pretrained(os.path.join(output_dir, "quantizer"))
+                        unwrapped_model.save_pretrained(os.path.join(output_dir, "quantizer"))
                         # save the quantizer embeddings
-                        torch.save(model.embedding_gs, os.path.join(output_dir, "quantizer_embeddings.pt"))
+                        torch.save(unwrapped_model.embedding_gs, os.path.join(output_dir, "quantizer_embeddings.pt"))
 
                     # make sure to pop weight so that corresponding model is not saved again
                     weights.pop()
@@ -287,21 +334,24 @@ class Trainer(ABC):
             for _ in range(len(models)):
                 # pop models so that they are not loaded again
                 model = models.pop()
+                unwrapped_model = self.unwrap_model(model)
                 if (hasattr(self, "pruning_type") and self.pruning_type == "structural" and
-                        isinstance(model, UNet2DConditionModel)):
+                        isinstance(unwrapped_model, UNet2DConditionModel) or
+                        isinstance(model, (UNet2DConditionModelPruned, UNet2DConditionModelMagnitudePruned))):
                     state_dict = safetensors.torch.load_file(os.path.join(input_dir, self.prediction_model_name,
                                                                           "diffusion_pytorch_model.safetensors"))
                     model.load_state_dict(state_dict)
                     del state_dict
-                elif isinstance(model, (UNet2DConditionModelPruned, UNet2DConditionModelMagnitudePruned)):
-                    state_dict = safetensors.torch.load_file(os.path.join(input_dir, self.prediction_model_name,
-                                                                          "diffusion_pytorch_model.safetensors"))
-                    model.load_state_dict(state_dict)
-                    del state_dict
-                # load diffusers style into model
-                elif isinstance(model, (UNet2DConditionModel, UNet2DConditionModelGated)):
+                elif isinstance(unwrapped_model, (UNet2DConditionModel, UNet2DConditionModelGated)):
                     load_model = UNet2DConditionModelGated.from_pretrained(input_dir,
                                                                            subfolder=self.prediction_model_name)
+                    model.register_to_config(**load_model.config)
+                    model.load_state_dict(load_model.state_dict())
+                    model.total_macs = load_model.total_macs
+                    del load_model
+                elif isinstance(unwrapped_model, GatedFluxTransformer2DModel):
+                    load_model = GatedFluxTransformer2DModel.from_pretrained(input_dir,
+                                                                             subfolder=self.prediction_model_name)
                     model.register_to_config(**load_model.config)
                     model.load_state_dict(load_model.state_dict())
                     model.total_macs = load_model.total_macs
@@ -633,8 +683,7 @@ class Trainer(ABC):
     def depth_analysis(self, n_consecutive_blocks=1):
         logger.info("Generating depth analysis samples from the given prompts... ")
         pipeline = self.get_pipeline()
-        prediction_model_unwrapped = self.prediction_model.module if hasattr(self.prediction_model,
-                                                                             "module") else self.prediction_model
+        prediction_model_unwrapped = self.unwrap_model(self.prediction_model)
 
         image_output_dir = os.path.join(self.config.training.logging.logging_dir, "depth_analysis_images")
         os.makedirs(image_output_dir, exist_ok=True)
@@ -699,11 +748,16 @@ class Trainer(ABC):
         )
         return gen_images
 
+    def unwrap_model(self, model):
+        model = self.accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
+
 
 class UnetPruner(Trainer):
     def __init__(self, config: DictConfig):
-        super().__init__(config)
         self.prediction_model_name = "unet"
+        super().__init__(config)
 
     def init_models(self):
 
@@ -828,20 +882,19 @@ class UnetPruner(Trainer):
                     self.config.training.optim.prediction_model_learning_rate * math.sqrt(scaling_factor)
             )
 
-        optimizer_cls = self.get_optimizer_cls()
-        optimizer = optimizer_cls(
-            [
-                {"params": self.hyper_net.parameters(), "lr": self.config.training.optim.hypernet_learning_rate,
-                 "weight_decay": self.config.training.optim.hypernet_weight_decay},
-                {"params": self.quantizer.parameters(), "lr": self.config.training.optim.quantizer_learning_rate,
-                 "weight_decay": self.config.training.optim.quantizer_weight_decay},
-                {"params": [p for p in self.prediction_model.parameters() if p.requires_grad],
-                 "lr": self.config.training.optim.prediction_model_learning_rate,
-                 "weight_decay": self.config.training.optim.prediciton_model_weight_decay},
-            ],
-            betas=(self.config.training.optim.adam_beta1, self.config.training.optim.adam_beta2),
-            eps=self.config.training.optim.adam_epsilon,
-        )
+        params = [
+            {"params": self.hyper_net.parameters(),
+             "lr": self.config.training.optim.hypernet_learning_rate,
+             "weight_decay": self.config.training.optim.hypernet_weight_decay},
+            {"params": self.quantizer.parameters(),
+             "lr": self.config.training.optim.quantizer_learning_rate,
+             "weight_decay": self.config.training.optim.quantizer_weight_decay},
+            {"params": [p for p in self.prediction_model.parameters() if p.requires_grad],
+             "lr": self.config.training.optim.prediction_model_learning_rate,
+             "weight_decay": self.config.training.optim.prediction_model_weight_decay},
+        ]
+
+        optimizer = self.get_optimizer(params)
         return optimizer
 
     def init_losses(self):
@@ -1105,10 +1158,9 @@ class UnetPruner(Trainer):
             log_kwargs={"wandb": {"commit": False}})
 
     def step(self, batch, pretrain=False):
-        prediction_model_unwrapped = self.prediction_model.module if hasattr(self.prediction_model,
-                                                                 "module") else self.prediction_model
-        quantizer_unwrapped = self.quantizer.module if hasattr(self.quantizer, "module") else self.quantizer
-        hyper_net_unwrapped = self.hyper_net.module if hasattr(self.hyper_net, "module") else self.hyper_net
+        prediction_model_unwrapped = self.unwrap_model(self.prediction_model)
+        hyper_net_unwrapped = self.unwrap_model(self.hyper_net)
+        quantizer_unwrapped = self.unwrap_model(self.quantizer)
 
         latents = self.vae.encode(batch["pixel_values"].to(self.weight_dtype)).latent_dist.sample()
         latents = latents * self.vae.config.scaling_factor
@@ -1139,7 +1191,7 @@ class UnetPruner(Trainer):
             noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
         # Get the text embedding for conditioning
-        encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
+        encoder_hidden_states = batch["prompt_embeds"].to(self.accelerator.device, dtype=self.weight_dtype)
         text_embeddings = batch["mpnet_embeddings"]
 
         arch_vector = self.hyper_net(text_embeddings)
@@ -1271,10 +1323,9 @@ class UnetPruner(Trainer):
 
     @torch.no_grad()
     def count_macs(self, batch):
-        hyper_net_unwrapped = self.hyper_net.module if hasattr(self.hyper_net, "module") else self.hyper_net
-        quantizer_unwrapped = self.quantizer.module if hasattr(self.quantizer, "module") else self.quantizer
-        prediction_model_unwrapped = self.prediction_model.module if hasattr(self.prediction_model,
-                                                                             "module") else self.prediction_model
+        hyper_net_unwrapped = self.unwrap_model(self.hyper_net)
+        quantizer_unwrapped = self.unwrap_model(self.quantizer)
+        prediction_model_unwrapped = self.unwrap_model(self.prediction_model)
 
         arch_vecs_separated = hyper_net_unwrapped.transform_structure_vector(
             torch.ones((1, quantizer_unwrapped.vq_embed_dim), device=self.accelerator.device))
@@ -1284,7 +1335,7 @@ class UnetPruner(Trainer):
         latents = self.vae.encode(batch["pixel_values"][:1].to(self.weight_dtype)).latent_dist.sample()
         timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (1,),
                                   device=self.accelerator.device).long()
-        encoder_hidden_states = self.text_encoder(batch["input_ids"][:1])[0]
+        encoder_hidden_states = batch["prompt_embeds"][:1].to(self.accelerator.device, dtype=self.weight_dtype)
 
         macs, params = count_ops_and_params(self.prediction_model,
                                             {'sample': latents,
@@ -1314,8 +1365,7 @@ class UnetPruner(Trainer):
 
     @torch.no_grad()
     def update_pruning_target(self):
-        prediction_model_unwrapped = self.prediction_model.module if hasattr(self.prediction_model,
-                                                                 "module") else self.prediction_model
+        prediction_model_unwrapped = self.unwrap_model(self.prediction_model)
         p = self.config.training.losses.resource_loss.pruning_target
 
         p_actual = (1 - (1 - p) * prediction_model_unwrapped.resource_info_dict['total_macs'] /
@@ -1543,427 +1593,27 @@ class SDXLPruner(UnetPruner):
         self.hyper_net = hyper_net
         self.quantizer = quantizer
 
-    @staticmethod
-    def encode_prompt(batch, text_encoders, tokenizers, mpnet_model, mpnet_tokenizer, proportion_empty_prompts,
-                      caption_column, is_train=True):
-        prompt_embeds_list = []
-        prompt_batch = batch[caption_column]
-
-        captions = []
-        for caption in prompt_batch:
-            if random.random() < proportion_empty_prompts:
-                captions.append("")
-            elif isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
-
-        with torch.no_grad():
-
-            for tokenizer, text_encoder in zip(tokenizers, text_encoders):
-                text_inputs = tokenizer(
-                    captions,
-                    padding="max_length",
-                    max_length=tokenizer.model_max_length,
-                    truncation=True,
-                    return_tensors="pt",
-                )
-                text_input_ids = text_inputs.input_ids
-                prompt_embeds = text_encoder(
-                    text_input_ids.to(text_encoder.device),
-                    output_hidden_states=True,
-                    return_dict=False,
-                )
-
-                # We are only ALWAYS interested in the pooled output of the final text encoder
-                pooled_prompt_embeds = prompt_embeds[0]
-                prompt_embeds = prompt_embeds[-1][-2]
-                bs_embed, seq_len, _ = prompt_embeds.shape
-                prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
-                prompt_embeds_list.append(prompt_embeds)
-
-        prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
-        pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
-        mpnet_embeddings = get_mpnet_embeddings(captions, mpnet_model, mpnet_tokenizer, is_train=is_train)
-        return {"prompt_embeds": prompt_embeds.cpu(), "pooled_prompt_embeds": pooled_prompt_embeds.cpu(),
-                "mpnet_embeddings": mpnet_embeddings.cpu()}
-
-    @staticmethod
-    def compute_vae_encodings(batch, vae):
-        images = batch.pop("pixel_values")
-        pixel_values = torch.stack(list(images))
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        pixel_values = pixel_values.to(vae.device, dtype=vae.dtype)
-
-        with torch.no_grad():
-            model_input = vae.encode(pixel_values).latent_dist.sample()
-        model_input = model_input * vae.config.scaling_factor
-        return {"model_input": model_input.cpu()}
-
-    @staticmethod
-    def generate_timestep_weights(args, num_timesteps):
-        weights = torch.ones(num_timesteps)
-
-        # Determine the indices to bias
-        num_to_bias = int(args.timestep_bias_portion * num_timesteps)
-
-        if args.timestep_bias_strategy == "later":
-            bias_indices = slice(-num_to_bias, None)
-        elif args.timestep_bias_strategy == "earlier":
-            bias_indices = slice(0, num_to_bias)
-        elif args.timestep_bias_strategy == "range":
-            # Out of the possible 1000 timesteps, we might want to focus on eg. 200-500.
-            range_begin = args.timestep_bias_begin
-            range_end = args.timestep_bias_end
-            if range_begin < 0:
-                raise ValueError(
-                    "When using the range strategy for timestep bias, you must provide a beginning timestep greater or equal to zero."
-                )
-            if range_end > num_timesteps:
-                raise ValueError(
-                    "When using the range strategy for timestep bias, you must provide an ending timestep smaller than the number of timesteps."
-                )
-            bias_indices = slice(range_begin, range_end)
-        else:  # 'none' or any other string
-            return weights
-        if args.timestep_bias_multiplier <= 0:
-            return ValueError(
-                "The parameter --timestep_bias_multiplier is not intended to be used to disable the training of specific timesteps."
-                " If it was intended to disable timestep bias, use `--timestep_bias_strategy none` instead."
-                " A timestep bias multiplier less than or equal to 0 is not allowed."
-            )
-
-        # Apply the bias
-        weights[bias_indices] *= args.timestep_bias_multiplier
-
-        # Normalize
-        weights /= weights.sum()
-
-        return weights
-
-    def prepare_datasets(self, preprocess_train, preprocess_eval, preprocess_prompts):
-        # Preprocessing the datasets.
-        train_resize = transforms.Resize(self.config.model.prediction_model.resolution,
-                                         interpolation=transforms.InterpolationMode.BILINEAR)
-        train_crop = transforms.CenterCrop(
-            self.config.model.prediction_model.resolution) if self.config.data.dataloader.center_crop else transforms.RandomCrop(
-            self.config.model.prediction_model.resolution)
-        train_flip = transforms.RandomHorizontalFlip()
-        train_transforms = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
-
-        def preprocess_train(examples):
-            samples = download_images_if_missing(examples, "image")
-            images = [image.convert("RGB") if image is not None else image for image in samples["image"]]
-            # image aug
-            original_sizes = []
-            all_images = []
-            crop_top_lefts = []
-            for image in images:
-                original_sizes.append((image.height, image.width))
-                image = train_resize(image)
-                if self.config.data.dataloader.random_flip and random.random() < 0.5:
-                    # flip
-                    image = train_flip(image)
-                if self.config.data.dataloader.center_crop:
-                    y1 = max(0, int(round((image.height - self.config.model.prediction_model.resolution) / 2.0)))
-                    x1 = max(0, int(round((image.width - self.config.model.prediction_model.resolution) / 2.0)))
-                    image = train_crop(image)
-                else:
-                    y1, x1, h, w = train_crop.get_params(image, (self.config.model.prediction_model.resolution,
-                                                                 self.config.model.prediction_model.resolution))
-                    image = crop(image, y1, x1, h, w)
-                crop_top_left = (y1, x1)
-                crop_top_lefts.append(crop_top_left)
-                image = train_transforms(image)
-                all_images.append(image)
-
-            examples["original_sizes"] = original_sizes
-            examples["crop_top_lefts"] = crop_top_lefts
-            examples["pixel_values"] = all_images
-            return examples
-
-        with self.accelerator.main_process_first():
-            if self.config.data.max_train_samples is not None:
-                self.train_dataset = self.train_dataset.shuffle(seed=self.config.seed).select(
-                    range(self.config.data.max_train_samples))
-            # Set the training transforms
-            train_dataset = self.train_dataset.with_transform(preprocess_train)
-
-        # Let's first compute all the embeddings so that we can free up the text encoders
-        # from memory. We will pre-compute the VAE encodings too.
-        text_encoders = [self.text_encoder, self.text_encoder2]
-        tokenizers = [self.tokenizer, self.tokenizer2]
-        compute_embeddings_fn = functools.partial(
-            self.encode_prompt,
-            text_encoders=text_encoders,
-            tokenizers=tokenizers,
-            mpnet_model=self.mpnet_model,
-            mpnet_tokenizer=self.mpnet_tokenizer,
-            proportion_empty_prompts=self.config.training.proportion_empty_prompts,
-            caption_column=self.config.data.caption_column,
-        )
-        compute_vae_encodings_fn = functools.partial(self.compute_vae_encodings, vae=self.vae)
-        with self.accelerator.main_process_first():
-            from datasets.fingerprint import Hasher
-
-            # fingerprint used by the cache for the other processes to load the result
-            # details: https://github.com/huggingface/diffusers/pull/4038#discussion_r1266078401
-            new_fingerprint = Hasher.hash(self.config)
-            new_fingerprint_for_vae = Hasher.hash(self.vae_path)
-            train_dataset_with_embeddings = train_dataset.map(
-                compute_embeddings_fn, batched=True, new_fingerprint=new_fingerprint
-            )
-            train_dataset_with_vae = train_dataset.map(
-                compute_vae_encodings_fn,
-                batched=True,
-                batch_size=self.config.data.dataloader.train_batch_size,
-                new_fingerprint=new_fingerprint_for_vae,
-            )
-            precomputed_dataset = concatenate_datasets(
-                [train_dataset_with_embeddings, train_dataset_with_vae.remove_columns(["image", "caption"])], axis=1
-            )
-            precomputed_dataset = precomputed_dataset.with_transform(preprocess_train)
-
-        del compute_vae_encodings_fn, compute_embeddings_fn, self.text_encoder, self.text_encoder2
-        del text_encoders, tokenizers, self.vae
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        self.train_dataset = precomputed_dataset
-
-    def init_dataloaders(self, data_collate_fn, prompts_collate_fn):
-        def collate_fn(examples):
-            model_input = torch.stack([torch.tensor(example["model_input"]) for example in examples])
-            original_sizes = [example["original_sizes"] for example in examples]
-            crop_top_lefts = [example["crop_top_lefts"] for example in examples]
-            prompt_embeds = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples])
-            pooled_prompt_embeds = torch.stack([torch.tensor(example["pooled_prompt_embeds"]) for example in examples])
-
-            return {
-                "model_input": model_input,
-                "prompt_embeds": prompt_embeds,
-                "pooled_prompt_embeds": pooled_prompt_embeds,
-                "original_sizes": original_sizes,
-                "crop_top_lefts": crop_top_lefts,
-            }
-
-            # DataLoaders creation:
-
-        train_dataloader = torch.utils.data.DataLoader(
-            self.train_dataset,
-            shuffle=True,
-            collate_fn=collate_fn,
-            batch_size=self.config.data.dataloader.train_batch_size,
-            num_workers=self.config.data.dataloader.dataloader_num_workers,
-        )
-
-        self.train_dataloader = train_dataloader
-
-    def step(self, batch, pretrain=False):
-        prediction_model_unwrapped = self.prediction_model.module if hasattr(self.prediction_model,
-                                                                 "module") else self.prediction_model
-        quantizer_unwrapped = self.quantizer.module if hasattr(self.quantizer, "module") else self.quantizer
-        hyper_net_unwrapped = self.hyper_net.module if hasattr(self.hyper_net, "module") else self.hyper_net
-
-        model_input = batch["model_input"].to(self.accelerator.device)
-        noise = torch.randn_like(model_input)
-        if self.config.model.prediction_model.noise_offset:
-            # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-            noise += self.config.model.prediction_model.noise_offset * torch.randn(
-                (model_input.shape[0], model_input.shape[1], 1, 1), device=model_input.device
-            )
-
-        bsz = model_input.shape[0]
-        if self.config.model.prediction_model.timestep_bias_strategy == "none":
-            # Sample a random timestep for each image without bias.
-            timesteps = torch.randint(
-                0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=model_input.device
-            )
-        else:
-            # Sample a random timestep for each image, potentially biased by the timestep weights.
-            # Biasing the timestep weights allows us to spend less time training irrelevant timesteps.
-            weights = self.generate_timestep_weights(self.config.model.prediction_model,
-                                                     self.config.noise_scheduler.config.num_train_timesteps).to(
-                model_input.device
-            )
-            timesteps = torch.multinomial(weights, bsz, replacement=True).long()
-
-        # Add noise to the model input according to the noise magnitude at each timestep
-        # (this is the forward diffusion process)
-        noisy_model_input = self.noise_scheduler.add_noise(model_input, noise, timesteps)
-
-        # time ids
-        def compute_time_ids(original_size, crops_coords_top_left):
-            # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
-            target_size = (self.config.model.prediction_model.resolution, self.config.model.prediction_model.resolution)
-            add_time_ids = list(original_size + crops_coords_top_left + target_size)
-            add_time_ids = torch.tensor([add_time_ids])
-            add_time_ids = add_time_ids.to(self.accelerator.device, dtype=self.weight_dtype)
-            return add_time_ids
-
-        add_time_ids = torch.cat(
-            [compute_time_ids(s, c) for s, c in zip(batch["original_sizes"], batch["crop_top_lefts"])]
-        )
-
-        # Predict the noise residual
-        prediction_model_added_conditions = {"time_ids": add_time_ids}
-        prompt_embeds = batch["prompt_embeds"].to(self.accelerator.device)
-        pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(self.accelerator.device)
-        prediction_model_added_conditions.update({"text_embeds": pooled_prompt_embeds})
-
-        # Get the text embedding for conditioning
-        text_embeddings = batch["mpnet_embeddings"]
-
-        arch_vector = self.hyper_net(text_embeddings)
-        arch_vector_quantized, _ = self.quantizer(arch_vector)
-
-        arch_vector = quantizer_unwrapped.gumbel_sigmoid_trick(arch_vector)
-
-        if hyper_net_unwrapped.single_arch_param:
-            arch_vector = arch_vector.repeat(text_embeddings.shape[0], 1)
-            hyper_net_unwrapped.arch_gs = arch_vector
-
-        arch_vector_width_depth_normalized = quantizer_unwrapped.width_depth_normalize(arch_vector)
-        with torch.no_grad():
-            quantizer_embeddings = quantizer_unwrapped.get_codebook_entry_gumbel_sigmoid(
-                torch.arange(quantizer_unwrapped.n_e, device=self.accelerator.device),
-                hard=True).detach()
-
-            quantizer_embeddings /= quantizer_embeddings.norm(dim=-1, keepdim=True)
-            quantizer_embeddings_pairwise_similarity = quantizer_embeddings @ quantizer_embeddings.t()
-
-            text_embeddings_list = [torch.zeros_like(text_embeddings) for _ in
-                                    range(self.accelerator.num_processes)]
-            arch_vector_list = [torch.zeros_like(arch_vector) for _ in
-                                range(self.accelerator.num_processes)]
-
-            if self.accelerator.num_processes > 1:
-                torch.distributed.all_gather(text_embeddings_list, text_embeddings)
-                torch.distributed.all_gather(arch_vector_list, arch_vector_width_depth_normalized)
-            else:
-                text_embeddings_list[self.accelerator.process_index] = text_embeddings
-                arch_vector_list[self.accelerator.process_index] = arch_vector_width_depth_normalized
-
-        text_embeddings_list[self.accelerator.process_index] = text_embeddings
-        arch_vector_list[self.accelerator.process_index] = arch_vector_width_depth_normalized
-        text_embeddings_list = torch.cat(text_embeddings_list, dim=0)
-        arch_vector_list = torch.cat(arch_vector_list, dim=0)
-
-        # During hyper_net pretraining, we don't cluster the architecture vector and directly use it.
-        if pretrain:
-            arch_vectors_separated = hyper_net_unwrapped.transform_structure_vector(arch_vector)
-        else:
-            arch_vectors_separated = hyper_net_unwrapped.transform_structure_vector(arch_vector_quantized)
-
-        contrastive_loss, arch_vectors_similarity = self.contrastive_loss(text_embeddings_list, arch_vector_list,
-                                                                          return_similarity=True)
-
-        # Get the target for loss depending on the prediction type
-        if self.config.model.prediction_model.prediction_type is not None:
-            # set prediction_type of scheduler if defined
-            self.noise_scheduler.register_to_config(prediction_type=self.config.model.prediction_model.prediction_type)
-
-        if self.noise_scheduler.config.prediction_type == "epsilon":
-            target = noise
-        elif self.noise_scheduler.config.prediction_type == "v_prediction":
-            target = self.noise_scheduler.get_velocity(model_input, noise, timesteps)
-        else:
-            raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
-
-        with torch.no_grad():
-            full_arch_vector = torch.ones_like(arch_vector)
-            full_arch_vector = hyper_net_unwrapped.transform_structure_vector(full_arch_vector)
-            prediction_model_unwrapped.set_structure(full_arch_vector)
-            full_model_pred = self.prediction_model(noisy_model_input, timesteps, prompt_embeds,
-                                                    added_cond_kwargs=prediction_model_added_conditions,
-                                                    return_dict=False, ).sample.detach()
-            teacher_block_activations = self.block_activations.copy()
-
-        prediction_model_unwrapped.set_structure(arch_vectors_separated)
-        # Predict the noise residual and compute loss
-        model_pred = self.prediction_model(noisy_model_input, timesteps, prompt_embeds, return_dict=False)[0]
-        student_block_activations = self.block_activations.copy()
-
-        if self.config.training.losses.diffusion_loss.snr_gamma is None:
-            loss = self.ddpm_loss(model_pred.float(), target.float(), reduction="mean")
-        else:
-            # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-            # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-            # This is discussed in Section 4.2 of the same paper.
-            snr = compute_snr(self.noise_scheduler, timesteps)
-            if self.noise_scheduler.config.prediction_type == "v_prediction":
-                # Velocity objective requires that we add one to SNR values before we divide by them.
-                snr = snr + 1
-            mse_loss_weights = (
-                    torch.stack(
-                        [snr,
-                         self.config.training.losses.diffusion_loss.snr_gamma * torch.ones_like(timesteps)],
-                        dim=1).min(dim=1)[0] / snr
-            )
-
-            loss = self.ddpm_loss(model_pred.float(), target.float(), reduction="none")
-            loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-            loss = loss.mean()
-
-        distillation_loss = self.distillation_loss(model_pred.float(), full_model_pred.float(), reduction="mean")
-
-        block_loss = torch.tensor(0.0, device=self.accelerator.device)
-        for key in student_block_activations.keys():
-            block_loss += self.distillation_loss(student_block_activations[key],
-                                                 teacher_block_activations[key].detach(),
-                                                 reduction="mean")
-        block_loss /= len(student_block_activations)
-
-        macs_dict = prediction_model_unwrapped.calc_macs()
-        curr_macs = macs_dict['cur_prunable_macs']
-
-        # The reason is that sanity['prunable_macs'] does not have depth-related pruning
-        # macs like skip connections of resnets in it.
-        resource_ratios = (curr_macs / (
-            prediction_model_unwrapped.resource_info_dict['cur_prunable_macs'].squeeze()))
-
-        resource_loss = self.resource_loss(resource_ratios.mean())
-
-        max_loss = 1. - torch.max(resource_ratios)
-        std_loss = -torch.std(resource_ratios)
-        with torch.no_grad():
-            batch_resource_ratios = macs_dict['cur_prunable_macs'] / (
-                prediction_model_unwrapped.resource_info_dict['cur_prunable_macs'].squeeze())
-
-        diff_loss = loss.clone().detach().mean()
-        loss += self.config.training.losses.resource_loss.weight * resource_loss
-        loss += self.config.training.losses.contrastive_loss.weight * contrastive_loss
-        loss += self.config.training.losses.distillation_loss.weight * distillation_loss
-        loss += self.config.training.losses.block_loss.weight * block_loss
-        loss += self.config.training.losses.std_loss.weight * std_loss
-        loss += self.config.training.losses.max_loss.weight * max_loss
-
-        return (
-            loss, diff_loss, distillation_loss, block_loss, contrastive_loss, resource_loss,
-            arch_vectors_similarity, resource_ratios.mean(),
-            macs_dict, arch_vector_quantized, quantizer_embeddings_pairwise_similarity, batch_resource_ratios)
-
 
 class FluxPruner(UnetPruner):
     def __init__(self, config: DictConfig):
+        self.prediction_model_name = "transformer"
         super().__init__(config)
         self.tokenizer2 = None
         self.text_encoder2 = None
+        self.noise_scheduler_copy = None
 
     def init_models(self):
         logger.info("Loading models...")
-        noise_scheduler = DDIMScheduler.from_pretrained(self.config.pretrained_model_name_or_path,
-                                                        subfolder="scheduler")
+        noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(self.config.pretrained_model_name_or_path,
+                                                                          subfolder="scheduler")
+        self.noise_scheduler_copy = copy.deepcopy(noise_scheduler)
 
-        tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer = CLIPTokenizer.from_pretrained(
             self.config.pretrained_model_name_or_path, subfolder="tokenizer", revision=self.config.revision,
-            use_fast=False
         )
 
-        tokenizer_2 = AutoTokenizer.from_pretrained(
+        tokenizer_2 = T5TokenizerFast.from_pretrained(
             self.config.pretrained_model_name_or_path, subfolder="tokenizer_2", revision=self.config.revision,
-            use_fast=False
         )
 
         text_encoder = CLIPTextModel.from_pretrained(
@@ -2020,17 +1670,71 @@ class FluxPruner(UnetPruner):
         self.noise_scheduler = noise_scheduler
         self.mpnet_tokenizer = mpnet_tokenizer
         self.mpnet_model = mpnet_model
-        self.transformer = transformer
+        self.prediction_model = transformer
         self.hyper_net = hyper_net
         self.quantizer = quantizer
+
+    def init_dataset_preprocessors(self, dataset):
+
+        # Get the column names for input/target.
+        column_names = dataset["train"].column_names
+        image_column = self.config.data.image_column
+        if image_column not in column_names:
+            raise ValueError(
+                f"--image_column' value '{self.config.data.image_column}' needs to be one of: {', '.join(column_names)}"
+            )
+
+        caption_column = self.config.data.caption_column
+        if caption_column not in column_names:
+            raise ValueError(
+                f"--caption_column' value '{self.config.data.caption_column}' needs to be one of: {', '.join(column_names)}"
+            )
+
+        # Preprocessors and transformers
+        train_transform, validation_transform = get_transforms(self.config)
+        preprocess_train = partial(preprocess_sample,
+                                   tokenizers=[self.tokenizer, self.tokenizer2],
+                                   text_encoders=[self.text_encoder, self.text_encoder2],
+                                   mpnet_model=self.mpnet_model, mpnet_tokenizer=self.mpnet_tokenizer,
+                                   transform=train_transform,
+                                   image_column=image_column, caption_column=caption_column,
+                                   is_train=True,
+                                   max_sequence_length=(
+                                       self.tokenizer.model_max_length, self.config.tokenizer.max_sequence_length))
+
+        preprocess_validation = partial(preprocess_sample,
+                                        tokenizers=[self.tokenizer, self.tokenizer2],
+                                        text_encoders=[self.text_encoder, self.text_encoder2],
+                                        mpnet_model=self.mpnet_model, mpnet_tokenizer=self.mpnet_tokenizer,
+                                        transform=train_transform,
+                                        image_column=image_column, caption_column=caption_column,
+                                        is_train=False,
+                                        max_sequence_length=(
+                                            self.tokenizer.model_max_length, self.config.tokenizer.max_sequence_length))
+
+        preprocess_prompts_ = partial(preprocess_prompts, mpnet_model=self.mpnet_model,
+                                      mpnet_tokenizer=self.mpnet_tokenizer)
+
+        return preprocess_train, preprocess_validation, preprocess_prompts_
+
+    def get_sigmas(self, timesteps, n_dim=4, dtype=torch.float32):
+        sigmas = self.noise_scheduler_copy.sigmas.to(device=self.accelerator.device, dtype=dtype)
+        schedule_timesteps = self.noise_scheduler_copy.timesteps.to(self.accelerator.device)
+        timesteps = timesteps.to(self.accelerator.device)
+        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+        sigma = sigmas[step_indices].flatten()
+        while len(sigma.shape) < n_dim:
+            sigma = sigma.unsqueeze(-1)
+        return sigma
 
 
 class UnetFineTuner(Trainer):
     def __init__(self, config: DictConfig):
-        self.teacher_model = None
-        super().__init__(config)
-        self.hyper_net, self.quantizer, self.mpnet_model, self.mpnet_tokenizer = None, None, None, None
         self.prediction_model_name = "unet"
+        super().__init__(config)
+        self.teacher_model = None
+        self.hyper_net, self.quantizer, self.mpnet_model, self.mpnet_tokenizer = None, None, None, None
 
     def init_models(self):
         logger.info("Loading models...")
@@ -2151,17 +1855,13 @@ class UnetFineTuner(Trainer):
                     self.config.training.optim.prediction_model_learning_rate * math.sqrt(scaling_factor)
             )
 
-        optimizer_cls = self.get_optimizer_cls()
+        params = [
+            {"params": [p for p in self.prediction_model.parameters()],
+             "lr": self.config.training.optim.prediction_model_learning_rate,
+             "weight_decay": self.config.training.optim.prediction_model_weight_decay},
+        ]
 
-        optimizer = optimizer_cls(
-            [
-                {"params": [p for p in self.prediction_model.parameters()],
-                 "lr": self.config.training.optim.prediction_model_learning_rate,
-                 "weight_decay": self.config.training.optim.prediction_model_weight_decay},
-            ],
-            betas=(self.config.training.optim.adam_beta1, self.config.training.optim.adam_beta2),
-            eps=self.config.training.optim.adam_epsilon,
-        )
+        optimizer = self.get_optimizer(params)
         return optimizer
 
     def init_losses(self):
@@ -2335,7 +2035,7 @@ class UnetFineTuner(Trainer):
             noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
         # Get the text embedding for conditioning
-        encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
+        encoder_hidden_states = batch["prompt_embeds"].to(self.accelerator.device, dtype=self.weight_dtype)
 
         # Get the target for loss depending on the prediction type
         if self.config.model.prediction_model.prediction_type is not None:

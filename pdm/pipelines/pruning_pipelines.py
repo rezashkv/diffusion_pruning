@@ -12,7 +12,8 @@ from diffusers import StableDiffusionPipeline, DiffusionPipeline
 from diffusers.models.modeling_utils import _LOW_CPU_MEM_USAGE_DEFAULT
 import diffusers
 import transformers
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPImageProcessor, PreTrainedModel
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPImageProcessor, PreTrainedModel, \
+    CLIPVisionModelWithProjection
 
 from ..models.unet.unet_2d_conditional import UNet2DConditionModelGated
 
@@ -168,12 +169,13 @@ class StableDiffusionPruningPipeline(StableDiffusionPipeline):
             scheduler: KarrasDiffusionSchedulers,
             safety_checker: StableDiffusionSafetyChecker,
             feature_extractor: CLIPImageProcessor,
+            image_encoder: CLIPVisionModelWithProjection = None,
             requires_safety_checker: bool = True,
             hyper_net: Optional[torch.nn.Module] = None,
             quantizer: Optional[torch.nn.Module] = None,
     ):
         super().__init__(vae, text_encoder, tokenizer, unet, scheduler, safety_checker, feature_extractor,
-                         requires_safety_checker)
+                         image_encoder, requires_safety_checker)
         self.hyper_net = hyper_net
         self.quantizer = quantizer
 

@@ -1,5 +1,5 @@
 model:
-  unet:
+  prediction_model:
     pretrained_model_name_or_path: stabilityai/stable-unet-2-1
     input_perturbation: 0.0
     revision: null

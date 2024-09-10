@@ -11,12 +11,15 @@ from diffusers.models.resnet import ResnetBlock2D, Upsample2D, Downsample2D
 from diffusers.models.transformers.transformer_2d import Transformer2DModelOutput
 from diffusers.models.attention import BasicTransformerBlock, FeedForward
 from diffusers.models.unets.unet_2d_blocks import (CrossAttnDownBlock2D, CrossAttnUpBlock2D, DownBlock2D, UpBlock2D,
-                                             UNetMidBlock2DCrossAttn)
+                                                   UNetMidBlock2DCrossAttn)
 from diffusers.models.attention_processor import AttnProcessor2_0, Attention
-from diffusers.utils import logging, USE_PEFT_BACKEND
+from diffusers.utils import logging, deprecate, is_torch_npu_available, is_torch_version
 
 from ..gates import DepthGate, WidthGate, LinearWidthGate
 from ...utils.estimation_utils import hard_concrete
+
+if is_torch_npu_available():
+    import torch_npu
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -38,16 +41,22 @@ class GEGLUGated(GEGLU):
         self.total_macs, self.prunable_macs = 0., 0.
         self.pruned = False
 
-    def forward(self, hidden_states, scale: float = 1.0):
-        args = () if USE_PEFT_BACKEND else (scale,)
-        hidden_states, gate = self.proj(hidden_states, *args).chunk(2, dim=-1)
-        # if gate is pruned, no need to apply the pruning gate
-        if not self.pruned:
-            # ########## Apply Width Gate ##########
-            hidden_states = self.gate(hidden_states)
-            gate = self.gate(gate)
-
-        return hidden_states * self.gelu(gate)
+    def forward(self, hidden_states, *args, **kwargs):
+        if len(args) > 0 or kwargs.get("scale", None) is not None:
+            deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
+            deprecate("scale", "1.0.0", deprecation_message)
+        hidden_states = self.proj(hidden_states)
+        if is_torch_npu_available():
+            if not self.pruned:
+                hidden_states = self.gate(hidden_states)
+            # using torch_npu.npu_geglu can run faster and save memory on NPU.
+            return torch_npu.npu_geglu(hidden_states, dim=-1, approximate=1)[0]
+        else:
+            hidden_states, gate = hidden_states.chunk(2, dim=-1)
+            if not self.pruned:
+                hidden_states = self.gate(hidden_states)
+                gate = self.gate(gate)
+            return hidden_states * self.gelu(gate)
 
     @torch.no_grad()
     def prune_gate(self):
@@ -194,12 +203,20 @@ class HeadGatedAttnProcessor2(AttnProcessor2_0):
     def __call__(
             self,
             attn: Attention,
-            hidden_states: torch.FloatTensor,
-            encoder_hidden_states: Optional[torch.FloatTensor] = None,
-            attention_mask: Optional[torch.FloatTensor] = None,
-            temb: Optional[torch.FloatTensor] = None,
-            scale: float = 1.0,
-    ) -> torch.FloatTensor:
+            hidden_states: torch.Tensor,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            temb: Optional[torch.Tensor] = None,
+            *args,
+            **kwargs,
+    ) -> torch.Tensor:
+        if len(args) > 0 or kwargs.get("scale", None) is not None:
+            deprecation_message = ("The `scale` argument is deprecated and will be ignored. Please remove it,"
+                                   " as passing it will raise an error in the future."
+                                   " `scale` should directly be passed while calling the underlying pipeline component"
+                                   " i.e., via `cross_attention_kwargs`.")
+            deprecate("scale", "1.0.0", deprecation_message)
+
         residual = hidden_states
 
         if attn.spatial_norm is not None:
@@ -224,20 +241,15 @@ class HeadGatedAttnProcessor2(AttnProcessor2_0):
         if attn.group_norm is not None:
             hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
-        args = () if USE_PEFT_BACKEND else (scale,)
-        query = attn.to_q(hidden_states, *args)
+        query = attn.to_q(hidden_states)
 
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
         elif attn.norm_cross:
             encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
 
-        key = (
-            attn.to_k(encoder_hidden_states, scale=scale) if not USE_PEFT_BACKEND else attn.to_k(encoder_hidden_states)
-        )
-        value = (
-            attn.to_v(encoder_hidden_states, scale=scale) if not USE_PEFT_BACKEND else attn.to_v(encoder_hidden_states)
-        )
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
 
         inner_dim = key.shape[-1]
         head_dim = inner_dim // attn.heads
@@ -246,6 +258,11 @@ class HeadGatedAttnProcessor2(AttnProcessor2_0):
 
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
 
         if not attn.pruned:
             # ########## Apply Width Gate ##########
@@ -263,9 +280,7 @@ class HeadGatedAttnProcessor2(AttnProcessor2_0):
         hidden_states = hidden_states.to(query.dtype)
 
         # linear proj
-        hidden_states = (
-            attn.to_out[0](hidden_states, scale=scale) if not USE_PEFT_BACKEND else attn.to_out[0](hidden_states)
-        )
+        hidden_states = attn.to_out[0](hidden_states)
         # dropout
         hidden_states = attn.to_out[1](hidden_states)
 
@@ -290,81 +305,76 @@ class ResnetBlock2DWidthGated(ResnetBlock2D):
         self.prunable_macs, self.total_macs = 0., 0.
         self.pruned = False
 
-    def forward(self, input_tensor, temb, scale: float = 1.0):
+    def forward(self, input_tensor: torch.Tensor, temb: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        if len(args) > 0 or kwargs.get("scale", None) is not None:
+            deprecation_message = ("The `scale` argument is deprecated and will be ignored."
+                                   " Please remove it, as passing it will raise an error in the future."
+                                   " `scale` should directly be passed while calling the underlying pipeline component"
+                                   " i.e., via `cross_attention_kwargs`.")
+            deprecate("scale", "1.0.0", deprecation_message)
+
         hidden_states = input_tensor
 
-        if self.time_embedding_norm == "ada_group" or self.time_embedding_norm == "spatial":
-            hidden_states = self.norm1(hidden_states, temb)
-        else:
-            hidden_states = self.norm1(hidden_states)
-
+        hidden_states = self.norm1(hidden_states)
         hidden_states = self.nonlinearity(hidden_states)
 
         if self.upsample is not None:
-            # upsample_nearest_nhwc fails with large batch sizes.
-            # see https://github.com/huggingface/diffusers/issues/984
+            # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
             if hidden_states.shape[0] >= 64:
                 input_tensor = input_tensor.contiguous()
                 hidden_states = hidden_states.contiguous()
-            input_tensor = (
-                self.upsample(input_tensor, scale=scale)
-                if isinstance(self.upsample, Upsample2D)
-                else self.upsample(input_tensor)
-            )
-            hidden_states = (
-                self.upsample(hidden_states, scale=scale)
-                if isinstance(self.upsample, Upsample2D)
-                else self.upsample(hidden_states)
-            )
+            input_tensor = self.upsample(input_tensor)
+            hidden_states = self.upsample(hidden_states)
         elif self.downsample is not None:
-            input_tensor = (
-                self.downsample(input_tensor, scale=scale)
-                if isinstance(self.downsample, Downsample2D)
-                else self.downsample(input_tensor)
-            )
-            hidden_states = (
-                self.downsample(hidden_states, scale=scale)
-                if isinstance(self.downsample, Downsample2D)
-                else self.downsample(hidden_states)
-            )
+            input_tensor = self.downsample(input_tensor)
+            hidden_states = self.downsample(hidden_states)
 
-        hidden_states = self.conv1(hidden_states, scale) if not USE_PEFT_BACKEND else self.conv1(hidden_states)
+        hidden_states = self.conv1(hidden_states)
 
         if self.time_emb_proj is not None:
             if not self.skip_time_act:
                 temb = self.nonlinearity(temb)
-            temb = (
-                self.time_emb_proj(temb, scale)[:, :, None, None]
-                if not USE_PEFT_BACKEND
-                else self.time_emb_proj(temb)[:, :, None, None]
-            )
+            temb = self.time_emb_proj(temb)[:, :, None, None]
 
-        if temb is not None and self.time_embedding_norm == "default":
-            hidden_states = hidden_states + temb
+        if self.time_embedding_norm == "default":
+            if temb is not None:
+                hidden_states = hidden_states + temb
 
-        if not self.pruned:
-            # ########## Apply Width Gate ##########
-            assert self.norm2.num_groups == self.gate.gate_f.shape[1]
-            hidden_states = self.gate(hidden_states)
+            if not self.pruned:
+                # ########## Apply Width Gate ##########
+                assert self.norm2.num_groups == self.gate.gate_f.shape[1]
+                hidden_states = self.gate(hidden_states)
 
-        if self.time_embedding_norm == "ada_group" or self.time_embedding_norm == "spatial":
-            hidden_states = self.norm2(hidden_states, temb)
-        else:
             hidden_states = self.norm2(hidden_states)
+        elif self.time_embedding_norm == "scale_shift":
+            if temb is None:
+                raise ValueError(
+                    f" `temb` should not be None when `time_embedding_norm` is {self.time_embedding_norm}"
+                )
+            time_scale, time_shift = torch.chunk(temb, 2, dim=1)
 
-        if temb is not None and self.time_embedding_norm == "scale_shift":
-            scale, shift = torch.chunk(temb, 2, dim=1)
-            hidden_states = hidden_states * (1 + scale) + shift
+            if not self.pruned:
+                # ########## Apply Width Gate ##########
+                assert self.norm2.num_groups == self.gate.gate_f.shape[1]
+                hidden_states = self.gate(hidden_states)
+
+            hidden_states = self.norm2(hidden_states)
+            hidden_states = hidden_states * (1 + time_scale) + time_shift
+        else:
+            if not self.pruned:
+                # ########## Apply Width Gate ##########
+                assert self.norm2.num_groups == self.gate.gate_f.shape[1]
+                hidden_states = self.gate(hidden_states)
+
+            hidden_states = self.norm2(hidden_states)
 
         hidden_states = self.nonlinearity(hidden_states)
 
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.conv2(hidden_states, scale) if not USE_PEFT_BACKEND else self.conv2(hidden_states)
+        hidden_states = self.conv2(hidden_states)
 
         if self.conv_shortcut is not None:
-            input_tensor = (
-                self.conv_shortcut(input_tensor, scale) if not USE_PEFT_BACKEND else self.conv_shortcut(input_tensor)
-            )
+            input_tensor = self.conv_shortcut(input_tensor)
 
         output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
 
@@ -479,9 +489,16 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
         self.dropped = False
         self.pruned = False
 
-    def forward(self, input_tensor, temb, scale: float = 1.0):
-        assert (self.upsample is None) and (
-                self.downsample is None)  # Depth gate cannot be in the up/down sample blocks.
+    def forward(self, input_tensor: torch.Tensor, temb: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        if len(args) > 0 or kwargs.get("scale", None) is not None:
+            deprecation_message = ("The `scale` argument is deprecated and will be ignored."
+                                   " Please remove it, as passing it will raise an error in the future."
+                                   " `scale` should directly be passed while calling the underlying pipeline component"
+                                   " i.e., via `cross_attention_kwargs`.")
+            deprecate("scale", "1.0.0", deprecation_message)
+
+        assert (self.upsample is None) and (self.downsample is None)
+        # Depth gate cannot be in the up/down sample blocks.
         if self.is_input_concatenated:  # We are in the upsample blocks, input is concatenated.
             # input_hidden_states = input_tensor.chunk(2, dim=1)[0]
             # [0] because the forward pass is hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
@@ -499,78 +516,66 @@ class ResnetBlock2DWidthDepthGated(ResnetBlock2D):
 
         hidden_states = input_tensor
 
-        if self.time_embedding_norm == "ada_group" or self.time_embedding_norm == "spatial":
-            hidden_states = self.norm1(hidden_states, temb)
-        else:
-            hidden_states = self.norm1(hidden_states)
-
+        hidden_states = self.norm1(hidden_states)
         hidden_states = self.nonlinearity(hidden_states)
 
         if self.upsample is not None:
-            # upsample_nearest_nhwc fails with large batch sizes.
-            # see https://github.com/huggingface/diffusers/issues/984
+            # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
             if hidden_states.shape[0] >= 64:
                 input_tensor = input_tensor.contiguous()
                 hidden_states = hidden_states.contiguous()
-            input_tensor = (
-                self.upsample(input_tensor, scale=scale)
-                if isinstance(self.upsample, Upsample2D)
-                else self.upsample(input_tensor)
-            )
-            hidden_states = (
-                self.upsample(hidden_states, scale=scale)
-                if isinstance(self.upsample, Upsample2D)
-                else self.upsample(hidden_states)
-            )
+            input_tensor = self.upsample(input_tensor)
+            hidden_states = self.upsample(hidden_states)
         elif self.downsample is not None:
-            input_tensor = (
-                self.downsample(input_tensor, scale=scale)
-                if isinstance(self.downsample, Downsample2D)
-                else self.downsample(input_tensor)
-            )
-            hidden_states = (
-                self.downsample(hidden_states, scale=scale)
-                if isinstance(self.downsample, Downsample2D)
-                else self.downsample(hidden_states)
-            )
+            input_tensor = self.downsample(input_tensor)
+            hidden_states = self.downsample(hidden_states)
 
-        hidden_states = self.conv1(hidden_states, scale) if not USE_PEFT_BACKEND else self.conv1(hidden_states)
+        hidden_states = self.conv1(hidden_states)
 
         if self.time_emb_proj is not None:
             if not self.skip_time_act:
                 temb = self.nonlinearity(temb)
-            temb = (
-                self.time_emb_proj(temb, scale)[:, :, None, None]
-                if not USE_PEFT_BACKEND
-                else self.time_emb_proj(temb)[:, :, None, None]
-            )
+            temb = self.time_emb_proj(temb)[:, :, None, None]
 
-        if temb is not None and self.time_embedding_norm == "default":
-            hidden_states = hidden_states + temb
+        if self.time_embedding_norm == "default":
+            if temb is not None:
+                hidden_states = hidden_states + temb
 
-        if not self.pruned:
-            # ########## Apply Width Gate ##########
-            assert self.norm2.num_groups == self.gate.gate_f.shape[1]
-            hidden_states = self.gate(hidden_states)
+            if not self.pruned:
+                # ########## Apply Width Gate ##########
+                assert self.norm2.num_groups == self.gate.gate_f.shape[1]
+                hidden_states = self.gate(hidden_states)
 
-        if self.time_embedding_norm == "ada_group" or self.time_embedding_norm == "spatial":
-            hidden_states = self.norm2(hidden_states, temb)
-        else:
             hidden_states = self.norm2(hidden_states)
+        elif self.time_embedding_norm == "scale_shift":
+            if temb is None:
+                raise ValueError(
+                    f" `temb` should not be None when `time_embedding_norm` is {self.time_embedding_norm}"
+                )
+            time_scale, time_shift = torch.chunk(temb, 2, dim=1)
 
-        if temb is not None and self.time_embedding_norm == "scale_shift":
-            scale, shift = torch.chunk(temb, 2, dim=1)
-            hidden_states = hidden_states * (1 + scale) + shift
+            if not self.pruned:
+                # ########## Apply Width Gate ##########
+                assert self.norm2.num_groups == self.gate.gate_f.shape[1]
+                hidden_states = self.gate(hidden_states)
+
+            hidden_states = self.norm2(hidden_states)
+            hidden_states = hidden_states * (1 + time_scale) + time_shift
+        else:
+            if not self.pruned:
+                # ########## Apply Width Gate ##########
+                assert self.norm2.num_groups == self.gate.gate_f.shape[1]
+                hidden_states = self.gate(hidden_states)
+
+            hidden_states = self.norm2(hidden_states)
 
         hidden_states = self.nonlinearity(hidden_states)
 
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.conv2(hidden_states, scale) if not USE_PEFT_BACKEND else self.conv2(hidden_states)
+        hidden_states = self.conv2(hidden_states)
 
         if self.conv_shortcut is not None:
-            input_tensor = (
-                self.conv_shortcut(input_tensor, scale) if not USE_PEFT_BACKEND else self.conv_shortcut(input_tensor)
-            )
+            input_tensor = self.conv_shortcut(input_tensor)
 
         output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
 
@@ -713,8 +718,17 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
             upcast_attention: bool = False,
             norm_elementwise_affine: bool = True,
             norm_type: str = "layer_norm",
+            # 'layer_norm', 'ada_norm', 'ada_norm_zero', 'ada_norm_single', 'ada_norm_continuous', 'layer_norm_i2vgen'
+            norm_eps: float = 1e-5,
             final_dropout: bool = False,
             attention_type: str = "default",
+            positional_embeddings: Optional[str] = None,
+            num_positional_embeddings: Optional[int] = None,
+            ada_norm_continous_conditioning_embedding_dim: Optional[int] = None,
+            ada_norm_bias: Optional[int] = None,
+            ff_inner_dim: Optional[int] = None,
+            ff_bias: bool = True,
+            attention_out_bias: bool = True,
             gated_ff: bool = True,
             ff_gate_width: int = 32,
     ):
@@ -723,7 +737,12 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
                          num_embeds_ada_norm=num_embeds_ada_norm, attention_bias=attention_bias,
                          only_cross_attention=only_cross_attention, double_self_attention=double_self_attention,
                          upcast_attention=upcast_attention, norm_elementwise_affine=norm_elementwise_affine,
-                         norm_type=norm_type, final_dropout=final_dropout, attention_type=attention_type)
+                         norm_type=norm_type, norm_eps=norm_eps, final_dropout=final_dropout,
+                         attention_type=attention_type, positional_embeddings=positional_embeddings,
+                         num_positional_embeddings=num_positional_embeddings,
+                         ada_norm_continous_conditioning_embedding_dim=ada_norm_continous_conditioning_embedding_dim,
+                         ada_norm_bias=ada_norm_bias, ff_inner_dim=ff_inner_dim, ff_bias=ff_bias,
+                         attention_out_bias=attention_out_bias)
 
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
@@ -759,96 +778,6 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
 
         self.structure = {'width': [], 'depth': []}
         self.prunable_macs, self.total_macs = 0., 0.
-
-    def forward(
-            self,
-            hidden_states: torch.FloatTensor,
-            attention_mask: Optional[torch.FloatTensor] = None,
-            encoder_hidden_states: Optional[torch.FloatTensor] = None,
-            encoder_attention_mask: Optional[torch.FloatTensor] = None,
-            timestep: Optional[torch.LongTensor] = None,
-            cross_attention_kwargs: Dict[str, Any] = None,
-            class_labels: Optional[torch.LongTensor] = None,
-    ):
-        # Notice that normalization is always applied before the real computation in the following blocks.
-        # 0. Self-Attention
-        if self.use_ada_layer_norm:
-            norm_hidden_states = self.norm1(hidden_states, timestep)
-        elif self.use_ada_layer_norm_zero:
-            norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
-                hidden_states, timestep, class_labels, hidden_dtype=hidden_states.dtype
-            )
-        else:
-            norm_hidden_states = self.norm1(hidden_states)
-
-        # 1. Retrieve lora scale.
-        lora_scale = cross_attention_kwargs.get("scale", 1.0) if cross_attention_kwargs is not None else 1.0
-
-        # 2. Prepare GLIGEN inputs
-        cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
-        gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
-
-        attn_output = self.attn1(
-            norm_hidden_states,
-            encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
-            attention_mask=attention_mask,
-            **cross_attention_kwargs,
-        )
-        if self.use_ada_layer_norm_zero:
-            attn_output = gate_msa.unsqueeze(1) * attn_output
-        hidden_states = attn_output + hidden_states
-
-        # 2.5 GLIGEN Control
-        if gligen_kwargs is not None:
-            hidden_states = self.fuser(hidden_states, gligen_kwargs["objs"])
-        # 2.5 ends
-
-        # 3. Cross-Attention
-        if self.attn2 is not None:
-            norm_hidden_states = (
-                self.norm2(hidden_states, timestep) if self.use_ada_layer_norm else self.norm2(hidden_states)
-            )
-
-            attn_output = self.attn2(
-                norm_hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                attention_mask=encoder_attention_mask,
-                **cross_attention_kwargs,
-            )
-            hidden_states = attn_output + hidden_states
-
-        # 4. Feed-forward
-        norm_hidden_states = self.norm3(hidden_states)
-
-        if self.use_ada_layer_norm_zero:
-            norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-
-        if self._chunk_size is not None:
-            # "feed_forward_chunk_size" can be used to save memory
-            if norm_hidden_states.shape[self._chunk_dim] % self._chunk_size != 0:
-                raise ValueError(
-                    f"`hidden_states` dimension to be chunked: {norm_hidden_states.shape[self._chunk_dim]}"
-                    f" has to be divisible by chunk size: {self._chunk_size}. "
-                    f"Make sure to set an appropriate `chunk_size` when calling `unet.enable_forward_chunking`."
-                )
-
-            num_chunks = norm_hidden_states.shape[self._chunk_dim] // self._chunk_size
-            ff_output = torch.cat(
-                [
-                    self.ff(hid_slice, scale=lora_scale)
-                    for hid_slice in norm_hidden_states.chunk(num_chunks, dim=self._chunk_dim)
-                ],
-                dim=self._chunk_dim,
-            )
-        else:
-            ff_output = self.ff(norm_hidden_states, scale=lora_scale)
-
-        if self.use_ada_layer_norm_zero:
-            ff_output = gate_mlp.unsqueeze(1) * ff_output
-
-        hidden_states = ff_output + hidden_states
-
-        return hidden_states
 
     def get_gate_structure(self):
         if len(self.structure['width']) == 0:
@@ -930,11 +859,11 @@ class BasicTransformerBlockWidthGated(BasicTransformerBlock):
         if self.gated_ff:
             ff_ratio = hard_concrete(self.ff.net[0].gate.gate_f).mean(dim=1)
             return (
-                        attn1_ratio * self.attn1.prunable_macs + attn2_ratio * self.attn2.prunable_macs +
-                        ff_ratio * self.ff.prunable_macs) / total_prunable_macs
+                    attn1_ratio * self.attn1.prunable_macs + attn2_ratio * self.attn2.prunable_macs +
+                    ff_ratio * self.ff.prunable_macs) / total_prunable_macs
         else:
             return ((
-                        attn1_ratio * self.attn1.prunable_macs + attn2_ratio * self.attn2.prunable_macs) /
+                            attn1_ratio * self.attn1.prunable_macs + attn2_ratio * self.attn2.prunable_macs) /
                     total_prunable_macs)
 
 
@@ -961,8 +890,13 @@ class Transformer2DModelWidthGated(Transformer2DModel):
             double_self_attention: bool = False,
             upcast_attention: bool = False,
             norm_type: str = "layer_norm",
+            # 'layer_norm', 'ada_norm', 'ada_norm_zero', 'ada_norm_single', 'ada_norm_continuous', 'layer_norm_i2vgen'
             norm_elementwise_affine: bool = True,
+            norm_eps: float = 1e-5,
             attention_type: str = "default",
+            caption_channels: int = None,
+            interpolation_scale: float = None,
+            use_additional_conditions: Optional[bool] = None,
             gated_ff: bool = False,
             ff_gate_width: int = 32
     ):
@@ -970,11 +904,13 @@ class Transformer2DModelWidthGated(Transformer2DModel):
                          in_channels=in_channels, out_channels=out_channels, num_layers=num_layers, dropout=dropout,
                          norm_num_groups=norm_num_groups, cross_attention_dim=cross_attention_dim,
                          attention_bias=attention_bias, sample_size=sample_size, num_vector_embeds=num_vector_embeds,
-                         patch_size=patch_size, activation_fn=activation_fn,
-                         num_embeds_ada_norm=num_embeds_ada_norm, use_linear_projection=use_linear_projection,
-                         only_cross_attention=only_cross_attention, double_self_attention=double_self_attention,
-                         upcast_attention=upcast_attention, norm_type=norm_type,
-                         norm_elementwise_affine=norm_elementwise_affine, attention_type=attention_type)
+                         patch_size=patch_size, activation_fn=activation_fn, num_embeds_ada_norm=num_embeds_ada_norm,
+                         use_linear_projection=use_linear_projection, only_cross_attention=only_cross_attention,
+                         double_self_attention=double_self_attention, upcast_attention=upcast_attention,
+                         norm_type=norm_type, norm_elementwise_affine=norm_elementwise_affine,
+                         attention_type=attention_type, norm_eps=norm_eps,
+                         caption_channels=caption_channels, interpolation_scale=interpolation_scale,
+                         use_additional_conditions=use_additional_conditions)
 
         inner_dim = num_attention_heads * attention_head_dim
 
@@ -1090,8 +1026,13 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
             double_self_attention: bool = False,
             upcast_attention: bool = False,
             norm_type: str = "layer_norm",
+            # 'layer_norm', 'ada_norm', 'ada_norm_zero', 'ada_norm_single', 'ada_norm_continuous', 'layer_norm_i2vgen'
             norm_elementwise_affine: bool = True,
+            norm_eps: float = 1e-5,
             attention_type: str = "default",
+            caption_channels: int = None,
+            interpolation_scale: float = None,
+            use_additional_conditions: Optional[bool] = None,
             gated_ff: bool = False,
             ff_gate_width: int = 32
     ):
@@ -1099,11 +1040,13 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
                          in_channels=in_channels, out_channels=out_channels, num_layers=num_layers, dropout=dropout,
                          norm_num_groups=norm_num_groups, cross_attention_dim=cross_attention_dim,
                          attention_bias=attention_bias, sample_size=sample_size, num_vector_embeds=num_vector_embeds,
-                         patch_size=patch_size, activation_fn=activation_fn,
-                         num_embeds_ada_norm=num_embeds_ada_norm, use_linear_projection=use_linear_projection,
-                         only_cross_attention=only_cross_attention, double_self_attention=double_self_attention,
-                         upcast_attention=upcast_attention, norm_type=norm_type,
-                         norm_elementwise_affine=norm_elementwise_affine, attention_type=attention_type)
+                         patch_size=patch_size, activation_fn=activation_fn, num_embeds_ada_norm=num_embeds_ada_norm,
+                         use_linear_projection=use_linear_projection, only_cross_attention=only_cross_attention,
+                         double_self_attention=double_self_attention, upcast_attention=upcast_attention,
+                         norm_type=norm_type, norm_elementwise_affine=norm_elementwise_affine,
+                         attention_type=attention_type, norm_eps=norm_eps,
+                         caption_channels=caption_channels, interpolation_scale=interpolation_scale,
+                         use_additional_conditions=use_additional_conditions)
 
         inner_dim = num_attention_heads * attention_head_dim
 
@@ -1187,11 +1130,17 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
+
         if self.dropped:
             if not return_dict:
                 return (hidden_states,)
 
             return Transformer2DModelOutput(sample=hidden_states)
+
+        if cross_attention_kwargs is not None:
+            if cross_attention_kwargs.get("scale", None) is not None:
+                logger.warning("Passing `scale` to `cross_attention_kwargs` is deprecated. `scale` will be ignored.")
+
         # ensure attention_mask is a bias, and give it a singleton query_tokens dimension.
         #   we may have done this conversion already, e.g. if we came here via UNet2DConditionModel#forward.
         #   we can tell by counting dims; if ndim == 2: it's a mask rather than a bias.
@@ -1215,59 +1164,38 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
             encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
             encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
 
-        # Retrieve lora scale.
-        lora_scale = cross_attention_kwargs.get("scale", 1.0) if cross_attention_kwargs is not None else 1.0
-
-        # ########### 1. Input
+        # 1. Input
         input_hidden_states = hidden_states
         if self.is_input_continuous:
-            batch, _, height, width = hidden_states.shape
+            batch_size, _, height, width = hidden_states.shape
             residual = hidden_states
-
-            hidden_states = self.norm(hidden_states)
-            if not self.use_linear_projection:
-                hidden_states = (
-                    self.proj_in(hidden_states, scale=lora_scale)
-                    if not USE_PEFT_BACKEND
-                    else self.proj_in(hidden_states)
-                )
-                inner_dim = hidden_states.shape[1]
-                hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * width, inner_dim)
-            else:
-                inner_dim = hidden_states.shape[1]
-                hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch, height * width, inner_dim)
-                hidden_states = (
-                    self.proj_in(hidden_states, scale=lora_scale)
-                    if not USE_PEFT_BACKEND
-                    else self.proj_in(hidden_states)
-                )
-
+            hidden_states, inner_dim = self._operate_on_continuous_inputs(hidden_states)
         elif self.is_input_vectorized:
             hidden_states = self.latent_image_embedding(hidden_states)
         elif self.is_input_patches:
-            height, width = hidden_states.shape[-2] // self.patch_size, hidden_states.shape[-1] // self.patch_size
-            hidden_states = self.pos_embed(hidden_states)
+            height, width = hidden_states.shape[-2] // self.patch_size, hidden_states.shape[
+                -1] // self.patch_size
+            hidden_states, encoder_hidden_states, timestep, embedded_timestep = self._operate_on_patched_inputs(
+                hidden_states, encoder_hidden_states, timestep, added_cond_kwargs
+            )
 
-            if self.adaln_single is not None:
-                if self.use_additional_conditions and added_cond_kwargs is None:
-                    raise ValueError(
-                        "`added_cond_kwargs` cannot be None when using additional conditions for `adaln_single`."
-                    )
-                batch_size = hidden_states.shape[0]
-                timestep, embedded_timestep = self.adaln_single(
-                    timestep, added_cond_kwargs, batch_size=batch_size, hidden_dtype=hidden_states.dtype
-                )
-
-        # ########### 2. Blocks
-        if self.caption_projection is not None:
-            batch_size = hidden_states.shape[0]
-            encoder_hidden_states = self.caption_projection(encoder_hidden_states)
-            encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
-
+        # 2. Blocks
         for block in self.transformer_blocks:
             if self.training and self.gradient_checkpointing:
+
+                def create_custom_forward(module, return_dict=None):
+                    def custom_forward(*inputs):
+                        if return_dict is not None:
+                            return module(*inputs, return_dict=return_dict)
+                        else:
+                            return module(*inputs)
+
+                    return custom_forward
+
+                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=",
+                                                                                           "1.11.0") else {}
                 hidden_states = torch.utils.checkpoint.checkpoint(
-                    block,
+                    create_custom_forward(block),
                     hidden_states,
                     attention_mask,
                     encoder_hidden_states,
@@ -1275,7 +1203,7 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
                     timestep,
                     cross_attention_kwargs,
                     class_labels,
-                    use_reentrant=False,
+                    **ckpt_kwargs,
                 )
             else:
                 hidden_states = block(
@@ -1288,58 +1216,26 @@ class Transformer2DModelWidthDepthGated(Transformer2DModel):
                     class_labels=class_labels,
                 )
 
-        # ########### 3. Output
+        # 3. Output
         if self.is_input_continuous:
-            if not self.use_linear_projection:
-                hidden_states = hidden_states.reshape(batch, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
-                hidden_states = (
-                    self.proj_out(hidden_states, scale=lora_scale)
-                    if not USE_PEFT_BACKEND
-                    else self.proj_out(hidden_states)
-                )
-            else:
-                hidden_states = (
-                    self.proj_out(hidden_states, scale=lora_scale)
-                    if not USE_PEFT_BACKEND
-                    else self.proj_out(hidden_states)
-                )
-                hidden_states = hidden_states.reshape(batch, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
-
-            output = hidden_states + residual
-        elif self.is_input_vectorized:
-            hidden_states = self.norm_out(hidden_states)
-            logits = self.out(hidden_states)
-            # (batch, self.num_vector_embeds - 1, self.num_latent_pixels)
-            logits = logits.permute(0, 2, 1)
-
-            # log(p(x_0))
-            output = F.log_softmax(logits.double(), dim=1).float()
-
-        if self.is_input_patches:
-            if self.config.norm_type != "ada_norm_single":
-                conditioning = self.transformer_blocks[0].norm1.emb(
-                    timestep, class_labels, hidden_dtype=hidden_states.dtype
-                )
-                shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
-                hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
-                hidden_states = self.proj_out_2(hidden_states)
-            elif self.config.norm_type == "ada_norm_single":
-                shift, scale = (self.scale_shift_table[None] + embedded_timestep[:, None]).chunk(2, dim=1)
-                hidden_states = self.norm_out(hidden_states)
-                # Modulation
-                hidden_states = hidden_states * (1 + scale) + shift
-                hidden_states = self.proj_out(hidden_states)
-                hidden_states = hidden_states.squeeze(1)
-
-            # unpatchify
-            if self.adaln_single is None:
-                height = width = int(hidden_states.shape[1] ** 0.5)
-            hidden_states = hidden_states.reshape(
-                (-1, height, width, self.patch_size, self.patch_size, self.out_channels)
+            output = self._get_output_for_continuous_inputs(
+                hidden_states=hidden_states,
+                residual=residual,
+                batch_size=batch_size,
+                height=height,
+                width=width,
+                inner_dim=inner_dim,
             )
-            hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
-            output = hidden_states.reshape(
-                (-1, self.out_channels, height * self.patch_size, width * self.patch_size)
+        elif self.is_input_vectorized:
+            output = self._get_output_for_vectorized_inputs(hidden_states)
+        elif self.is_input_patches:
+            output = self._get_output_for_patched_inputs(
+                hidden_states=hidden_states,
+                timestep=timestep,
+                class_labels=class_labels,
+                embedded_timestep=embedded_timestep,
+                height=height,
+                width=width,
             )
 
         if not self.pruned:
@@ -2242,6 +2138,7 @@ class CrossAttnUpBlock2DWidthHalfDepthGated(CrossAttnUpBlock2D):
             util.append(attention_util)
         return util
 
+
 class DownBlock2DWidthDepthGated(DownBlock2D):
     def __init__(
             self,
@@ -2548,7 +2445,6 @@ class UpBlock2DWidthHalfDepthGated(UpBlock2D):
         for b in self.resnets:
             util.append(b.get_block_utilization())
         return util
-
 
 
 class UNetMidBlock2DCrossAttnWidthGated(UNetMidBlock2DCrossAttn):

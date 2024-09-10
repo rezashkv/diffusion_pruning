@@ -1,5 +1,5 @@
 model:
-  unet:
+  prediction_model:
     pretrained_model_name_or_path: stabilityai/stable-unet-2-1
     input_perturbation: 0.0
     revision: null
@@ -110,12 +110,13 @@ training:
   optim:
     hypernet_learning_rate: 2e-4
     quantizer_learning_rate: 2e-4
-    unet_learning_rate: 5e-5
+    prediction_model_learning_rate: 5e-5
 
     quantizer_weight_decay: 0.00
     hypernet_weight_decay: 0.00
-    unet_weight_decay: 0.00
+    prediction_model_weight_decay: 0.00
 
+    optimizer: "adamw"
     use_8bit_adam: false
     adam_beta1: 0.9
     adam_beta2: 0.999
