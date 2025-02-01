@@ -1,4 +1,4 @@
-# APTP: Adaptive Prompt-Tailored Pruning of T2I Diffusion Models
+# [ICLR 2025] APTP: Adaptive Prompt-Tailored Pruning of T2I Diffusion Models
 
 [![arXiv](https://img.shields.io/badge/arXiv-2406.12042-red.svg)](https://arxiv.org/abs/2406.12042) 
 [![Hugging Face Models](https://img.shields.io/badge/🤗%20Hugging%20Face-Models-yellow)](https://huggingface.co/rezashkv/APTP)
